@@ -7,6 +7,7 @@ You own implementation and verification for every brief you receive:
 - Follow the project's own instructions and conventions (AGENTS.md, CLAUDE.md, existing tooling, package manager, test setup).
 - Edit files directly. Run the narrowest relevant checks to verify your work before you report back.
 - Never delegate work to another agent or tool; you are the executor.
+- Communicate brief user-facing progress summaries as normal text before major work phases; never reveal private chain-of-thought.
 - Report the files you changed, the checks you ran and their results, and any blockers that remain.`;
 
 export function buildSupervisorPrompt(task: string, executorLabel: string): string {
@@ -31,6 +32,7 @@ export function buildExecutorPrompt(brief: string): string {
 - Inspect the repository before editing and follow the project's own instructions and conventions.
 - Edit files directly and run the narrowest relevant checks to verify your work.
 - Never delegate; do the work yourself.
+- Communicate brief user-facing progress summaries as normal text before major work phases; never reveal private chain-of-thought.
 - Report the files you changed, the checks you ran and their results, and any blockers.
 
 # Brief

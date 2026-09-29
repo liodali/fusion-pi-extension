@@ -20,6 +20,8 @@ The supervisor and executor are two separate model sessions. They do not share c
 
 No temporary Markdown files, `/tmp` files, or other on-disk communication channels are created. Coordination happens entirely through the tool call boundary.
 
+While the executor works, the Fusion widget and the `fusion_delegate` tool display show a bounded chronological work transcript: brief progress notes, tool calls with their targets, completion/failure entries, and truncated text results. The transcript is retained on the final tool row rather than replaced by the report. Hidden thinking streams are never displayed — a `reasoning` status entry is all that surfaces. The transcript lives in the tool's display details and is not prepended to the model-facing result content, so it does not inflate the supervisor's context. Token and cost usage is tracked separately for the supervisor and the executor; the executor total covers the whole run, including revisions.
+
 ## Model tiers
 
 Selection is driven by each model's `cost.output` metadata: USD per million output tokens, as reported by Pi's model catalog.
@@ -61,7 +63,7 @@ pi --extension ./src/index.ts
 | `/fusion-config` | Search and select the price-tiered supervisor and executor models. Each selector prompts for search text first (blank shows everything in the cohort), then lists matching recent models with their output pricing. In the TUI the result picker shows at most 10 models and scrolls with Up/Down; other frontends use the standard select dialog. The pair is remembered and reused by `/fusion` and `/fusion-mode`. |
 | `/fusion [task]` | Run one task through the protocol. Prompts for the task in an editor when omitted, sets the supervisor model with `pi.setModel`, starts a fresh run, and sends the supervisor prompt. Reuses the configured pair when present. |
 | `/fusion-mode` | Toggle persistent mode. When enabled, ordinary interactive text prompts are transformed into the supervisor protocol automatically. When disabled, the active executor is disposed and the widget cleared. |
-| `/fusion-status` | Show mode, supervisor/executor labels with output pricing, current phase, and revision count. |
+| `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing, current phase, revision count, per-run supervisor and executor usage totals, and current executor activity. |
 | `/fusion-clean` | Wait for the agent to go idle, dispose the executor session, and clear run data (task, revisions, phase). Model configuration and mode are preserved. Creates no temporary files. |
 
 Quick start:
@@ -80,7 +82,7 @@ Quick start:
 1. Configure once with `/fusion-config`, or let `/fusion` / `/fusion-mode` prompt for a pair on first use.
 2. The supervisor investigates the repository itself, resolves ambiguity, and writes a self-contained brief: objective, files, constraints, edge cases, exact verification checks.
 3. `fusion_delegate` with `action: "execute"` lazily creates a persistent in-memory Pi SDK `AgentSession` for the executor: its own system prompt, project skills and context files, and the standard read/edit/bash tool set. Extensions and prompt templates are disabled on the executor so it cannot re-enter Fusion.
-4. The executor works the brief directly in the shared working tree and reports changed files, checks run, and blockers. Per-invocation token and cost usage is returned in the tool result.
+4. The executor works the brief directly in the shared working tree and reports changed files, checks run, and blockers. Per-invocation token and cost usage is returned in the tool result alongside the cumulative executor total for the run.
 5. The supervisor reviews the actual working tree and diff — not the executor's summary — and may re-run checks itself.
 6. Defects are batched into one consolidated revision brief per `fusion_delegate` `action: "revise"` call, up to 3 revisions per task.
 7. The supervisor takes over only if the executor is blocked, then delivers a final user-facing summary with the checks that passed.
@@ -91,6 +93,7 @@ Quick start:
 - The executor session is disposed when a new task starts, when Fusion mode is disabled, on `session_shutdown`, and via `/fusion-clean`.
 - The selected supervisor/executor pair and mode flag live only in extension memory; they reset when Pi exits or the extension reloads.
 - Because both agents share the filesystem, executor edits are visible to the supervisor immediately.
+- Usage is tracked per run and per role: supervisor tokens are aggregated from the main session's assistant turns, executor tokens from each `fusion_delegate` invocation (initial execution plus revisions). Totals reset on a new task, mode disable, session shutdown, and `/fusion-clean`.
 - The extension writes no prompts, briefs, or secrets to temporary files.
 
 ## Safety and limitations
@@ -110,11 +113,12 @@ Quick start:
 | `src/index.ts` | Extension entry point: tool, commands, input interception, widget, executor lifecycle. |
 | `src/prompts.ts` | Supervisor/executor prompt construction and `MAX_REVISIONS`. |
 | `src/pricing.ts` | Output-price tier logic and priced model labels. |
+| `src/progress.ts` | Bounded chronological executor transcript and tool-result summaries. |
 | `src/recent-models.ts` | Curated recent-model cohort matching and search. |
 | `src/scrollable-select.ts` | TUI picker capped at 10 visible rows; falls back to the standard select dialog outside TUI. |
 | `src/usage.ts` | Incremental `Usage` aggregation for executor invocations. |
 | `.pi/extensions/fusion.ts` | Project-local shim re-exporting `src/index.ts` for auto-discovery. |
-| `test/*.test.ts` | `bun:test` unit tests for prompts, pricing, cohort matching/search, and usage aggregation. |
+| `test/*.test.ts` | `bun:test` unit tests for prompts, pricing, cohort matching/search, progress transcript, and usage aggregation. |
 
 ```bash
 bun test

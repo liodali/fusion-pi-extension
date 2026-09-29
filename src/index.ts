@@ -10,6 +10,7 @@ import {
 	getAgentDir,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	buildExecutorPrompt,
@@ -25,9 +26,21 @@ import {
 	getOutputPrice,
 	isModelInTier,
 } from "./pricing.ts";
+import {
+	appendProgressEntry,
+	formatProgressTranscript,
+	summarizeToolResult,
+	truncateInline,
+} from "./progress.ts";
 import { isRecentModel, RECENT_MODEL_COHORT, searchRecentModels } from "./recent-models.ts";
 import { selectScrollableOption } from "./scrollable-select.ts";
-import { aggregateUsage } from "./usage.ts";
+import {
+	addUsage,
+	aggregateAssistantUsage,
+	aggregateUsage,
+	createEmptyUsage,
+	formatUsageSummary,
+} from "./usage.ts";
 
 const WIDGET_KEY = "fusion";
 
@@ -40,6 +53,7 @@ interface FusionToolDetails {
 	output: string;
 	error?: string;
 	usage?: Usage;
+	transcript?: string;
 }
 
 interface FusionState {
@@ -55,6 +69,11 @@ interface FusionState {
 	supervisorLabel?: string;
 	executorLabel?: string;
 	executorSession?: AgentSession;
+	supervisorUsage: Usage;
+	executorUsage: Usage;
+	executorActivity?: string;
+	executorOutput?: string;
+	executorTranscript: string[];
 }
 
 function modelLabel(model: Model<any>): string {
@@ -64,6 +83,19 @@ function modelLabel(model: Model<any>): string {
 function priceText(model: Model<Api>): string {
 	const price = getOutputPrice(model);
 	return price === undefined ? "price unknown" : `$${price.toFixed(2)}/M output`;
+}
+
+function describeExecutorTool(toolName: string, args: unknown): string {
+	if (args && typeof args === "object") {
+		const record = args as Record<string, unknown>;
+		for (const key of ["file_path", "path", "command", "pattern", "query"]) {
+			const value = record[key];
+			if (typeof value === "string" && value.trim().length > 0) {
+				return `${toolName} ${truncateInline(value)}`;
+			}
+		}
+	}
+	return toolName;
 }
 
 function collectModels(ctx: ExtensionContext): Model<Api>[] {
@@ -103,10 +135,23 @@ export default function (pi: ExtensionAPI) {
 		revisions: 0,
 		executed: false,
 		delegating: false,
+		supervisorUsage: createEmptyUsage(),
+		executorUsage: createEmptyUsage(),
+		executorTranscript: [],
 	};
 
 	const executorLabel = (): string =>
 		state.executorLabel ?? (state.executorModel ? modelLabel(state.executorModel) : "unconfigured");
+
+	const appendExecutorProgress = (entry: string): void => {
+		state.executorTranscript = appendProgressEntry(state.executorTranscript, entry);
+	};
+
+	const executorProgressText = (): string => {
+		const transcript = formatProgressTranscript(state.executorTranscript, state.executorOutput);
+		const header = `Fusion executor: ${state.executorActivity ?? "working"}`;
+		return transcript ? `${header}\n\n${transcript}` : header;
+	};
 
 	function updateWidget(ctx: ExtensionContext): void {
 		if (!state.runActive && !state.modeEnabled) {
@@ -116,7 +161,10 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setWidget(WIDGET_KEY, [
 			`Fusion: ${state.phase}`,
 			`Supervisor: ${state.supervisorLabel ?? "-"}`,
+			`  Usage: ${formatUsageSummary(state.supervisorUsage)}`,
 			`Executor: ${state.executorLabel ?? "-"}`,
+			`  Usage: ${formatUsageSummary(state.executorUsage)}`,
+			`Activity: ${state.executorActivity ?? "-"}`,
 			`Revisions: ${state.revisions}/${MAX_REVISIONS}`,
 		]);
 	}
@@ -129,6 +177,8 @@ export default function (pi: ExtensionAPI) {
 	function disposeExecutor(): void {
 		const session = state.executorSession;
 		state.executorSession = undefined;
+		state.executorActivity = undefined;
+		state.executorOutput = undefined;
 		try {
 			session?.dispose();
 		} catch {}
@@ -140,6 +190,9 @@ export default function (pi: ExtensionAPI) {
 		state.task = task;
 		state.revisions = 0;
 		state.executed = false;
+		state.supervisorUsage = createEmptyUsage();
+		state.executorUsage = createEmptyUsage();
+		state.executorTranscript = [];
 		setPhase(ctx, "planning");
 	}
 
@@ -273,6 +326,7 @@ export default function (pi: ExtensionAPI) {
 					output: text,
 					error,
 					usage,
+					transcript: executorProgressText(),
 				},
 				usage,
 			});
@@ -284,6 +338,7 @@ export default function (pi: ExtensionAPI) {
 						revisions: state.revisions,
 						executor: executorLabel(),
 						output: text,
+						transcript: executorProgressText(),
 					},
 				});
 			};
@@ -309,6 +364,9 @@ export default function (pi: ExtensionAPI) {
 				if (isRevision) {
 					state.revisions += 1;
 					setPhase(ctx, "revising");
+					appendExecutorProgress(
+						`[revision ${state.revisions}/${MAX_REVISIONS}] Executor resumed with ${executorLabel()}`,
+					);
 				} else {
 					disposeExecutor();
 					state.runActive = true;
@@ -316,12 +374,9 @@ export default function (pi: ExtensionAPI) {
 					state.revisions = 0;
 					state.executed = false;
 					setPhase(ctx, "executing");
+					appendExecutorProgress(`[execute] Executor started with ${executorLabel()}`);
 				}
-				emit(
-					isRevision
-						? `Fusion executor revising (${state.revisions}/${MAX_REVISIONS}) via ${executorLabel()}`
-						: `Fusion executor executing via ${executorLabel()}`,
-				);
+				emit(executorProgressText());
 				const promptText = isRevision
 					? buildRevisionPrompt(params.brief, state.revisions)
 					: buildExecutorPrompt(params.brief);
@@ -336,33 +391,114 @@ export default function (pi: ExtensionAPI) {
 				};
 				signal?.addEventListener("abort", abortExecutor, { once: true });
 				const messageStart = session.messages.length;
+				let liveText = "";
+				let pendingText = "";
+				const unsubscribe = session.subscribe((event) => {
+					if (event.type === "message_update") {
+						const streamEvent = event.assistantMessageEvent;
+						if (streamEvent.type === "thinking_start") {
+							state.executorActivity = "reasoning";
+							appendExecutorProgress("[reasoning] Executor is reasoning privately.");
+							updateWidget(ctx);
+							emit(executorProgressText());
+						} else if (streamEvent.type === "text_start") {
+							liveText = "";
+							pendingText = "";
+							state.executorOutput = undefined;
+						} else if (streamEvent.type === "text_delta") {
+							liveText += streamEvent.delta;
+							pendingText += streamEvent.delta;
+							state.executorOutput = liveText;
+							state.executorActivity = "writing";
+							updateWidget(ctx);
+							if (pendingText.includes("\n") || pendingText.length >= 80) {
+								pendingText = "";
+								emit(executorProgressText());
+							}
+						} else if (streamEvent.type === "text_end") {
+							const content = streamEvent.content.trim();
+							if (content) {
+								appendExecutorProgress(`[executor]\n${content}`);
+							}
+							liveText = "";
+							pendingText = "";
+							state.executorOutput = undefined;
+							state.executorActivity = "working";
+							updateWidget(ctx);
+							emit(executorProgressText());
+						}
+					} else if (event.type === "tool_execution_start") {
+						state.executorActivity = `running ${describeExecutorTool(event.toolName, event.args)}`;
+						appendExecutorProgress(`[tool] ${describeExecutorTool(event.toolName, event.args)}`);
+						updateWidget(ctx);
+						emit(executorProgressText());
+					} else if (event.type === "tool_execution_end") {
+						appendExecutorProgress(`[${event.isError ? "failed" : "done"}] ${event.toolName}`);
+						const summary = summarizeToolResult(event.result);
+						if (summary) {
+							appendExecutorProgress(`[result]\n${summary}`);
+						}
+						state.executorActivity = `${event.toolName} ${event.isError ? "failed" : "completed"}`;
+						updateWidget(ctx);
+						emit(executorProgressText());
+					}
+				});
 				try {
 					await session.prompt(promptText, { source: "extension" });
 				} finally {
 					signal?.removeEventListener("abort", abortExecutor);
+					unsubscribe();
 				}
 				const output = lastAssistantOutput(session);
 				const usage = aggregateUsage(session.messages.slice(messageStart));
+				state.executorUsage = addUsage(state.executorUsage, usage);
 				state.executed = true;
 				if (output.stopReason === "error" || output.stopReason === "aborted") {
 					const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
+					state.executorActivity = "failed";
+					appendExecutorProgress(
+						`[failed] Executor stopped with status "${output.stopReason}"${reason}.`,
+					);
 					setPhase(ctx, "failed");
 					return respond(
-						`Fusion executor stopped with status "${output.stopReason}"${reason}.`,
+						`Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}`,
 						output.errorMessage ?? output.stopReason,
 						usage,
 					);
 				}
+				state.executorActivity = "finished";
+				appendExecutorProgress("[finished] Executor completed the delegation.");
 				setPhase(ctx, "reviewing");
-				emit(`Fusion executor finished (${executorLabel()})`);
-				return respond(output.text || "The executor finished without producing a text report.", undefined, usage);
+				emit(executorProgressText());
+				return respond(
+					`${output.text || "The executor finished without producing a text report."}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}`,
+					undefined,
+					usage,
+				);
 			} catch (error) {
-				setPhase(ctx, "failed");
+				state.executorActivity = "failed";
 				const message = error instanceof Error ? error.message : String(error);
+				appendExecutorProgress(`[failed] ${message}`);
+				setPhase(ctx, "failed");
 				return respond(`Fusion delegation failed: ${message}`, message);
 			} finally {
 				state.delegating = false;
 			}
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("fusion_delegate ")) + theme.fg("muted", args.action),
+				0,
+				0,
+			);
+		},
+		renderResult(result, { isPartial }, theme) {
+			const details = result.details as FusionToolDetails | undefined;
+			const transcript = details?.transcript;
+			const fallback = result.content.find((part) => part.type === "text");
+			const text = transcript || (fallback?.type === "text" ? fallback.text : "");
+			const color = details?.error ? "error" : isPartial ? "muted" : "text";
+			return new Text(theme.fg(color, text), 0, 0);
 		},
 	});
 
@@ -437,6 +573,9 @@ export default function (pi: ExtensionAPI) {
 				state.modeEnabled = false;
 				state.runActive = false;
 				state.phase = "idle";
+				state.supervisorUsage = createEmptyUsage();
+				state.executorUsage = createEmptyUsage();
+				state.executorTranscript = [];
 				disposeExecutor();
 				ctx.ui.setWidget(WIDGET_KEY, undefined);
 				ctx.ui.notify("Fusion mode disabled.", "info");
@@ -482,7 +621,7 @@ export default function (pi: ExtensionAPI) {
 				? `${modelLabel(state.executorModel)} (${priceText(state.executorModel)})`
 				: "none";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"}`,
 				"info",
 			);
 		},
@@ -499,6 +638,9 @@ export default function (pi: ExtensionAPI) {
 			state.executed = false;
 			state.delegating = false;
 			state.phase = "idle";
+			state.supervisorUsage = createEmptyUsage();
+			state.executorUsage = createEmptyUsage();
+			state.executorTranscript = [];
 			updateWidget(ctx);
 			ctx.ui.notify(
 				"Fusion executor context and completed run data cleared. No temporary files were created.",
@@ -526,6 +668,12 @@ export default function (pi: ExtensionAPI) {
 		return { action: "transform", text: buildSupervisorPrompt(event.text, executorLabel()) };
 	});
 
+	pi.on("agent_end", (event, ctx) => {
+		if (!state.runActive) return;
+		state.supervisorUsage = addUsage(state.supervisorUsage, aggregateAssistantUsage(event.messages));
+		updateWidget(ctx);
+	});
+
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!state.runActive || state.phase === "failed") return;
 		setPhase(ctx, "complete");
@@ -535,6 +683,9 @@ export default function (pi: ExtensionAPI) {
 		state.runActive = false;
 		state.modeEnabled = false;
 		state.phase = "idle";
+		state.supervisorUsage = createEmptyUsage();
+		state.executorUsage = createEmptyUsage();
+		state.executorTranscript = [];
 		disposeExecutor();
 	});
 }
