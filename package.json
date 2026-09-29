@@ -1,0 +1,22 @@
+{
+	"name": "pi-fusion-extension",
+	"version": "0.1.0",
+	"description": "Supervisor-executor orchestration for Pi",
+	"type": "module",
+	"keywords": ["pi-package", "pi-extension", "multi-agent", "fusion"],
+	"license": "MIT",
+	"files": ["src", ".pi/extensions/fusion.ts"],
+	"pi": { "extensions": ["./src/index.ts"] },
+	"scripts": {
+		"typecheck": "bunx tsc --noEmit",
+		"test": "bun test"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": { "typescript": "^5.9.2" }
+}
