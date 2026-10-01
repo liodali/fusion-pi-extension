@@ -12,10 +12,10 @@ import {
 const usageWith = (fields: object): Usage => fields as Usage;
 
 const assistantWith = (usage: object | undefined): AgentMessage =>
-	({ role: "assistant", content: [], usage }) as AgentMessage;
+	({ role: "assistant", content: [], usage }) as unknown as AgentMessage;
 
 const toolResultWith = (usage: object | undefined): AgentMessage =>
-	({ role: "toolResult", content: [], usage }) as AgentMessage;
+	({ role: "toolResult", content: [], usage }) as unknown as AgentMessage;
 
 describe("aggregateUsage", () => {
 	test("returns zeroed usage for empty input", () => {

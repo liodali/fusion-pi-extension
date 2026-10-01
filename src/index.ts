@@ -1,5 +1,13 @@
+import { relative, resolve } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, Model, TextContent, Usage } from "@earendil-works/pi-ai";
+import {
+	type Api,
+	getSupportedThinkingLevels,
+	type Model,
+	type ModelThinkingLevel,
+	type TextContent,
+	type Usage,
+} from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
 	type AgentToolResult,
@@ -12,12 +20,23 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { changedPaths, parsePorcelain } from "./git-changes.ts";
+import {
+	GIT_TIMEOUT_MS,
+	MAX_SCOUT_TOOL_CALLS,
+	RENDER_THROTTLE_MS,
+	SCOUT_ANSWER_MAX_CHARS,
+	TRANSCRIPT_TAIL_LINES,
+} from "./limits.ts";
 import {
 	buildExecutorPrompt,
 	buildRevisionPrompt,
+	buildScoutPrompt,
 	buildSupervisorPrompt,
 	EXECUTOR_SYSTEM_PROMPT,
 	MAX_REVISIONS,
+	MAX_SCOUT_CALLS,
+	SCOUT_SYSTEM_PROMPT,
 } from "./prompts.ts";
 import {
 	FUSION_OUTPUT_PRICE_THRESHOLD,
@@ -33,7 +52,18 @@ import {
 	truncateInline,
 } from "./progress.ts";
 import { isRecentModel, RECENT_MODEL_COHORT, searchRecentModels } from "./recent-models.ts";
+import {
+	type ExecutorReport,
+	formatCompactReport,
+	parseExecutorReport,
+} from "./report.ts";
 import { selectScrollableOption } from "./scrollable-select.ts";
+import {
+	defaultThinkingLevel,
+	orderThinkingLevels,
+	scoutDefaultThinkingLevel,
+} from "./thinking.ts";
+import { createThrottle } from "./throttle.ts";
 import {
 	addUsage,
 	aggregateAssistantUsage,
@@ -44,13 +74,37 @@ import {
 
 const WIDGET_KEY = "fusion";
 
-type FusionPhase = "idle" | "planning" | "executing" | "reviewing" | "revising" | "complete" | "failed";
+type FusionPhase =
+	| "idle"
+	| "planning"
+	| "executing"
+	| "reviewing"
+	| "revising"
+	| "scouting"
+	| "complete"
+	| "failed";
+
+interface FusionTimings {
+	readyMs?: number;
+	firstEventMs?: number;
+	totalMs?: number;
+}
 
 interface FusionToolDetails {
 	action: "execute" | "revise";
 	revisions: number;
 	executor: string;
 	output: string;
+	error?: string;
+	usage?: Usage;
+	timings?: FusionTimings;
+	report?: ExecutorReport;
+	diffStat?: string;
+	transcript?: string;
+}
+
+interface FusionScoutDetails {
+	answer: string;
 	error?: string;
 	usage?: Usage;
 	transcript?: string;
@@ -68,7 +122,18 @@ interface FusionState {
 	executorModel?: Model<Api>;
 	supervisorLabel?: string;
 	executorLabel?: string;
+	supervisorThinking: ThinkingLevel;
+	executorThinking: ThinkingLevel;
+	scoutThinking: ThinkingLevel;
+	executorBrief?: string;
 	executorSession?: AgentSession;
+	executorSessionModel?: Model<Api>;
+	executorSessionThinking?: ThinkingLevel;
+	executorReady?: Promise<AgentSession>;
+	executorUsed: boolean;
+	lastTimings?: FusionTimings;
+	scoutCalls: number;
+	scoutUsage: Usage;
 	supervisorUsage: Usage;
 	executorUsage: Usage;
 	executorActivity?: string;
@@ -135,6 +200,12 @@ export default function (pi: ExtensionAPI) {
 		revisions: 0,
 		executed: false,
 		delegating: false,
+		supervisorThinking: "off",
+		executorThinking: "off",
+		scoutThinking: "off",
+		executorUsed: false,
+		scoutCalls: 0,
+		scoutUsage: createEmptyUsage(),
 		supervisorUsage: createEmptyUsage(),
 		executorUsage: createEmptyUsage(),
 		executorTranscript: [],
@@ -160,12 +231,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		ctx.ui.setWidget(WIDGET_KEY, [
 			`Fusion: ${state.phase}`,
-			`Supervisor: ${state.supervisorLabel ?? "-"}`,
+			`Supervisor: ${state.supervisorLabel ?? "-"} (thinking ${state.supervisorThinking})`,
 			`  Usage: ${formatUsageSummary(state.supervisorUsage)}`,
-			`Executor: ${state.executorLabel ?? "-"}`,
+			`Executor: ${state.executorLabel ?? "-"} (thinking ${state.executorThinking})`,
 			`  Usage: ${formatUsageSummary(state.executorUsage)}`,
 			`Activity: ${state.executorActivity ?? "-"}`,
 			`Revisions: ${state.revisions}/${MAX_REVISIONS}`,
+			`Scout: ${state.scoutCalls}/${MAX_SCOUT_CALLS} calls, ${formatUsageSummary(state.scoutUsage)} (thinking ${state.scoutThinking})`,
 		]);
 	}
 
@@ -174,25 +246,238 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	}
 
+	const FUSION_TOOL_NAMES = ["fusion_delegate", "fusion_scout"];
+
+	function syncFusionTools(): void {
+		const active = pi.getActiveTools();
+		const next = active.filter((name) => !FUSION_TOOL_NAMES.includes(name));
+		if (state.runActive || state.modeEnabled) {
+			next.push(...FUSION_TOOL_NAMES);
+		}
+		const nextSet = new Set(next);
+		const changed =
+			next.length !== active.length || active.some((name) => !nextSet.has(name));
+		if (changed) {
+			pi.setActiveTools(next);
+		}
+	}
+
+	function executorConfigMatches(): boolean {
+		return (
+			state.executorSessionModel !== undefined &&
+			state.executorSessionModel === state.executorModel &&
+			state.executorSessionThinking === state.executorThinking
+		);
+	}
+
 	function disposeExecutor(): void {
 		const session = state.executorSession;
+		const ready = state.executorReady;
 		state.executorSession = undefined;
+		state.executorSessionModel = undefined;
+		state.executorSessionThinking = undefined;
+		state.executorReady = undefined;
+		state.executorUsed = false;
 		state.executorActivity = undefined;
 		state.executorOutput = undefined;
 		try {
 			session?.dispose();
 		} catch {}
+		void ready?.then(
+			(pending) => {
+				if (pending !== session) {
+					try {
+						pending.dispose();
+					} catch {}
+				}
+			},
+			() => {},
+		);
+	}
+
+	const executorResourceLoaders = new Map<string, DefaultResourceLoader>();
+	const scoutResourceLoaders = new Map<string, DefaultResourceLoader>();
+
+	async function cachedResourceLoader(
+		cache: Map<string, DefaultResourceLoader>,
+		cwd: string,
+		systemPrompt: string,
+	): Promise<DefaultResourceLoader> {
+		const cached = cache.get(cwd);
+		if (cached) return cached;
+		const loader = new DefaultResourceLoader({
+			cwd,
+			agentDir: getAgentDir(),
+			noExtensions: true,
+			noPromptTemplates: true,
+			appendSystemPrompt: [systemPrompt],
+		});
+		await loader.reload();
+		cache.set(cwd, loader);
+		return loader;
+	}
+
+	function launchExecutor(ctx: ExtensionContext): void {
+		const model = state.executorModel;
+		if (!model) return;
+		const thinking = state.executorThinking;
+		const cwd = ctx.cwd;
+		const agentDir = getAgentDir();
+		state.executorSessionModel = model;
+		state.executorSessionThinking = thinking;
+		const ready = (async (): Promise<AgentSession> => {
+			const resourceLoader = await cachedResourceLoader(
+				executorResourceLoaders,
+				cwd,
+				EXECUTOR_SYSTEM_PROMPT,
+			);
+			const { session } = await createAgentSession({
+				cwd,
+				agentDir,
+				model,
+				thinkingLevel: thinking,
+				resourceLoader,
+				sessionManager: SessionManager.inMemory(cwd),
+			});
+			return session;
+		})();
+		state.executorReady = ready;
+		void ready.then(
+			(session) => {
+				if (state.executorReady === ready) {
+					state.executorSession = session;
+					state.executorUsed = false;
+				} else {
+					try {
+						session.dispose();
+					} catch {}
+				}
+			},
+			() => {
+				if (state.executorReady === ready) {
+					state.executorReady = undefined;
+					state.executorSessionModel = undefined;
+					state.executorSessionThinking = undefined;
+				}
+			},
+		);
+	}
+
+	function warmExecutor(ctx: ExtensionContext): void {
+		if (!state.executorModel) {
+			disposeExecutor();
+			return;
+		}
+		if (state.executorUsed || !executorConfigMatches()) {
+			disposeExecutor();
+		}
+		if (!state.executorReady && !state.executorSession) {
+			launchExecutor(ctx);
+		}
+	}
+
+	function touchedPath(args: unknown): string | undefined {
+		if (args && typeof args === "object") {
+			const record = args as Record<string, unknown>;
+			for (const key of ["path", "file_path"]) {
+				const value = record[key];
+				if (typeof value === "string" && value.trim().length > 0) {
+					return value;
+				}
+			}
+		}
+		return undefined;
+	}
+
+	async function gitToplevel(ctx: ExtensionContext): Promise<string | undefined> {
+		try {
+			const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+				cwd: ctx.cwd,
+				timeout: GIT_TIMEOUT_MS,
+			});
+			if (result.code !== 0) return undefined;
+			return result.stdout.trim() || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	async function gitPorcelain(toplevel: string): Promise<Map<string, string> | undefined> {
+		try {
+			const status = await pi.exec("git", ["status", "--porcelain"], {
+				cwd: toplevel,
+				timeout: GIT_TIMEOUT_MS,
+			});
+			if (status.code !== 0) return undefined;
+			return parsePorcelain(status.stdout);
+		} catch {
+			return undefined;
+		}
+	}
+
+	async function executorDiffStat(
+		ctx: ExtensionContext,
+		toplevel: string,
+		before: Map<string, string> | undefined,
+		after: Map<string, string> | undefined,
+		touchedFiles: ReadonlySet<string>,
+	): Promise<string | undefined> {
+		if (!before || !after) return undefined;
+		try {
+			const touchedRepoPaths = [...touchedFiles]
+				.map((path) => relative(toplevel, resolve(ctx.cwd, path)))
+				.filter((path) => path.length > 0 && !path.startsWith(".."));
+			const { modified, added } = changedPaths(before, after);
+			const diffPaths = new Set(modified);
+			for (const path of touchedRepoPaths) {
+				if (after.has(path)) diffPaths.add(path);
+			}
+			const remaining = touchedRepoPaths.filter((path) => !diffPaths.has(path));
+			if (remaining.length > 0) {
+				const names = await pi.exec("git", ["diff", "--name-only", "--", ...remaining], {
+					cwd: toplevel,
+					timeout: GIT_TIMEOUT_MS,
+				});
+				if (names.code !== 0) return undefined;
+				for (const line of names.stdout.split("\n")) {
+					const path = line.trim();
+					if (path) diffPaths.add(path);
+				}
+			}
+			const parts: string[] = [];
+			if (diffPaths.size > 0) {
+				const diff = await pi.exec("git", ["diff", "--stat", "--", ...diffPaths], {
+					cwd: toplevel,
+					timeout: GIT_TIMEOUT_MS,
+				});
+				if (diff.code !== 0) return undefined;
+				if (diff.stdout.trim()) {
+					parts.push(diff.stdout.trim());
+				}
+			}
+			for (const path of added) {
+				parts.push(`new: ${path}`);
+			}
+			return parts.length > 0 ? parts.join("\n") : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	function startRun(ctx: ExtensionContext, task: string): void {
-		disposeExecutor();
+		warmExecutor(ctx);
+		state.executorActivity = undefined;
+		state.executorOutput = undefined;
 		state.runActive = true;
+		syncFusionTools();
 		state.task = task;
 		state.revisions = 0;
 		state.executed = false;
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
 		state.executorTranscript = [];
+		state.scoutCalls = 0;
+		state.scoutUsage = createEmptyUsage();
 		setPhase(ctx, "planning");
 	}
 
@@ -241,10 +526,43 @@ export default function (pi: ExtensionAPI) {
 		return choice === undefined ? undefined : byOption.get(choice);
 	}
 
+	async function selectThinkingLevel(
+		ctx: ExtensionContext,
+		model: Model<Api>,
+		role: "supervisor" | "executor" | "scout",
+		pickDefault: (levels: readonly ModelThinkingLevel[]) => ThinkingLevel,
+	): Promise<ThinkingLevel> {
+		const levels = getSupportedThinkingLevels(model);
+		const ordered = orderThinkingLevels(levels);
+		const defaultLevel = pickDefault(levels);
+		if (ordered.length <= 1) {
+			return defaultLevel;
+		}
+		const options = [
+			`${defaultLevel} (default)`,
+			...ordered.filter((level) => level !== defaultLevel),
+		];
+		const choice = await selectScrollableOption(ctx, `Fusion ${role} thinking level`, options);
+		if (choice === undefined) return defaultLevel;
+		return (
+			ordered.find((level) => level === choice.replace(/ \(default\)$/, "")) ??
+			defaultLevel
+		);
+	}
+
 	async function selectModelPair(
 		ctx: ExtensionContext,
 	): Promise<
-		{ supervisor: Model<Api>; executor: Model<Api>; supervisorLabel: string; executorLabel: string } | undefined
+		| {
+				supervisor: Model<Api>;
+				executor: Model<Api>;
+				supervisorLabel: string;
+				executorLabel: string;
+				supervisorThinking: ThinkingLevel;
+				executorThinking: ThinkingLevel;
+				scoutThinking: ThinkingLevel;
+			}
+		| undefined
 	> {
 		const supervisor = await selectModel(
 			ctx,
@@ -255,56 +573,81 @@ export default function (pi: ExtensionAPI) {
 				: undefined,
 		);
 		if (!supervisor) return undefined;
+		const supervisorThinking = await selectThinkingLevel(
+			ctx,
+			supervisor,
+			"supervisor",
+			defaultThinkingLevel,
+		);
 		const executor = await selectModel(ctx, "Fusion executor model", "executor");
 		if (!executor) return undefined;
+		const executorThinking = await selectThinkingLevel(
+			ctx,
+			executor,
+			"executor",
+			defaultThinkingLevel,
+		);
+		const scoutThinking = await selectThinkingLevel(
+			ctx,
+			executor,
+			"scout",
+			scoutDefaultThinkingLevel,
+		);
 		return {
 			supervisor,
 			executor,
 			supervisorLabel: modelLabel(supervisor),
 			executorLabel: modelLabel(executor),
+			supervisorThinking,
+			executorThinking,
+			scoutThinking,
 		};
 	}
 
 	async function configureModels(ctx: ExtensionContext): Promise<
-		{ supervisor: Model<Api>; executor: Model<Api>; supervisorLabel: string; executorLabel: string } | undefined
+		| {
+				supervisor: Model<Api>;
+				executor: Model<Api>;
+				supervisorLabel: string;
+				executorLabel: string;
+				supervisorThinking: ThinkingLevel;
+				executorThinking: ThinkingLevel;
+				scoutThinking: ThinkingLevel;
+			}
+		| undefined
 	> {
 		const pair = await selectModelPair(ctx);
 		if (!pair) return undefined;
 		state.supervisorModel = pair.supervisor;
 		state.supervisorLabel = pair.supervisorLabel;
+		state.supervisorThinking = pair.supervisorThinking;
 		state.executorModel = pair.executor;
 		state.executorLabel = pair.executorLabel;
+		state.executorThinking = pair.executorThinking;
+		state.scoutThinking = pair.scoutThinking;
+		disposeExecutor();
+		warmExecutor(ctx);
 		updateWidget(ctx);
 		return pair;
 	}
 
 	async function ensureExecutor(ctx: ExtensionContext): Promise<AgentSession> {
-		if (state.executorSession) return state.executorSession;
-		const model = state.executorModel;
-		if (!model) {
+		if (!state.executorModel) {
 			throw new Error("No fusion executor model configured. Run /fusion or /fusion-mode first.");
 		}
-		const cwd = ctx.cwd;
-		const agentDir = getAgentDir();
-		const resourceLoader = new DefaultResourceLoader({
-			cwd,
-			agentDir,
-			noExtensions: true,
-			noPromptTemplates: true,
-			appendSystemPrompt: [EXECUTOR_SYSTEM_PROMPT],
-		});
-		await resourceLoader.reload();
-		const thinkingLevel: ThinkingLevel | undefined = ctx.thinkingLevel;
-		const { session } = await createAgentSession({
-			cwd,
-			agentDir,
-			model,
-			thinkingLevel,
-			resourceLoader,
-			sessionManager: SessionManager.inMemory(cwd),
-		});
-		state.executorSession = session;
-		return session;
+		if (!executorConfigMatches()) {
+			disposeExecutor();
+		}
+		if (state.executorSession) {
+			return state.executorSession;
+		}
+		if (!state.executorReady) {
+			launchExecutor(ctx);
+		}
+		if (!state.executorReady) {
+			throw new Error("Fusion executor session did not start.");
+		}
+		return state.executorReady;
 	}
 
 	pi.registerTool({
@@ -317,15 +660,24 @@ export default function (pi: ExtensionAPI) {
 			brief: Type.String({ minLength: 1 }),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<FusionToolDetails>> {
-			const respond = (text: string, error?: string, usage?: Usage): AgentToolResult<FusionToolDetails> => ({
+			const timings: FusionTimings = {};
+			const respond = (
+				text: string,
+				error?: string,
+				usage?: Usage,
+				extras?: { output?: string; report?: ExecutorReport; diffStat?: string },
+			): AgentToolResult<FusionToolDetails> => ({
 				content: [{ type: "text", text }],
 				details: {
 					action: params.action,
 					revisions: state.revisions,
 					executor: executorLabel(),
-					output: text,
+					output: extras?.output ?? text,
 					error,
 					usage,
+					timings,
+					report: extras?.report,
+					diffStat: extras?.diffStat,
 					transcript: executorProgressText(),
 				},
 				usage,
@@ -338,10 +690,18 @@ export default function (pi: ExtensionAPI) {
 						revisions: state.revisions,
 						executor: executorLabel(),
 						output: text,
+						timings,
 						transcript: executorProgressText(),
 					},
 				});
 			};
+			const renderThrottle = createThrottle(() => {
+				emit(executorProgressText());
+				updateWidget(ctx);
+			}, RENDER_THROTTLE_MS);
+			const scheduleRender = renderThrottle.schedule;
+			const timingLine = (): string =>
+				`Timing: ready ${timings.readyMs ?? "-"}ms, first event ${timings.firstEventMs ?? "-"}ms, total ${timings.totalMs ?? "-"}ms`;
 
 			if (state.delegating) {
 				return respond("A fusion delegation is already in progress. Wait for it to complete before delegating again.");
@@ -359,6 +719,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			state.delegating = true;
+			const startedAt = Date.now();
 			try {
 				const isRevision = params.action === "revise";
 				if (isRevision) {
@@ -368,20 +729,28 @@ export default function (pi: ExtensionAPI) {
 						`[revision ${state.revisions}/${MAX_REVISIONS}] Executor resumed with ${executorLabel()}`,
 					);
 				} else {
-					disposeExecutor();
+					if (state.executorUsed || !executorConfigMatches()) {
+						disposeExecutor();
+					}
 					state.runActive = true;
 					state.task = params.brief;
+					state.executorBrief = params.brief;
 					state.revisions = 0;
 					state.executed = false;
 					setPhase(ctx, "executing");
 					appendExecutorProgress(`[execute] Executor started with ${executorLabel()}`);
 				}
 				emit(executorProgressText());
-				const promptText = isRevision
-					? buildRevisionPrompt(params.brief, state.revisions)
-					: buildExecutorPrompt(params.brief);
 				if (signal?.aborted) throw new Error("Fusion delegation aborted.");
 				const session = await ensureExecutor(ctx);
+				timings.readyMs = Date.now() - startedAt;
+				const promptText = isRevision
+					? buildRevisionPrompt(
+							params.brief,
+							state.revisions,
+							state.executorUsed ? undefined : state.executorBrief,
+						)
+					: buildExecutorPrompt(params.brief);
 				if (signal?.aborted) {
 					await session.abort();
 					throw new Error("Fusion delegation aborted.");
@@ -391,47 +760,44 @@ export default function (pi: ExtensionAPI) {
 				};
 				signal?.addEventListener("abort", abortExecutor, { once: true });
 				const messageStart = session.messages.length;
+				const touchedFiles = new Set<string>();
 				let liveText = "";
-				let pendingText = "";
 				const unsubscribe = session.subscribe((event) => {
+					if (timings.firstEventMs === undefined) {
+						timings.firstEventMs = Date.now() - startedAt;
+					}
 					if (event.type === "message_update") {
 						const streamEvent = event.assistantMessageEvent;
 						if (streamEvent.type === "thinking_start") {
 							state.executorActivity = "reasoning";
 							appendExecutorProgress("[reasoning] Executor is reasoning privately.");
-							updateWidget(ctx);
-							emit(executorProgressText());
+							scheduleRender();
 						} else if (streamEvent.type === "text_start") {
 							liveText = "";
-							pendingText = "";
 							state.executorOutput = undefined;
 						} else if (streamEvent.type === "text_delta") {
 							liveText += streamEvent.delta;
-							pendingText += streamEvent.delta;
 							state.executorOutput = liveText;
 							state.executorActivity = "writing";
-							updateWidget(ctx);
-							if (pendingText.includes("\n") || pendingText.length >= 80) {
-								pendingText = "";
-								emit(executorProgressText());
-							}
+							scheduleRender();
 						} else if (streamEvent.type === "text_end") {
 							const content = streamEvent.content.trim();
 							if (content) {
 								appendExecutorProgress(`[executor]\n${content}`);
 							}
 							liveText = "";
-							pendingText = "";
 							state.executorOutput = undefined;
 							state.executorActivity = "working";
-							updateWidget(ctx);
-							emit(executorProgressText());
+							scheduleRender();
 						}
 					} else if (event.type === "tool_execution_start") {
+						if (event.toolName === "edit" || event.toolName === "write") {
+							const path = touchedPath(event.args);
+							if (path) touchedFiles.add(path);
+						}
 						state.executorActivity = `running ${describeExecutorTool(event.toolName, event.args)}`;
 						appendExecutorProgress(`[tool] ${describeExecutorTool(event.toolName, event.args)}`);
-						updateWidget(ctx);
-						emit(executorProgressText());
+						scheduleRender();
 					} else if (event.type === "tool_execution_end") {
 						appendExecutorProgress(`[${event.isError ? "failed" : "done"}] ${event.toolName}`);
 						const summary = summarizeToolResult(event.result);
@@ -439,16 +805,21 @@ export default function (pi: ExtensionAPI) {
 							appendExecutorProgress(`[result]\n${summary}`);
 						}
 						state.executorActivity = `${event.toolName} ${event.isError ? "failed" : "completed"}`;
-						updateWidget(ctx);
-						emit(executorProgressText());
+						scheduleRender();
 					}
 				});
+				state.executorUsed = true;
+				const toplevel = await gitToplevel(ctx);
+				const porcelainBefore = toplevel ? await gitPorcelain(toplevel) : undefined;
 				try {
 					await session.prompt(promptText, { source: "extension" });
 				} finally {
 					signal?.removeEventListener("abort", abortExecutor);
 					unsubscribe();
 				}
+				const porcelainAfter = toplevel ? await gitPorcelain(toplevel) : undefined;
+				timings.totalMs = Date.now() - startedAt;
+				state.lastTimings = { ...timings };
 				const output = lastAssistantOutput(session);
 				const usage = aggregateUsage(session.messages.slice(messageStart));
 				state.executorUsage = addUsage(state.executorUsage, usage);
@@ -460,8 +831,9 @@ export default function (pi: ExtensionAPI) {
 						`[failed] Executor stopped with status "${output.stopReason}"${reason}.`,
 					);
 					setPhase(ctx, "failed");
+					renderThrottle.flush();
 					return respond(
-						`Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}`,
+						`Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`,
 						output.errorMessage ?? output.stopReason,
 						usage,
 					);
@@ -469,19 +841,38 @@ export default function (pi: ExtensionAPI) {
 				state.executorActivity = "finished";
 				appendExecutorProgress("[finished] Executor completed the delegation.");
 				setPhase(ctx, "reviewing");
-				emit(executorProgressText());
+				const parsed = parseExecutorReport(output.text);
+				const diffStat = toplevel
+					? await executorDiffStat(
+							ctx,
+							toplevel,
+							porcelainBefore,
+							porcelainAfter,
+							touchedFiles,
+						)
+					: undefined;
+				renderThrottle.flush();
 				return respond(
-					`${output.text || "The executor finished without producing a text report."}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}`,
+					`${formatCompactReport(parsed.report, diffStat, parsed.prose)}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`,
 					undefined,
 					usage,
+					{
+						output: parsed.prose || output.text,
+						report: parsed.report,
+						diffStat,
+					},
 				);
 			} catch (error) {
+				timings.totalMs = Date.now() - startedAt;
+				state.lastTimings = { ...timings };
 				state.executorActivity = "failed";
 				const message = error instanceof Error ? error.message : String(error);
 				appendExecutorProgress(`[failed] ${message}`);
 				setPhase(ctx, "failed");
-				return respond(`Fusion delegation failed: ${message}`, message);
+				renderThrottle.flush();
+				return respond(`Fusion delegation failed: ${message}\n${timingLine()}`, message);
 			} finally {
+				renderThrottle.cancel();
 				state.delegating = false;
 			}
 		},
@@ -495,8 +886,227 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, { isPartial }, theme) {
 			const details = result.details as FusionToolDetails | undefined;
 			const transcript = details?.transcript;
+			if (details?.report && !isPartial) {
+				const lines: string[] = [];
+				if (transcript) {
+					const transcriptLines = transcript.split("\n");
+					const tail = transcriptLines.slice(-TRANSCRIPT_TAIL_LINES);
+					if (transcriptLines.length > tail.length) {
+						lines.push(theme.fg("muted", `… ${transcriptLines.length - tail.length} earlier lines`));
+					}
+					for (const line of tail) {
+						lines.push(theme.fg("muted", line));
+					}
+					lines.push("");
+				}
+				let inBlockers = false;
+				for (const line of formatCompactReport(
+					details.report,
+					details.diffStat,
+					details.output,
+				).split("\n")) {
+					if (!line.startsWith("- ") && line !== "Blockers:") inBlockers = false;
+					if (line === "Blockers:") inBlockers = true;
+					if (line.startsWith("Status:")) {
+						lines.push(theme.fg("text", theme.bold(line)));
+					} else if (line.startsWith("- PASS")) {
+						lines.push(theme.fg("success", line));
+					} else if (line.startsWith("- FAIL") || inBlockers) {
+						lines.push(theme.fg("error", line));
+					} else {
+						lines.push(theme.fg("text", line));
+					}
+				}
+				return new Text(lines.join("\n"), 0, 0);
+			}
 			const fallback = result.content.find((part) => part.type === "text");
 			const text = transcript || (fallback?.type === "text" ? fallback.text : "");
+			const color = details?.error ? "error" : isPartial ? "muted" : "text";
+			return new Text(theme.fg(color, text), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "fusion_scout",
+		label: "Fusion Scout",
+		description:
+			"Ask the Fusion scout read-only questions about this repository. Runs on the cheap executor model in an isolated session with read-only tools (read, grep, find, ls). Pass 1-5 questions; each call answers all of them with path:line citations. At most 4 calls per run.",
+		parameters: Type.Object({
+			questions: Type.Array(Type.String({ minLength: 1 }), { minItems: 1, maxItems: 5 }),
+		}),
+		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<FusionScoutDetails>> {
+			let scoutTranscript: string[] = [];
+			let scoutActivity = "scouting";
+			const appendScoutProgress = (entry: string): void => {
+				scoutTranscript = appendProgressEntry(scoutTranscript, entry);
+			};
+			const scoutTranscriptText = (): string => {
+				const transcript = formatProgressTranscript(scoutTranscript);
+				const header = `Fusion scout: ${scoutActivity}`;
+				return transcript ? `${header}\n\n${transcript}` : header;
+			};
+			const respond = (text: string, error?: string, usage?: Usage): AgentToolResult<FusionScoutDetails> => ({
+				content: [{ type: "text", text }],
+				details: {
+					answer: text,
+					error,
+					usage,
+					transcript: scoutTranscriptText(),
+				},
+				usage,
+			});
+			const emit = (text: string): void => {
+				onUpdate?.({
+					content: [{ type: "text", text }],
+					details: {
+						answer: text,
+						transcript: scoutTranscriptText(),
+					},
+				});
+			};
+			const renderThrottle = createThrottle(() => {
+				emit(scoutTranscriptText());
+				updateWidget(ctx);
+			}, RENDER_THROTTLE_MS);
+			const scheduleRender = renderThrottle.schedule;
+
+			if (state.scoutCalls >= MAX_SCOUT_CALLS) {
+				return respond(
+					`Scout limit reached: at most ${MAX_SCOUT_CALLS} fusion_scout calls are allowed per run.`,
+				);
+			}
+
+			if (!state.executorModel) {
+				return respond("No fusion executor model configured. Run /fusion-config first.");
+			}
+
+			state.scoutCalls += 1;
+			const previousPhase = state.phase;
+			setPhase(ctx, "scouting");
+			appendScoutProgress(`[scout] Scouting ${params.questions.length} question(s) with ${executorLabel()}`);
+			emit(scoutTranscriptText());
+			let session: AgentSession | undefined;
+			try {
+				const cwd = ctx.cwd;
+				const resourceLoader = await cachedResourceLoader(
+					scoutResourceLoaders,
+					cwd,
+					SCOUT_SYSTEM_PROMPT,
+				);
+				const created = await createAgentSession({
+					cwd,
+					agentDir: getAgentDir(),
+					model: state.executorModel,
+					thinkingLevel: state.scoutThinking,
+					resourceLoader,
+					sessionManager: SessionManager.inMemory(cwd),
+					tools: ["read", "grep", "find", "ls"],
+				});
+				session = created.session;
+				if (signal?.aborted) {
+					await session.abort();
+					throw new Error("Fusion scout aborted.");
+				}
+				const abortScout = (): void => {
+					void session?.abort();
+				};
+				signal?.addEventListener("abort", abortScout, { once: true });
+				const messageStart = session.messages.length;
+				let toolCalls = 0;
+				let capped = false;
+				const unsubscribe = session.subscribe((event) => {
+					if (event.type === "tool_execution_start") {
+						toolCalls += 1;
+						if (toolCalls > MAX_SCOUT_TOOL_CALLS && !capped) {
+							capped = true;
+							void session?.abort();
+						}
+						scoutActivity = `running ${describeExecutorTool(event.toolName, event.args)}`;
+						appendScoutProgress(`[tool] ${describeExecutorTool(event.toolName, event.args)}`);
+						scheduleRender();
+					} else if (event.type === "tool_execution_end") {
+						appendScoutProgress(`[${event.isError ? "failed" : "done"}] ${event.toolName}`);
+						scoutActivity = `${event.toolName} ${event.isError ? "failed" : "completed"}`;
+						scheduleRender();
+					}
+				});
+				try {
+					await session.prompt(buildScoutPrompt(params.questions), { source: "extension" });
+				} finally {
+					signal?.removeEventListener("abort", abortScout);
+					unsubscribe();
+				}
+				const output = lastAssistantOutput(session);
+				const usage = aggregateUsage(session.messages.slice(messageStart));
+				state.scoutUsage = addUsage(state.scoutUsage, usage);
+				if (capped && output.text.trim()) {
+					const partial =
+						output.text.trim().length <= SCOUT_ANSWER_MAX_CHARS
+							? output.text.trim()
+							: `${output.text.trim().slice(0, SCOUT_ANSWER_MAX_CHARS - 1)}…`;
+					appendScoutProgress(
+						`[capped] Scout stopped after ${MAX_SCOUT_TOOL_CALLS} tool calls.`,
+					);
+					renderThrottle.flush();
+					return respond(
+						`Scout stopped after ${MAX_SCOUT_TOOL_CALLS} tool calls; partial answer:\n${partial}\n\nScout usage: ${formatUsageSummary(usage)}`,
+						undefined,
+						usage,
+					);
+				}
+				if (output.stopReason === "error" || output.stopReason === "aborted") {
+					const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
+					appendScoutProgress(
+						`[failed] Scout stopped with status "${output.stopReason}"${reason}.`,
+					);
+					renderThrottle.flush();
+					return respond(
+						`Fusion scout stopped with status "${output.stopReason}"${reason}.\n\nScout usage: ${formatUsageSummary(usage)}`,
+						output.errorMessage ?? output.stopReason,
+						usage,
+					);
+				}
+				const answer = (output.text || "The scout returned no answer.").trim();
+				const truncated =
+					answer.length <= SCOUT_ANSWER_MAX_CHARS
+						? answer
+						: `${answer.slice(0, SCOUT_ANSWER_MAX_CHARS - 1)}…`;
+				appendScoutProgress("[done] Scout answered.");
+				renderThrottle.flush();
+				return respond(
+					`${truncated}\n\nScout usage: ${formatUsageSummary(usage)}`,
+					undefined,
+					usage,
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				appendScoutProgress(`[failed] ${message}`);
+				renderThrottle.flush();
+				return respond(`Fusion scout failed: ${message}`, message);
+			} finally {
+				renderThrottle.cancel();
+				try {
+					session?.dispose();
+				} catch {}
+				if (state.phase === "scouting") {
+					setPhase(ctx, previousPhase);
+				}
+			}
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("fusion_scout ")) +
+					theme.fg("muted", `${args.questions.length} question(s)`),
+				0,
+				0,
+			);
+		},
+		renderResult(result, { isPartial }, theme) {
+			const details = result.details as FusionScoutDetails | undefined;
+			const fallback = result.content.find((part) => part.type === "text");
+			const text =
+				(isPartial ? details?.transcript : undefined) ||
+				(fallback?.type === "text" ? fallback.text : "");
 			const color = details?.error ? "error" : isPartial ? "muted" : "text";
 			return new Text(theme.fg(color, text), 0, 0);
 		},
@@ -537,6 +1147,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			pi.setThinkingLevel(state.supervisorThinking);
 			startRun(ctx, task);
 			pi.sendUserMessage(buildSupervisorPrompt(task, modelLabel(executor)));
 		},
@@ -556,7 +1167,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(
-				`Fusion configured. Supervisor ${pair.supervisorLabel} (${priceText(pair.supervisor)}), executor ${pair.executorLabel} (${priceText(pair.executor)}). Recent cohort ${RECENT_MODEL_COHORT}.`,
+				`Fusion configured. Supervisor ${pair.supervisorLabel} (${priceText(pair.supervisor)}, thinking ${pair.supervisorThinking}), executor ${pair.executorLabel} (${priceText(pair.executor)}, thinking ${pair.executorThinking}), scout thinking ${pair.scoutThinking}. Recent cohort ${RECENT_MODEL_COHORT}.`,
 				"info",
 			);
 		},
@@ -573,9 +1184,12 @@ export default function (pi: ExtensionAPI) {
 				state.modeEnabled = false;
 				state.runActive = false;
 				state.phase = "idle";
+				syncFusionTools();
 				state.supervisorUsage = createEmptyUsage();
 				state.executorUsage = createEmptyUsage();
 				state.executorTranscript = [];
+				state.scoutCalls = 0;
+				state.scoutUsage = createEmptyUsage();
 				disposeExecutor();
 				ctx.ui.setWidget(WIDGET_KEY, undefined);
 				ctx.ui.notify("Fusion mode disabled.", "info");
@@ -600,11 +1214,13 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			pi.setThinkingLevel(state.supervisorThinking);
 			state.modeEnabled = true;
+			syncFusionTools();
 			state.phase = "idle";
 			updateWidget(ctx);
 			ctx.ui.notify(
-				`Fusion mode enabled. Supervisor ${modelLabel(supervisor)}, executor ${modelLabel(executor)}.`,
+				`Fusion mode enabled. Supervisor ${modelLabel(supervisor)} (thinking ${state.supervisorThinking}), executor ${modelLabel(executor)} (thinking ${state.executorThinking}).`,
 				"info",
 			);
 		},
@@ -615,13 +1231,16 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const mode = state.modeEnabled ? "enabled" : "disabled";
 			const supervisor = state.supervisorModel
-				? `${modelLabel(state.supervisorModel)} (${priceText(state.supervisorModel)})`
+				? `${modelLabel(state.supervisorModel)} (${priceText(state.supervisorModel)}, thinking ${state.supervisorThinking})`
 				: "none";
 			const executor = state.executorModel
-				? `${modelLabel(state.executorModel)} (${priceText(state.executorModel)})`
+				? `${modelLabel(state.executorModel)} (${priceText(state.executorModel)}, thinking ${state.executorThinking})`
 				: "none";
+			const lastTimings = state.lastTimings
+				? ` | last timing ready ${state.lastTimings.readyMs ?? "-"}ms, first event ${state.lastTimings.firstEventMs ?? "-"}ms, total ${state.lastTimings.totalMs ?? "-"}ms`
+				: "";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"}${lastTimings}`,
 				"info",
 			);
 		},
@@ -633,6 +1252,7 @@ export default function (pi: ExtensionAPI) {
 			await ctx.waitForIdle();
 			disposeExecutor();
 			state.runActive = false;
+			syncFusionTools();
 			state.task = undefined;
 			state.revisions = 0;
 			state.executed = false;
@@ -641,6 +1261,8 @@ export default function (pi: ExtensionAPI) {
 			state.supervisorUsage = createEmptyUsage();
 			state.executorUsage = createEmptyUsage();
 			state.executorTranscript = [];
+			state.scoutCalls = 0;
+			state.scoutUsage = createEmptyUsage();
 			updateWidget(ctx);
 			ctx.ui.notify(
 				"Fusion executor context and completed run data cleared. No temporary files were created.",
@@ -665,6 +1287,7 @@ export default function (pi: ExtensionAPI) {
 			return { action: "continue" };
 		}
 		startRun(ctx, event.text);
+		pi.setThinkingLevel(state.supervisorThinking);
 		return { action: "transform", text: buildSupervisorPrompt(event.text, executorLabel()) };
 	});
 
@@ -675,8 +1298,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		if (!state.runActive || state.phase === "failed") return;
-		setPhase(ctx, "complete");
+		if (!state.runActive) return;
+		if (state.phase !== "failed") {
+			setPhase(ctx, "complete");
+		}
+		if (!state.modeEnabled) {
+			state.runActive = false;
+		}
+		syncFusionTools();
+	});
+
+	pi.on("session_start", () => {
+		try {
+			syncFusionTools();
+		} catch {}
 	});
 
 	pi.on("session_shutdown", () => {
@@ -686,6 +1321,15 @@ export default function (pi: ExtensionAPI) {
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
 		state.executorTranscript = [];
+		state.scoutCalls = 0;
+		state.scoutUsage = createEmptyUsage();
 		disposeExecutor();
+		try {
+			syncFusionTools();
+		} catch {}
 	});
+
+	try {
+		syncFusionTools();
+	} catch {}
 }
