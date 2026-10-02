@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
 	appendProgressEntry,
+	formatDuration,
 	formatProgressTranscript,
 	MAX_PROGRESS_CHARS,
 	summarizeToolResult,
+	tailLines,
 	truncateInline,
 } from "../src/progress.ts";
 
@@ -52,6 +54,34 @@ describe("appendProgressEntry", () => {
 		expect(entries.length).toBe(1);
 		expect(entries[0].startsWith("…")).toBe(true);
 		expect(entries[0].length).toBe(MAX_PROGRESS_CHARS);
+	});
+});
+
+describe("tailLines", () => {
+	test("keeps only the last n lines", () => {
+		expect(tailLines("a\nb\nc\nd", 2)).toBe("c\nd");
+	});
+
+	test("returns the whole text when it has fewer lines than n", () => {
+		expect(tailLines("a\nb", 8)).toBe("a\nb");
+	});
+
+	test("drops trailing blank lines", () => {
+		expect(tailLines("a\nb\n\n\n", 8)).toBe("a\nb");
+	});
+});
+
+describe("formatDuration", () => {
+	test("formats sub-second durations as milliseconds", () => {
+		expect(formatDuration(850)).toBe("850ms");
+	});
+
+	test("formats seconds with one decimal", () => {
+		expect(formatDuration(1200)).toBe("1.2s");
+	});
+
+	test("formats minutes with zero-padded seconds", () => {
+		expect(formatDuration(125000)).toBe("2m 05s");
 	});
 });
 

@@ -5,3 +5,4 @@ export const SCOUT_ANSWER_MAX_CHARS = 3000;
 export const RENDER_THROTTLE_MS = 150;
 export const GIT_TIMEOUT_MS = 5000;
 export const TRANSCRIPT_TAIL_LINES = 15;
+export const TOOL_STREAM_TAIL_LINES = 8;

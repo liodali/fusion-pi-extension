@@ -30,6 +30,21 @@ export function formatProgressTranscript(entries: string[], liveText?: string): 
 	return `…${combined.slice(combined.length - (MAX_PROGRESS_CHARS - 1))}`;
 }
 
+export function tailLines(text: string, n: number): string {
+	const lines = text.trimEnd().split("\n");
+	return lines.slice(-n).join("\n");
+}
+
+export function formatDuration(ms: number): string {
+	if (ms < 1000) return `${Math.round(ms)}ms`;
+	const tenths = Math.round(ms / 100) / 10;
+	if (tenths < 60) return `${tenths.toFixed(1)}s`;
+	const seconds = Math.round(ms / 1000);
+	const minutes = Math.floor(seconds / 60);
+	const rest = seconds % 60;
+	return `${minutes}m ${String(rest).padStart(2, "0")}s`;
+}
+
 export function summarizeToolResult(result: unknown, max = MAX_TOOL_RESULT_CHARS): string | undefined {
 	let text: string | undefined;
 	if (typeof result === "string") {
