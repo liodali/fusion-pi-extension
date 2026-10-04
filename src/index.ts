@@ -55,7 +55,11 @@ import {
 	tailLines,
 	truncateInline,
 } from "./progress.ts";
-import { isRecentModel, RECENT_MODEL_COHORT, searchRecentModels } from "./recent-models.ts";
+import {
+	filterModelsByQuery,
+	isRecentModel,
+	RECENT_MODEL_COHORT,
+} from "./recent-models.ts";
 import {
 	type ExecutorReport,
 	formatCompactReport,
@@ -70,7 +74,7 @@ import {
 	runsDir,
 	writeRun,
 } from "./runs.ts";
-import { selectScrollableOption } from "./scrollable-select.ts";
+import { selectScrollableOption, selectSearchableOption } from "./scrollable-select.ts";
 import {
 	defaultThinkingLevel,
 	orderThinkingLevels,
@@ -516,6 +520,8 @@ export default function (pi: ExtensionAPI) {
 		title: string,
 		tier: FusionModelTier,
 		preferredLabel?: string,
+		current?: Model<Api>,
+		currentThinking?: ThinkingLevel,
 	): Promise<Model<Api> | undefined> {
 		const tierModels = collectModels(ctx).filter(
 			(model) => isRecentModel(model) && isModelInTier(model, tier),
@@ -529,31 +535,50 @@ export default function (pi: ExtensionAPI) {
 			);
 			return undefined;
 		}
-		const query = await ctx.ui.input(
-			`Search recent Fusion ${tier} models (${RECENT_MODEL_COHORT})`,
-			"Provider, model name, or ID (blank for all)",
-		);
-		if (query === undefined) return undefined;
-		const models = searchRecentModels(tierModels, query);
-		if (models.length === 0) {
-			ctx.ui.notify(`No recent ${tier} models match "${query.trim()}".`, "warning");
-			return undefined;
-		}
-		const byOption = new Map<string, Model<Api>>();
-		const options: string[] = [];
-		for (const model of models) {
-			const option = formatPricedModelLabel(model);
-			byOption.set(option, model);
-			options.push(option);
-		}
+		const orderedModels = [...tierModels];
 		if (preferredLabel) {
-			const index = models.findIndex((model) => modelLabel(model) === preferredLabel);
+			const index = orderedModels.findIndex((model) => modelLabel(model) === preferredLabel);
 			if (index > 0) {
-				options.unshift(options.splice(index, 1)[0]);
+				orderedModels.unshift(orderedModels.splice(index, 1)[0]);
 			}
 		}
-		const choice = await selectScrollableOption(ctx, title, options);
+		if (current) {
+			const index = orderedModels.findIndex((model) => modelLabel(model) === modelLabel(current));
+			if (index > 0) {
+				orderedModels.unshift(orderedModels.splice(index, 1)[0]);
+			}
+		}
+		const labelFor = (model: Model<Api>): string =>
+			current && modelLabel(model) === modelLabel(current)
+				? `${formatPricedModelLabel(model)} (current)`
+				: formatPricedModelLabel(model);
+		const byOption = new Map<string, Model<Api>>();
+		for (const model of orderedModels) {
+			byOption.set(labelFor(model), model);
+		}
+		const pickerTitle = current
+			? `${title} — current: ${modelLabel(current)} (thinking ${currentThinking ?? "off"})`
+			: title;
+		const choice = await selectSearchableOption(
+			ctx,
+			pickerTitle,
+			(query) => filterModelsByQuery(orderedModels, query).map(labelFor),
+			{ placeholder: "Type to search provider, model name, or ID" },
+		);
 		return choice === undefined ? undefined : byOption.get(choice);
+	}
+
+	async function askSkipOrChange(
+		ctx: ExtensionContext,
+		role: "supervisor" | "executor",
+		skipLabel: string,
+	): Promise<"skip" | "change" | undefined> {
+		const choice = await selectScrollableOption(ctx, `Fusion ${role} model`, [
+			skipLabel,
+			"Change model",
+		]);
+		if (choice === undefined) return undefined;
+		return choice === skipLabel ? "skip" : "change";
 	}
 
 	async function selectThinkingLevel(
@@ -594,34 +619,78 @@ export default function (pi: ExtensionAPI) {
 			}
 		| undefined
 	> {
-		const supervisor = await selectModel(
-			ctx,
-			"Fusion supervisor model",
-			"supervisor",
-			ctx.model && isRecentModel(ctx.model) && isModelInTier(ctx.model, "supervisor")
-				? modelLabel(ctx.model)
-				: undefined,
+		let supervisor = state.supervisorModel;
+		let supervisorThinking = state.supervisorThinking;
+		if (supervisor) {
+			const action = await askSkipOrChange(
+				ctx,
+				"supervisor",
+				`Skip (keep ${modelLabel(supervisor)} · thinking ${supervisorThinking})`,
+			);
+			if (action === undefined) return undefined;
+			if (action === "change") supervisor = undefined;
+		}
+		if (!supervisor) {
+			supervisor = await selectModel(
+				ctx,
+				"Fusion supervisor model",
+				"supervisor",
+				ctx.model && isRecentModel(ctx.model) && isModelInTier(ctx.model, "supervisor")
+					? modelLabel(ctx.model)
+					: undefined,
+				state.supervisorModel,
+				state.supervisorThinking,
+			);
+			if (!supervisor) return undefined;
+			supervisorThinking = await selectThinkingLevel(
+				ctx,
+				supervisor,
+				"supervisor",
+				defaultThinkingLevel,
+			);
+		}
+		ctx.ui.notify(
+			`Fusion supervisor: ${modelLabel(supervisor)} · thinking ${supervisorThinking}`,
+			"info",
 		);
-		if (!supervisor) return undefined;
-		const supervisorThinking = await selectThinkingLevel(
-			ctx,
-			supervisor,
-			"supervisor",
-			defaultThinkingLevel,
-		);
-		const executor = await selectModel(ctx, "Fusion executor model", "executor");
-		if (!executor) return undefined;
-		const executorThinking = await selectThinkingLevel(
-			ctx,
-			executor,
-			"executor",
-			defaultThinkingLevel,
-		);
-		const scoutThinking = await selectThinkingLevel(
-			ctx,
-			executor,
-			"scout",
-			scoutDefaultThinkingLevel,
+		let executor = state.executorModel;
+		let executorThinking = state.executorThinking;
+		let scoutThinking = state.scoutThinking;
+		if (executor) {
+			const action = await askSkipOrChange(
+				ctx,
+				"executor",
+				`Skip (keep ${modelLabel(executor)} · thinking ${executorThinking} · scout ${scoutThinking})`,
+			);
+			if (action === undefined) return undefined;
+			if (action === "change") executor = undefined;
+		}
+		if (!executor) {
+			executor = await selectModel(
+				ctx,
+				"Fusion executor model",
+				"executor",
+				undefined,
+				state.executorModel,
+				state.executorThinking,
+			);
+			if (!executor) return undefined;
+			executorThinking = await selectThinkingLevel(
+				ctx,
+				executor,
+				"executor",
+				defaultThinkingLevel,
+			);
+			scoutThinking = await selectThinkingLevel(
+				ctx,
+				executor,
+				"scout",
+				scoutDefaultThinkingLevel,
+			);
+		}
+		ctx.ui.notify(
+			`Fusion executor: ${modelLabel(executor)} · thinking ${executorThinking} · scout ${scoutThinking}`,
+			"info",
 		);
 		return {
 			supervisor,
@@ -646,6 +715,8 @@ export default function (pi: ExtensionAPI) {
 			}
 		| undefined
 	> {
+		const prevExecutor = state.executorModel;
+		const prevExecutorThinking = state.executorThinking;
 		const pair = await selectModelPair(ctx);
 		if (!pair) return undefined;
 		state.supervisorModel = pair.supervisor;
@@ -655,7 +726,9 @@ export default function (pi: ExtensionAPI) {
 		state.executorLabel = pair.executorLabel;
 		state.executorThinking = pair.executorThinking;
 		state.scoutThinking = pair.scoutThinking;
-		disposeExecutor();
+		if (pair.executor !== prevExecutor || pair.executorThinking !== prevExecutorThinking) {
+			disposeExecutor();
+		}
 		warmExecutor(ctx);
 		updateWidget(ctx);
 		return pair;

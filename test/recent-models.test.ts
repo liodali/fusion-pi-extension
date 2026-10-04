@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { isRecentModel, RECENT_MODEL_COHORT, searchRecentModels } from "../src/recent-models.ts";
+import {
+	filterModelsByQuery,
+	isRecentModel,
+	MODEL_PICKER_INITIAL_COUNT,
+	RECENT_MODEL_COHORT,
+	searchRecentModels,
+} from "../src/recent-models.ts";
 
 const model = (id: string, provider = "test-provider", name = "Test Model"): Model<Api> =>
 	({ id, provider, name }) as Model<Api>;
@@ -76,5 +82,68 @@ describe("searchRecentModels", () => {
 	test("old models stay excluded even when the query matches them", () => {
 		const result = searchRecentModels(models(), "claude sonnet");
 		expect(result.map((m) => m.id)).toEqual(["claude-sonnet-4.5"]);
+	});
+});
+
+describe("filterModelsByQuery", () => {
+	const models = () => [
+		model("claude-sonnet-4.5", "anthropic", "Claude Sonnet 4.5"),
+		model("gpt-5.2", "openai", "GPT 5.2"),
+		model("gemini-3-pro", "google", "Gemini 3 Pro"),
+		model("claude-opus-4.5", "anthropic", "Claude Opus 4.5"),
+		model("grok-4.1", "xai", "Grok 4.1"),
+		model("glm-4.7", "zai", "GLM 4.7"),
+		model("deepseek-v3.2", "deepseek", "DeepSeek V3.2"),
+	];
+
+	test("blank query returns the first MODEL_PICKER_INITIAL_COUNT models in input order", () => {
+		expect(MODEL_PICKER_INITIAL_COUNT).toBe(5);
+		const result = filterModelsByQuery(models(), "   ");
+		expect(result.map((m) => m.id)).toEqual([
+			"claude-sonnet-4.5",
+			"gpt-5.2",
+			"gemini-3-pro",
+			"claude-opus-4.5",
+			"grok-4.1",
+		]);
+	});
+
+	test("custom emptyLimit is respected", () => {
+		expect(filterModelsByQuery(models(), "", 3).map((m) => m.id)).toEqual([
+			"claude-sonnet-4.5",
+			"gpt-5.2",
+			"gemini-3-pro",
+		]);
+	});
+
+	test("non-blank query searches all models, including past the first page", () => {
+		const result = filterModelsByQuery(models(), "deepseek");
+		expect(result.map((m) => m.id)).toEqual(["deepseek-v3.2"]);
+	});
+
+	test("matches provider, id, and display name case-insensitively", () => {
+		expect(filterModelsByQuery(models(), "ANTHROPIC").map((m) => m.id)).toEqual([
+			"claude-sonnet-4.5",
+			"claude-opus-4.5",
+		]);
+		expect(filterModelsByQuery(models(), "gpt-5.2").map((m) => m.id)).toEqual(["gpt-5.2"]);
+		expect(filterModelsByQuery(models(), "GEMINI").map((m) => m.id)).toEqual(["gemini-3-pro"]);
+	});
+
+	test("requires every query token", () => {
+		expect(filterModelsByQuery(models(), "anthropic opus").map((m) => m.id)).toEqual([
+			"claude-opus-4.5",
+		]);
+		expect(filterModelsByQuery(models(), "anthropic openai")).toEqual([]);
+	});
+
+	test("does not apply the recent-model cohort filter", () => {
+		const all = [model("claude-sonnet-4", "anthropic", "Claude Sonnet 4"), ...models()];
+		const result = filterModelsByQuery(all, "claude sonnet");
+		expect(result.map((m) => m.id)).toEqual(["claude-sonnet-4", "claude-sonnet-4.5"]);
+	});
+
+	test("returns an empty list when nothing matches", () => {
+		expect(filterModelsByQuery(models(), "no-such-model")).toEqual([]);
 	});
 });

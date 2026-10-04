@@ -2,6 +2,8 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 
 export const RECENT_MODEL_COHORT = "2025–2026";
 
+export const MODEL_PICKER_INITIAL_COUNT = 5;
+
 export const RECENT_MODEL_PATTERNS: readonly RegExp[] = [
 	/claude-(?:fable|opus|sonnet|haiku)-(?:4-[5-9]|[5-9])/,
 	/gpt-(?:5-[2-9]|[6-9])/,
@@ -26,16 +28,32 @@ export function isRecentModel(model: Model<Api>): boolean {
 	return RECENT_MODEL_PATTERNS.some((pattern) => pattern.test(text));
 }
 
-export function searchRecentModels(models: Model<Api>[], query: string): Model<Api>[] {
-	const recent = models.filter(isRecentModel);
-	const tokens = query
+function queryTokens(query: string): string[] {
+	return query
 		.trim()
 		.toLowerCase()
 		.split(/\s+/)
 		.filter((token) => token.length > 0);
+}
+
+function matchesQueryTokens(model: Model<Api>, tokens: string[]): boolean {
+	const combined = `${model.provider} ${model.id} ${model.name}`.toLowerCase();
+	return tokens.every((token) => combined.includes(token));
+}
+
+export function searchRecentModels(models: Model<Api>[], query: string): Model<Api>[] {
+	const recent = models.filter(isRecentModel);
+	const tokens = queryTokens(query);
 	if (tokens.length === 0) return recent;
-	return recent.filter((model) => {
-		const combined = `${model.provider} ${model.id} ${model.name}`.toLowerCase();
-		return tokens.every((token) => combined.includes(token));
-	});
+	return recent.filter((model) => matchesQueryTokens(model, tokens));
+}
+
+export function filterModelsByQuery(
+	models: Model<Api>[],
+	query: string,
+	emptyLimit = MODEL_PICKER_INITIAL_COUNT,
+): Model<Api>[] {
+	const tokens = queryTokens(query);
+	if (tokens.length === 0) return models.slice(0, emptyLimit);
+	return models.filter((model) => matchesQueryTokens(model, tokens));
 }

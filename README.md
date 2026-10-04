@@ -66,7 +66,7 @@ pi --extension ./src/index.ts
 
 | Command | Behavior |
 |---------|----------|
-| `/fusion-config` | Search and select the price-tiered supervisor and executor models. Each selector prompts for search text first (blank shows everything in the cohort), then lists matching recent models with their output pricing. After each model is chosen, a second picker offers the thinking levels that model supports, highest first, with the top entry marked `(default)`; models that cannot reason skip the picker and use `off`. The executor model gets a third picker for the scout thinking level (default `low`, falling back to the lowest supported non-`off` level). In the TUI pickers show at most 10 rows and scroll with Up/Down; other frontends use the standard select dialog. The pair and its thinking levels are remembered and reused by `/fusion` and `/fusion-mode`. |
+| `/fusion-config` | Select the price-tiered supervisor and executor models from a searchable picker. For an already-configured role, a first step offers `Skip (keep …)` — reusing the existing model and thinking levels without further prompts — or `Change model`; unconfigured roles go straight to the picker. The picker names the current model in its title, lists it first with a `(current)` tag, shows the first five matching recent models with their output pricing, and filters the full cohort live as you type (matching provider, model name, or ID). After a newly chosen model, a second picker offers the thinking levels that model supports, highest first, with the top entry marked `(default)`; models that cannot reason skip the picker and use `off`. The executor model gets a third picker for the scout thinking level (default `low`, falling back to the lowest supported non-`off` level). Each resolved role is confirmed with a summary notification. In the TUI the picker shows at most 10 rows and scrolls with Up/Down; other frontends prompt for search text first, then use the standard select dialog. The pair and its thinking levels are remembered and reused by `/fusion` and `/fusion-mode`. |
 | `/fusion [task]` | Run one task through the protocol. Prompts for the task in an editor when omitted, sets the supervisor model and thinking level with `pi.setModel`/`pi.setThinkingLevel`, starts a fresh run, warms up the executor session in the background, and sends the supervisor prompt. Reuses the configured pair when present. |
 | `/fusion-mode` | Toggle persistent mode. When enabled, ordinary interactive text prompts are transformed into the supervisor protocol automatically and the supervisor thinking level is reapplied to each intercepted prompt. When disabled, the active executor is disposed and the widget cleared. |
 | `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing and thinking levels, scout thinking level, current phase, revision count, per-run supervisor, executor, and scout usage totals, current executor activity, and the last delegation timings (session-ready wait, first executor event, total). |
@@ -75,7 +75,7 @@ pi --extension ./src/index.ts
 Quick start:
 
 ```
-/fusion-config          # search, then pick supervisor (>= $10/M) and executor (<= $10/M)
+/fusion-config          # skip or change supervisor (>= $10/M) and executor (<= $10/M); type to filter
 /fusion refactor the retry logic in src/api.ts
 /fusion-status          # inspect phase and revision count
 /fusion-mode            # make every prompt go through Fusion
