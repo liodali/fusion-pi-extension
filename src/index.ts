@@ -20,9 +20,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { changedPaths, parsePorcelain } from "./git-changes.ts";
+import { changedPaths, hashFiles, parsePorcelain } from "./git-changes.ts";
 import {
 	GIT_TIMEOUT_MS,
+	MAX_HASHED_DIRTY_PATHS,
 	MAX_SCOUT_TOOL_CALLS,
 	RENDER_THROTTLE_MS,
 	SCOUT_ANSWER_MAX_CHARS,
@@ -443,9 +444,21 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function gitHasHead(toplevel: string): Promise<boolean> {
+		try {
+			const result = await pi.exec("git", ["rev-parse", "--verify", "--quiet", "HEAD"], {
+				cwd: toplevel,
+				timeout: GIT_TIMEOUT_MS,
+			});
+			return result.code === 0;
+		} catch {
+			return false;
+		}
+	}
+
 	async function gitPorcelain(toplevel: string): Promise<Map<string, string> | undefined> {
 		try {
-			const status = await pi.exec("git", ["status", "--porcelain"], {
+			const status = await pi.exec("git", ["status", "--porcelain=v1", "-z", "-uall"], {
 				cwd: toplevel,
 				timeout: GIT_TIMEOUT_MS,
 			});
@@ -459,23 +472,32 @@ export default function (pi: ExtensionAPI) {
 	async function executorDiffStat(
 		ctx: ExtensionContext,
 		toplevel: string,
+		headExists: boolean,
 		before: Map<string, string> | undefined,
 		after: Map<string, string> | undefined,
+		beforeHashes: Map<string, string> | undefined,
+		afterHashes: Map<string, string> | undefined,
 		touchedFiles: ReadonlySet<string>,
 	): Promise<string | undefined> {
 		if (!before || !after) return undefined;
 		try {
+			const diffBase = headExists ? ["diff", "HEAD"] : ["diff"];
 			const touchedRepoPaths = [...touchedFiles]
 				.map((path) => relative(toplevel, resolve(ctx.cwd, path)))
 				.filter((path) => path.length > 0 && !path.startsWith(".."));
-			const { modified, added } = changedPaths(before, after);
+			const { modified, added, preDirty } = changedPaths(
+				before,
+				after,
+				beforeHashes,
+				afterHashes,
+			);
 			const diffPaths = new Set(modified);
 			for (const path of touchedRepoPaths) {
 				if (after.has(path)) diffPaths.add(path);
 			}
 			const remaining = touchedRepoPaths.filter((path) => !diffPaths.has(path));
 			if (remaining.length > 0) {
-				const names = await pi.exec("git", ["diff", "--name-only", "--", ...remaining], {
+				const names = await pi.exec("git", [...diffBase, "--name-only", "--", ...remaining], {
 					cwd: toplevel,
 					timeout: GIT_TIMEOUT_MS,
 				});
@@ -487,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const parts: string[] = [];
 			if (diffPaths.size > 0) {
-				const diff = await pi.exec("git", ["diff", "--stat", "--", ...diffPaths], {
+				const diff = await pi.exec("git", [...diffBase, "--stat", "--", ...diffPaths], {
 					cwd: toplevel,
 					timeout: GIT_TIMEOUT_MS,
 				});
@@ -498,6 +520,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			for (const path of added) {
 				parts.push(`new: ${path}`);
+			}
+			if (preDirty.length > 0) {
+				parts.push(
+					`pre-existing changes (diff includes edits made before this delegation): ${preDirty.join(", ")}`,
+				);
 			}
 			return parts.length > 0 ? parts.join("\n") : undefined;
 		} catch {
@@ -999,7 +1026,12 @@ export default function (pi: ExtensionAPI) {
 				});
 				state.executorUsed = true;
 				const toplevel = await gitToplevel(ctx);
+				const headExists = toplevel ? await gitHasHead(toplevel) : false;
 				const porcelainBefore = toplevel ? await gitPorcelain(toplevel) : undefined;
+				const beforeHashes =
+					toplevel && porcelainBefore && porcelainBefore.size <= MAX_HASHED_DIRTY_PATHS
+						? await hashFiles(toplevel, porcelainBefore.keys())
+						: undefined;
 				try {
 					await session.prompt(promptText, { source: "extension" });
 				} finally {
@@ -1010,6 +1042,10 @@ export default function (pi: ExtensionAPI) {
 					state.activeRun.sessionFile = session.sessionManager.getSessionFile();
 				}
 				const porcelainAfter = toplevel ? await gitPorcelain(toplevel) : undefined;
+				const afterHashes =
+					toplevel && beforeHashes
+						? await hashFiles(toplevel, beforeHashes.keys())
+						: undefined;
 				timings.totalMs = Date.now() - startedAt;
 				state.lastTimings = { ...timings };
 				const output = lastAssistantOutput(session);
@@ -1045,8 +1081,11 @@ export default function (pi: ExtensionAPI) {
 					? await executorDiffStat(
 							ctx,
 							toplevel,
+							headExists,
 							porcelainBefore,
 							porcelainAfter,
+							beforeHashes,
+							afterHashes,
 							touchedFiles,
 						)
 					: undefined;
