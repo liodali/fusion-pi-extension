@@ -78,6 +78,7 @@ import {
 	writeRun,
 } from "./runs.ts";
 import { selectScrollableOption, selectSearchableOption } from "./scrollable-select.ts";
+import { needsContinuation } from "./settle.ts";
 import {
 	defaultThinkingLevel,
 	orderThinkingLevels,
@@ -139,6 +140,7 @@ interface FusionState {
 	finalFixUsed: boolean;
 	executed: boolean;
 	delegating: boolean;
+	settleNudges: number;
 	task?: string;
 	originalTask?: string;
 	supervisorModel?: Model<Api>;
@@ -227,6 +229,7 @@ export default function (pi: ExtensionAPI) {
 		finalFixUsed: false,
 		executed: false,
 		delegating: false,
+		settleNudges: 0,
 		supervisorThinking: "off",
 		executorThinking: "off",
 		scoutThinking: "off",
@@ -543,6 +546,7 @@ export default function (pi: ExtensionAPI) {
 		state.revisions = 0;
 		state.finalFixUsed = false;
 		state.executed = false;
+		state.settleNudges = 0;
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
 		state.executorTranscript = [];
@@ -1441,6 +1445,7 @@ export default function (pi: ExtensionAPI) {
 				state.modeEnabled = false;
 				state.runActive = false;
 				state.phase = "idle";
+				state.settleNudges = 0;
 				syncFusionTools();
 				state.supervisorUsage = createEmptyUsage();
 				state.executorUsage = createEmptyUsage();
@@ -1572,6 +1577,7 @@ export default function (pi: ExtensionAPI) {
 			state.revisions = run.revisions;
 			state.finalFixUsed = run.finalFixUsed ?? false;
 			state.executed = true;
+			state.settleNudges = 0;
 			state.runActive = true;
 			state.executorUsed = true;
 			state.runId = run.runId;
@@ -1604,6 +1610,7 @@ export default function (pi: ExtensionAPI) {
 			state.finalFixUsed = false;
 			state.executed = false;
 			state.delegating = false;
+			state.settleNudges = 0;
 			state.phase = "idle";
 			state.supervisorUsage = createEmptyUsage();
 			state.executorUsage = createEmptyUsage();
@@ -1644,6 +1651,45 @@ export default function (pi: ExtensionAPI) {
 		updateWidget(ctx);
 	});
 
+	pi.on("agent_before_settle", (event) => {
+		if (!state.runActive || state.delegating) return;
+		let lastAssistantText = "";
+		for (let i = event.context.llmMessages.length - 1; i >= 0; i--) {
+			const message = event.context.llmMessages[i];
+			if (message.role !== "assistant") continue;
+			lastAssistantText = message.content
+				.filter((part): part is TextContent => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			break;
+		}
+		// The nudge lands as a trailing user message, so the runtime's post-commit
+		// canContinue check passes whenever the context has any non-system message.
+		const nudge = needsContinuation({
+			executed: state.executed,
+			lastAssistantText,
+			nudges: state.settleNudges,
+			outcome: event.outcome,
+			canContinue:
+				event.context.canContinue ||
+				event.context.llmMessages.some((message) => message.role !== "system"),
+		});
+		if (!nudge) return;
+		state.settleNudges += 1;
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message" as const,
+					customType: "fusion-continue",
+					content: nudge,
+					display: true,
+				},
+			],
+			continue: true,
+		};
+	});
+
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!state.runActive) return;
 		if (state.phase !== "failed") {
@@ -1675,6 +1721,7 @@ export default function (pi: ExtensionAPI) {
 		state.runActive = false;
 		state.modeEnabled = false;
 		state.phase = "idle";
+		state.settleNudges = 0;
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
 		state.executorTranscript = [];

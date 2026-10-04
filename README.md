@@ -25,6 +25,8 @@ While the executor works, the Fusion widget and the `fusion_delegate` tool displ
 
 The executor ends its final message with a fenced JSON report (`status`, `summary`, `files_changed`, `checks`, `blockers`). Fusion parses it leniently — the last ```json block wins, malformed entries are dropped, and missing or invalid output degrades to an `unknown` status with the raw prose kept. The model-facing tool result is a compact rendering of that report plus a diff stat computed by the extension: `git status --porcelain=v1 -z -uall` snapshots taken before and after the delegation are compared (files that were already dirty are also content-hashed, so untouched pre-existing edits are not attributed to the executor), `git diff HEAD --stat` runs over the modified and still-dirty touched paths so staged changes are included, untracked or staged-new files are listed as `new:` lines, and paths that were already dirty before the delegation are listed on a `pre-existing changes` line. A final `Review: light` or `Review: full (reasons)` line is computed by Fusion: light only when the report is `done`, every check passed, there are no blockers, and the diff is small — anything else gets a full review. The raw prose lives in the tool details, and the rendered row shows a color-coded report above the last lines of the transcript.
 
+A run only completes when the supervisor finishes its protocol: if it settles early — for example to ask the user a question — Fusion injects a continuation nudge (at most 2 per run) that points it back at the protocol instead of ending the run. The supervisor is instructed never to stop for user questions and to end the run with a final summary starting with the exact heading `## Fusion summary`, which is what lets the run settle cleanly.
+
 While planning or reviewing, the supervisor can also call `fusion_scout` with 1–5 read-only questions (at most 4 calls per run, and at most 20 tool calls per invocation — a capped scout returns whatever partial answer it produced). The scout runs on the executor model with its own configurable thinking level (default `low`, or the lowest supported level) in a disposable session restricted to `read`, `grep`, `find`, and `ls`, and answers with `path:line` citations, truncated to ~3000 characters. Scout usage is tracked separately and shown in the widget and `/fusion-status`.
 
 The `fusion_delegate` and `fusion_scout` tools are only exposed to the model while a Fusion run or Fusion mode is active; the extension syncs the active tool list on run start, run completion, mode toggles, `/fusion-clean`, and session lifecycle events.
@@ -127,12 +129,13 @@ Quick start:
 | `src/progress.ts` | Bounded chronological executor transcript and tool-result summaries. |
 | `src/recent-models.ts` | Curated recent-model cohort matching and search. |
 | `src/report.ts` | Lenient parsing and compact rendering of the executor's JSON report, plus the computed `Review: light`/`full` tier. |
+| `src/settle.ts` | Completion gate: decides whether a settling run needs a continuation nudge. |
 | `src/scrollable-select.ts` | TUI picker capped at 10 visible rows; falls back to the standard select dialog outside TUI. |
 | `src/thinking.ts` | Thinking-level ordering (highest first), supervisor/executor and scout defaults, and agent-level conversion. |
 | `src/throttle.ts` | Trailing-edge `createThrottle` used to coalesce executor render updates. |
 | `src/usage.ts` | Incremental `Usage` aggregation for executor invocations. |
 | `.pi/extensions/fusion.ts` | Project-local shim re-exporting `src/index.ts` for auto-discovery. |
-| `test/*.test.ts` | `bun:test` unit tests for prompts, pricing, cohort matching/search, git change detection, progress transcript, report parsing and review tiering, thinking levels, throttle, and usage aggregation. |
+| `test/*.test.ts` | `bun:test` unit tests for prompts, pricing, cohort matching/search, git change detection, progress transcript, report parsing and review tiering, settle gating, thinking levels, throttle, and usage aggregation. |
 
 ```bash
 bun test

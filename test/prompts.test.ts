@@ -6,6 +6,7 @@ import {
 	buildScoutPrompt,
 	buildSupervisorPrompt,
 	EXECUTOR_SYSTEM_PROMPT,
+	FUSION_SUMMARY_HEADING,
 	MAX_REVISIONS,
 	MAX_SCOUT_CALLS,
 	SCOUT_SYSTEM_PROMPT,
@@ -36,6 +37,13 @@ describe("buildSupervisorPrompt", () => {
 		expect(prompt).toContain("diff stat");
 	});
 
+	test("forbids stopping to ask the user and requires listing assumptions", () => {
+		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain("Do not stop to ask the user questions during the run");
+		expect(prompt).toContain("most reasonable interpretation");
+		expect(prompt).toContain("assumptions");
+	});
+
 	test("tiers the review on the computed Review line", () => {
 		const prompt = buildSupervisorPrompt("task", "executor");
 		expect(prompt).toContain("Review line");
@@ -45,6 +53,12 @@ describe("buildSupervisorPrompt", () => {
 		expect(prompt).toContain("git diff HEAD");
 		expect(prompt).toContain("rerun the checks");
 		expect(prompt).toContain("Never trust the summary");
+	});
+
+	test("requires the final summary to start with the fusion summary heading", () => {
+		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain(FUSION_SUMMARY_HEADING);
+		expect(prompt).toContain(`starts with the exact heading "${FUSION_SUMMARY_HEADING}"`);
 	});
 
 	test("ends with a final acceptance audit against the original task and a once-per-run final_fix", () => {
