@@ -1,3 +1,5 @@
+import { CLEAN_DIFF_MAX_FILES, CLEAN_DIFF_MAX_LINES } from "./limits.ts";
+
 export const REPORT_SUMMARY_MAX_CHARS = 300;
 export const REPORT_PROSE_MAX_CHARS = 1500;
 
@@ -85,6 +87,45 @@ export function parseExecutorReport(text: string): { report: ExecutorReport; pro
 	return { report: normalizeReport(parsed as Record<string, unknown>), prose };
 }
 
+export interface ReviewTier {
+	tier: "light" | "full";
+	reasons: string[];
+}
+
+const DIFF_SUMMARY_PATTERN =
+	/(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/;
+
+export function reviewTier(report: ExecutorReport, diffStat?: string): ReviewTier {
+	const reasons: string[] = [];
+	if (report.status !== "done") reasons.push(`status ${report.status}`);
+	if (report.checks.length === 0) {
+		reasons.push("no checks run");
+	} else if (report.checks.some((check) => check.result !== "pass")) {
+		reasons.push("failing checks");
+	}
+	if (report.blockers.length > 0) reasons.push("blockers");
+	const stat = diffStat?.trim() ?? "";
+	if (!stat) {
+		reasons.push("no diff stat");
+	} else {
+		if (stat.split("\n").some((line) => line.startsWith("pre-existing changes"))) {
+			reasons.push("pre-existing changes");
+		}
+		const summary = DIFF_SUMMARY_PATTERN.exec(stat);
+		const files =
+			(summary ? Number(summary[1]) : 0) +
+			stat.split("\n").filter((line) => line.startsWith("new:")).length;
+		const changed = summary ? Number(summary[2] ?? 0) + Number(summary[3] ?? 0) : 0;
+		if (files > CLEAN_DIFF_MAX_FILES) {
+			reasons.push(`${files} files > ${CLEAN_DIFF_MAX_FILES}`);
+		}
+		if (changed > CLEAN_DIFF_MAX_LINES) {
+			reasons.push(`${changed} lines > ${CLEAN_DIFF_MAX_LINES}`);
+		}
+	}
+	return { tier: reasons.length === 0 ? "light" : "full", reasons };
+}
+
 export function formatCompactReport(
 	report: ExecutorReport,
 	diffStat?: string,
@@ -131,5 +172,9 @@ export function formatCompactReport(
 			);
 		}
 	}
+	const review = reviewTier(report, diffStat);
+	lines.push(
+		review.tier === "light" ? "Review: light" : `Review: full (${review.reasons.join(", ")})`,
+	);
 	return lines.join("\n");
 }

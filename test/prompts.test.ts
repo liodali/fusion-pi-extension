@@ -36,10 +36,13 @@ describe("buildSupervisorPrompt", () => {
 		expect(prompt).toContain("diff stat");
 	});
 
-	test("tiers the review: light pass on clean reports, full review otherwise", () => {
+	test("tiers the review on the computed Review line", () => {
 		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain("Review line");
+		expect(prompt).toContain('"Review: light"');
+		expect(prompt).toContain('"Review: full"');
 		expect(prompt).toContain("review only the changed hunks");
-		expect(prompt).toContain("partial/blocked/unknown");
+		expect(prompt).toContain("git diff HEAD");
 		expect(prompt).toContain("rerun the checks");
 		expect(prompt).toContain("Never trust the summary");
 	});

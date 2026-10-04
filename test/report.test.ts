@@ -5,6 +5,7 @@ import {
 	parseExecutorReport,
 	REPORT_PROSE_MAX_CHARS,
 	REPORT_SUMMARY_MAX_CHARS,
+	reviewTier,
 } from "../src/report.ts";
 
 const VALID_REPORT: ExecutorReport = {
@@ -99,9 +100,10 @@ describe("formatCompactReport", () => {
 		expect(text).toContain("- FAIL bun run typecheck");
 		expect(text).toContain("- missing API key");
 		expect(text).toContain("Diff stat:\na.ts | 2 +-");
+		expect(text).toContain("Review: full (status partial, failing checks, blockers)");
 	});
 
-	test("omits empty sections and renders without a diff stat", () => {
+	test("omits empty sections and ends with the review line", () => {
 		const report: ExecutorReport = {
 			status: "done",
 			summary: "fine",
@@ -110,7 +112,9 @@ describe("formatCompactReport", () => {
 			blockers: [],
 		};
 		const text = formatCompactReport(report);
-		expect(text).toBe("Status: done\nSummary: fine");
+		expect(text).toBe(
+			"Status: done\nSummary: fine\nReview: full (no checks run, no diff stat)",
+		);
 	});
 
 	test("appends truncated prose for unknown status", () => {
@@ -124,7 +128,72 @@ describe("formatCompactReport", () => {
 		const prose = "p".repeat(REPORT_PROSE_MAX_CHARS + 100);
 		const text = formatCompactReport(report, undefined, prose);
 		expect(text).toContain("Executor report (unstructured):");
-		expect(text.length).toBeLessThan(REPORT_PROSE_MAX_CHARS + 100);
+		expect(text.length).toBeLessThan(REPORT_PROSE_MAX_CHARS + 200);
 		expect(text).toContain("…");
+		expect(text).toContain("Review: full (status unknown, no checks run, no diff stat)");
+	});
+});
+
+describe("reviewTier", () => {
+	const DONE: ExecutorReport = {
+		status: "done",
+		summary: "ok",
+		files_changed: [{ path: "a.ts", change: "edit" }],
+		checks: [{ command: "bun test", result: "pass" }],
+		blockers: [],
+	};
+	const STAT = " a.ts | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)";
+
+	test("is light for a clean report with a small diff", () => {
+		expect(reviewTier(DONE, STAT)).toEqual({ tier: "light", reasons: [] });
+	});
+
+	test("is full when no checks ran", () => {
+		expect(reviewTier({ ...DONE, checks: [] }, STAT).reasons).toContain("no checks run");
+	});
+
+	test("is full when a check failed", () => {
+		const report: ExecutorReport = {
+			...DONE,
+			checks: [{ command: "bun test", result: "fail" }],
+		};
+		expect(reviewTier(report, STAT).reasons).toContain("failing checks");
+	});
+
+	test("is full when blockers exist", () => {
+		expect(reviewTier({ ...DONE, blockers: ["missing key"] }, STAT).reasons).toContain(
+			"blockers",
+		);
+	});
+
+	test("is full for a partial or unknown status", () => {
+		expect(reviewTier({ ...DONE, status: "partial" }, STAT).reasons).toContain(
+			"status partial",
+		);
+		expect(reviewTier({ ...DONE, status: "unknown" }, STAT).reasons).toContain(
+			"status unknown",
+		);
+	});
+
+	test("is full without a diff stat", () => {
+		expect(reviewTier(DONE).reasons).toContain("no diff stat");
+		expect(reviewTier(DONE, "  ").reasons).toContain("no diff stat");
+	});
+
+	test("is full when the diff touches too many files, counting new: lines", () => {
+		const stat =
+			" a.ts | 2 +-\n b.ts | 2 +-\n c.ts | 2 +-\n d.ts | 2 +-\n 4 files changed, 4 insertions(+), 4 deletions(-)\nnew: e.ts\nnew: f.ts";
+		expect(reviewTier(DONE, stat).reasons).toContain("6 files > 5");
+	});
+
+	test("is full when the diff changes too many lines", () => {
+		const stat =
+			" a.ts | 400 +-\n 1 file changed, 300 insertions(+), 100 deletions(-)";
+		expect(reviewTier(DONE, stat).reasons).toContain("400 lines > 200");
+	});
+
+	test("is full when pre-existing changes are mixed into the diff", () => {
+		const stat = `${STAT}\npre-existing changes (diff includes edits made before this delegation): a.ts`;
+		expect(reviewTier(DONE, stat).reasons).toContain("pre-existing changes");
 	});
 });

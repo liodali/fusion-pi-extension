@@ -1162,6 +1162,10 @@ export default function (pi: ExtensionAPI) {
 					if (line === "Blockers:") inBlockers = true;
 					if (line.startsWith("Status:")) {
 						lines.push(theme.fg("text", theme.bold(line)));
+					} else if (line === "Review: light") {
+						lines.push(theme.fg("success", line));
+					} else if (line.startsWith("Review:")) {
+						lines.push(theme.fg("warning", line));
 					} else if (line.startsWith("- PASS")) {
 						lines.push(theme.fg("success", line));
 					} else if (line.startsWith("- FAIL") || inBlockers) {
