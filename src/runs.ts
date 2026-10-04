@@ -17,10 +17,12 @@ export interface FusionRun {
 	cwd: string;
 	task: string;
 	brief: string;
+	originalTask?: string;
 	executor: FusionRunExecutor;
 	sessionFile?: string;
 	status: FusionRunStatus;
 	revisions: number;
+	finalFixUsed?: boolean;
 	results: Record<string, string>;
 	updatedAt: string;
 }

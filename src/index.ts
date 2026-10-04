@@ -31,10 +31,12 @@ import {
 } from "./limits.ts";
 import {
 	buildExecutorPrompt,
+	buildFinalFixPrompt,
 	buildRevisionPrompt,
 	buildScoutPrompt,
 	buildSupervisorPrompt,
 	EXECUTOR_SYSTEM_PROMPT,
+	MAX_FINAL_FIXES,
 	MAX_REVISIONS,
 	MAX_SCOUT_CALLS,
 	SCOUT_SYSTEM_PROMPT,
@@ -97,6 +99,7 @@ type FusionPhase =
 	| "executing"
 	| "reviewing"
 	| "revising"
+	| "finalizing"
 	| "scouting"
 	| "complete"
 	| "failed";
@@ -108,7 +111,7 @@ interface FusionTimings {
 }
 
 interface FusionToolDetails {
-	action: "execute" | "revise";
+	action: "execute" | "revise" | "final_fix";
 	revisions: number;
 	executor: string;
 	output: string;
@@ -132,9 +135,11 @@ interface FusionState {
 	runActive: boolean;
 	phase: FusionPhase;
 	revisions: number;
+	finalFixUsed: boolean;
 	executed: boolean;
 	delegating: boolean;
 	task?: string;
+	originalTask?: string;
 	supervisorModel?: Model<Api>;
 	executorModel?: Model<Api>;
 	supervisorLabel?: string;
@@ -218,6 +223,7 @@ export default function (pi: ExtensionAPI) {
 		runActive: false,
 		phase: "idle",
 		revisions: 0,
+		finalFixUsed: false,
 		executed: false,
 		delegating: false,
 		supervisorThinking: "off",
@@ -268,6 +274,7 @@ export default function (pi: ExtensionAPI) {
 			`  Usage: ${formatUsageSummary(state.executorUsage)}`,
 			`Activity: ${state.executorActivity ?? "-"}${elapsed}`,
 			`Revisions: ${state.revisions}/${MAX_REVISIONS}`,
+			`Final fix: ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES}`,
 			`Scout: ${state.scoutCalls}/${MAX_SCOUT_CALLS} calls, ${formatUsageSummary(state.scoutUsage)} (thinking ${state.scoutThinking})`,
 		]);
 	}
@@ -505,7 +512,9 @@ export default function (pi: ExtensionAPI) {
 		state.runActive = true;
 		syncFusionTools();
 		state.task = task;
+		state.originalTask = task;
 		state.revisions = 0;
+		state.finalFixUsed = false;
 		state.executed = false;
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
@@ -757,9 +766,9 @@ export default function (pi: ExtensionAPI) {
 		name: "fusion_delegate",
 		label: "Fusion Delegate",
 		description:
-			'Delegate implementation work to the Fusion executor agent. Call with action "execute" and a self-contained brief to start a task, then with action "revise" and consolidated feedback to request fixes (at most 3 revisions).',
+			'Delegate implementation work to the Fusion executor agent. Call with action "execute" and a self-contained brief to start a task, then with action "revise" and consolidated feedback to request fixes (at most 3 revisions). After the final acceptance audit against the original task, action "final_fix" may be used once per run, in addition to the 3 revisions.',
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("execute"), Type.Literal("revise")]),
+			action: Type.Union([Type.Literal("execute"), Type.Literal("revise"), Type.Literal("final_fix")]),
 			brief: Type.String({ minLength: 1 }),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx): Promise<AgentToolResult<FusionToolDetails>> {
@@ -815,6 +824,12 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "revise" && !state.executed) {
 				return respond('Cannot revise before the initial execution. Call fusion_delegate with action "execute" first.');
 			}
+			if (params.action === "final_fix" && !state.executed) {
+				return respond('Cannot run the final fix before the initial execution. Call fusion_delegate with action "execute" first.');
+			}
+			if (params.action === "final_fix" && state.finalFixUsed) {
+				return respond("Final fix already used: only one final_fix is allowed per run. Report remaining gaps to the user.");
+			}
 			if (params.action === "revise" && state.revisions >= MAX_REVISIONS) {
 				return respond(
 					`Revision limit reached: at most ${MAX_REVISIONS} revisions are allowed. Take over the implementation yourself.`,
@@ -822,9 +837,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const isRevision = params.action === "revise";
+			const isFinalFix = params.action === "final_fix";
+			const isFollowUp = isRevision || isFinalFix;
 			const revision = isRevision ? state.revisions + 1 : 0;
 			const key = delegationKey(params.action, params.brief, revision);
-			const cached = isRevision ? state.activeRun?.results[key] : undefined;
+			const cached = isFollowUp ? state.activeRun?.results[key] : undefined;
 			if (cached !== undefined) {
 				return respond(`${cached}\n\n(cached result, already executed)`);
 			}
@@ -839,20 +856,30 @@ export default function (pi: ExtensionAPI) {
 					appendExecutorProgress(
 						`[revision ${state.revisions}/${MAX_REVISIONS}] Executor resumed with ${executorLabel()}`,
 					);
+				} else if (isFinalFix) {
+					state.finalFixUsed = true;
+					setPhase(ctx, "finalizing");
+					appendExecutorProgress(
+						`[final fix] Executor resumed with ${executorLabel()}`,
+					);
 				} else {
 					if (state.executorUsed || !executorConfigMatches()) {
 						disposeExecutor();
 					}
 					state.runActive = true;
 					state.task = params.brief;
+					state.originalTask ??= params.brief;
 					state.executorBrief = params.brief;
 					state.revisions = 0;
+					state.finalFixUsed = false;
 					state.executed = false;
 					state.activeRun = {
 						runId: newRunId(),
 						cwd: ctx.cwd,
 						task: params.brief,
 						brief: params.brief,
+						originalTask: state.originalTask,
+						finalFixUsed: false,
 						executor: {
 							provider: state.executorModel?.provider ?? "",
 							modelId: state.executorModel?.id ?? "",
@@ -871,6 +898,7 @@ export default function (pi: ExtensionAPI) {
 				if (state.activeRun) {
 					state.activeRun.status = "running";
 					state.activeRun.revisions = state.revisions;
+					state.activeRun.finalFixUsed = state.finalFixUsed;
 					await persistRun();
 				}
 				emit(executorProgressText());
@@ -883,7 +911,13 @@ export default function (pi: ExtensionAPI) {
 							state.revisions,
 							state.executorUsed ? undefined : state.executorBrief,
 						)
-					: buildExecutorPrompt(params.brief);
+					: isFinalFix
+						? buildFinalFixPrompt(
+								params.brief,
+								state.originalTask,
+								state.executorUsed ? undefined : state.executorBrief,
+							)
+						: buildExecutorPrompt(params.brief);
 				if (signal?.aborted) {
 					await session.abort();
 					throw new Error("Fusion delegation aborted.");
@@ -1420,7 +1454,7 @@ export default function (pi: ExtensionAPI) {
 				? ` | last timing ready ${state.lastTimings.readyMs ?? "-"}ms, first event ${state.lastTimings.firstEventMs ?? "-"}ms, total ${state.lastTimings.totalMs ?? "-"}ms`
 				: "";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"}${lastTimings}`,
 				"info",
 			);
 		},
@@ -1490,8 +1524,10 @@ export default function (pi: ExtensionAPI) {
 			state.executorLabel = run.executor.label;
 			state.executorThinking = run.executor.thinking;
 			state.task = run.task;
+			state.originalTask = run.originalTask ?? run.task;
 			state.executorBrief = run.brief;
 			state.revisions = run.revisions;
+			state.finalFixUsed = run.finalFixUsed ?? false;
 			state.executed = true;
 			state.runActive = true;
 			state.executorUsed = true;
@@ -1501,7 +1537,7 @@ export default function (pi: ExtensionAPI) {
 			setPhase(ctx, "reviewing");
 			ctx.ui.notify(`Resumed interrupted Fusion run ${run.runId}.`, "info");
 			pi.sendUserMessage(
-				'The Fusion executor was interrupted mid-task. Review the working tree, then call fusion_delegate with action "revise" to have the executor continue.',
+				`The Fusion executor was interrupted mid-task. Original task:\n${state.originalTask}\n\nReview the working tree, then call fusion_delegate with action "revise" to have the executor continue, and finish with the final acceptance audit against the original task.`,
 			);
 		},
 	});
@@ -1520,7 +1556,9 @@ export default function (pi: ExtensionAPI) {
 			state.runActive = false;
 			syncFusionTools();
 			state.task = undefined;
+			state.originalTask = undefined;
 			state.revisions = 0;
+			state.finalFixUsed = false;
 			state.executed = false;
 			state.delegating = false;
 			state.phase = "idle";

@@ -1,6 +1,6 @@
-import { MAX_REVISIONS, MAX_SCOUT_CALLS } from "./limits.ts";
+import { MAX_FINAL_FIXES, MAX_REVISIONS, MAX_SCOUT_CALLS } from "./limits.ts";
 
-export { MAX_REVISIONS, MAX_SCOUT_CALLS };
+export { MAX_FINAL_FIXES, MAX_REVISIONS, MAX_SCOUT_CALLS };
 
 export const SCOUT_SYSTEM_PROMPT = `You are the Fusion scout: a read-only investigator working in the same repository as the supervising Pi session.
 
@@ -35,7 +35,8 @@ ${task}
 4. When fusion_delegate returns, it includes a compact report (status, files, checks, blockers) and a diff stat computed by Fusion. If the report status is done, every check is PASS, there are no blockers, and the diff stat is small, review only the changed hunks (git diff on the listed files) without rerunning the checks. Otherwise — any FAIL, blockers, a partial/blocked/unknown status, or a large or unexpected diff — do a full review of the working tree and diff, and rerun the checks yourself. Never trust the summary without looking at the diff.
 5. If you find defects, batch every defect into one consolidated revision brief and call fusion_delegate with action "revise". You may request at most ${MAX_REVISIONS} revisions.
 6. Take over the implementation yourself only when the executor is blocked or clearly out of its depth.
-7. When the work is done, give the user a final summary: what was implemented, which files changed, and which checks passed.`;
+7. Final acceptance audit: before summarizing, re-read the original Task above (not your brief) and check it requirement by requirement, marking each met, partial, or missing with concrete evidence (path:line or diff hunk). Also hunt for bugs: unhandled edge cases, regressions in touched code, missing tests, and checks that were never run. If anything is partial, missing, or buggy, call fusion_delegate with action "final_fix" and one consolidated list of every gap and bug. final_fix is allowed once per run, separate from the ${MAX_REVISIONS} revisions; the executor must do these fixes — do not fix them yourself. Review the final_fix diff the same way as step 4.
+8. When the work is done, give the user a final summary: what was implemented, which files changed, which checks passed, and the acceptance checklist from step 7, including anything still unresolved.`;
 }
 
 export function buildExecutorPrompt(brief: string): string {
@@ -65,4 +66,17 @@ ${briefSection}# Feedback
 ${feedback}
 
 Address every point, rerun the relevant checks, and report what changed. End your reply with the JSON report block described in your system prompt.`;
+}
+
+export function buildFinalFixPrompt(gaps: string, originalTask?: string, originalBrief?: string): string {
+	const taskSection = originalTask?.trim() ? `# Original user task\n${originalTask.trim()}\n\n` : "";
+	const briefSection = originalBrief?.trim() ? `# Original brief\n${originalBrief.trim()}\n\n` : "";
+	return `This is the supervisor's final acceptance audit (final fix, separate from revisions).
+
+Inspect the current working tree before making changes; the audit may assume state that has drifted.
+
+${taskSection}${briefSection}# Gaps and bugs
+${gaps}
+
+Fix every gap and bug listed, rerun the relevant checks, and report what changed. End your reply with the JSON report block described in your system prompt.`;
 }

@@ -1,4 +1,5 @@
 export const MAX_REVISIONS = 3;
+export const MAX_FINAL_FIXES = 1;
 export const MAX_SCOUT_CALLS = 4;
 export const MAX_SCOUT_TOOL_CALLS = 20;
 export const SCOUT_ANSWER_MAX_CHARS = 3000;

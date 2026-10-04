@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildExecutorPrompt,
+	buildFinalFixPrompt,
 	buildRevisionPrompt,
 	buildScoutPrompt,
 	buildSupervisorPrompt,
@@ -41,6 +42,16 @@ describe("buildSupervisorPrompt", () => {
 		expect(prompt).toContain("partial/blocked/unknown");
 		expect(prompt).toContain("rerun the checks");
 		expect(prompt).toContain("Never trust the summary");
+	});
+
+	test("ends with a final acceptance audit against the original task and a once-per-run final_fix", () => {
+		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain("Final acceptance audit");
+		expect(prompt).toContain("original Task");
+		expect(prompt).toContain("final_fix");
+		expect(prompt).toContain("once per run");
+		expect(prompt).toContain(`${MAX_REVISIONS}`);
+		expect(prompt).toContain("do not fix them yourself");
 	});
 });
 
@@ -95,6 +106,48 @@ describe("buildRevisionPrompt", () => {
 	test("reminds the executor to finish with the json report block", () => {
 		expect(buildRevisionPrompt("fix it", 1)).toContain("JSON report block");
 		expect(buildRevisionPrompt("fix it", 1, "brief")).toContain("JSON report block");
+	});
+});
+
+describe("buildFinalFixPrompt", () => {
+	test("embeds the gaps, frames the call as the final acceptance audit, and demands a working tree check", () => {
+		const prompt = buildFinalFixPrompt("missing error handling in parse()");
+		expect(prompt).toContain("final acceptance audit");
+		expect(prompt).toContain("separate from revisions");
+		expect(prompt).toContain("# Gaps and bugs");
+		expect(prompt).toContain("missing error handling in parse()");
+		expect(prompt).toContain("current working tree");
+		expect(prompt).toContain("JSON report block");
+	});
+
+	test("embeds the original user task before the gaps when provided", () => {
+		const prompt = buildFinalFixPrompt("fix it", "add a /health endpoint");
+		expect(prompt).toContain("# Original user task");
+		expect(prompt).toContain("add a /health endpoint");
+		expect(prompt.indexOf("# Original user task")).toBeLessThan(
+			prompt.indexOf("# Gaps and bugs"),
+		);
+	});
+
+	test("embeds the original brief after the user task and before the gaps", () => {
+		const prompt = buildFinalFixPrompt("fix it", "add a /health endpoint", "implement it in api.ts");
+		expect(prompt).toContain("# Original brief");
+		expect(prompt).toContain("implement it in api.ts");
+		expect(prompt.indexOf("# Original user task")).toBeLessThan(
+			prompt.indexOf("# Original brief"),
+		);
+		expect(prompt.indexOf("# Original brief")).toBeLessThan(
+			prompt.indexOf("# Gaps and bugs"),
+		);
+	});
+
+	test("omits the optional sections when not provided or blank", () => {
+		const bare = buildFinalFixPrompt("fix it");
+		expect(bare).not.toContain("# Original user task");
+		expect(bare).not.toContain("# Original brief");
+		const blank = buildFinalFixPrompt("fix it", "   ", "  ");
+		expect(blank).not.toContain("# Original user task");
+		expect(blank).not.toContain("# Original brief");
 	});
 });
 

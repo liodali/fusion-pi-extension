@@ -13,6 +13,7 @@ flowchart LR
     E -->|reads, edits, checks| W[Shared working tree]
     W -->|actual diff review| S
     S -->|fusion_delegate: revise feedback, max 3| E
+    S -->|fusion_delegate: final_fix after acceptance audit, once| E
     S -->|final summary| U
 ```
 
@@ -69,7 +70,7 @@ pi --extension ./src/index.ts
 | `/fusion-config` | Select the price-tiered supervisor and executor models from a searchable picker. For an already-configured role, a first step offers `Skip (keep …)` — reusing the existing model and thinking levels without further prompts — or `Change model`; unconfigured roles go straight to the picker. The picker names the current model in its title, lists it first with a `(current)` tag, shows the first five matching recent models with their output pricing, and filters the full cohort live as you type (matching provider, model name, or ID). After a newly chosen model, a second picker offers the thinking levels that model supports, highest first, with the top entry marked `(default)`; models that cannot reason skip the picker and use `off`. The executor model gets a third picker for the scout thinking level (default `low`, falling back to the lowest supported non-`off` level). Each resolved role is confirmed with a summary notification. In the TUI the picker shows at most 10 rows and scrolls with Up/Down; other frontends prompt for search text first, then use the standard select dialog. The pair and its thinking levels are remembered and reused by `/fusion` and `/fusion-mode`. |
 | `/fusion [task]` | Run one task through the protocol. Prompts for the task in an editor when omitted, sets the supervisor model and thinking level with `pi.setModel`/`pi.setThinkingLevel`, starts a fresh run, warms up the executor session in the background, and sends the supervisor prompt. Reuses the configured pair when present. |
 | `/fusion-mode` | Toggle persistent mode. When enabled, ordinary interactive text prompts are transformed into the supervisor protocol automatically and the supervisor thinking level is reapplied to each intercepted prompt. When disabled, the active executor is disposed and the widget cleared. |
-| `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing and thinking levels, scout thinking level, current phase, revision count, per-run supervisor, executor, and scout usage totals, current executor activity, and the last delegation timings (session-ready wait, first executor event, total). |
+| `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing and thinking levels, scout thinking level, current phase, revision and final-fix counts, per-run supervisor, executor, and scout usage totals, current executor activity, and the last delegation timings (session-ready wait, first executor event, total). |
 | `/fusion-clean` | Wait for the agent to go idle, dispose the executor session, and clear run data (task, revisions, phase). Model configuration and mode are preserved. Creates no temporary files. |
 
 Quick start:
@@ -91,7 +92,8 @@ Quick start:
 4. The executor works the brief directly in the shared working tree and finishes with a structured JSON report. The tool result is its compact rendering plus a real diff stat (from before/after `git status` snapshots and the executor's touched paths), per-invocation token and cost usage, the cumulative executor total for the run, and a one-line timing breakdown (`ready`, `first event`, `total` milliseconds). Widget and transcript updates are throttled to one render per ~150 ms while the executor streams.
 5. The supervisor reviews the actual working tree and diff — never the summary alone. When the report is `done`, every check passed, there are no blockers, and the diff stat is small, the review is limited to the changed hunks; otherwise (any FAIL, blockers, a partial/blocked/unknown status, or a large or unexpected diff) the supervisor does a full review and re-runs the checks itself.
 6. Defects are batched into one consolidated revision brief per `fusion_delegate` `action: "revise"` call, up to 3 revisions per task.
-7. The supervisor takes over only if the executor is blocked, then delivers a final user-facing summary with the checks that passed.
+7. Before summarizing, the supervisor runs a final acceptance audit against the original user task (not its brief): every requirement is marked met, partial, or missing with concrete evidence, and bugs (unhandled edge cases, regressions, missing tests, checks never run) are hunted down. Any gaps go back to the executor as one consolidated `fusion_delegate` `action: "final_fix"` call — allowed once per run, separate from the 3 revisions — and its diff is reviewed the same way.
+8. The supervisor takes over only if the executor is blocked, then delivers a final user-facing summary with the checks that passed and the acceptance checklist, including anything still unresolved.
 
 ## Session and data handling
 
@@ -100,6 +102,7 @@ Quick start:
 - The selected supervisor/executor pair and mode flag live only in extension memory; they reset when Pi exits or the extension reloads.
 - Because both agents share the filesystem, executor edits are visible to the supervisor immediately.
 - Usage is tracked per run and per role: supervisor tokens are aggregated from the main session's assistant turns, executor tokens from each `fusion_delegate` invocation (initial execution plus revisions). Totals reset on a new task, mode disable, session shutdown, and `/fusion-clean`.
+- Run manifests persist the original user task separately from the executor brief (plus the revision and final-fix state) so `/fusion-resume` can restore the acceptance audit context after an interruption.
 - The extension writes no prompts, briefs, or secrets to temporary files.
 
 ## Safety and limitations
@@ -109,7 +112,7 @@ Quick start:
 - Fusion mode is text-only: image attachments in intercepted prompts are rejected with a warning.
 - Tiering depends on provider/model catalog pricing metadata. Models without trustworthy pricing are executor-only by design.
 - The recent-model cohort is a hand-maintained pattern list: a selection heuristic, not authoritative release dates, and it needs occasional updates as new model families ship.
-- Only one Fusion run is active at a time, and a run allows one initial execution plus at most 3 revisions.
+- Only one Fusion run is active at a time, and a run allows one initial execution, at most 3 revisions, and one final fix.
 - State is not durable across process restarts or extension reloads.
 
 ## Development

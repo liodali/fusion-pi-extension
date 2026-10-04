@@ -77,6 +77,27 @@ describe("writeRun/readRun", () => {
 		expect((await readRun(dir, run.runId))?.runId).toBe(run.runId);
 	});
 
+	test("roundtrips originalTask and finalFixUsed, and still parses runs without them", async () => {
+		const dir = await tmpRunsDir();
+		const run = makeRun({ originalTask: "the user's original ask", finalFixUsed: true });
+		await writeRun(dir, run);
+		const loaded = await readRun(dir, run.runId);
+		expect(loaded?.originalTask).toBe("the user's original ask");
+		expect(loaded?.finalFixUsed).toBe(true);
+
+		const legacy = makeRun({ runId: "legacy" });
+		await writeRun(dir, legacy);
+		const legacyFile = join(dir, "legacy.json");
+		const parsed = JSON.parse(await readFile(legacyFile, "utf8")) as Record<string, unknown>;
+		delete parsed.originalTask;
+		delete parsed.finalFixUsed;
+		await writeFile(legacyFile, `${JSON.stringify(parsed)}\n`);
+		const loadedLegacy = await readRun(dir, "legacy");
+		expect(loadedLegacy).toBeDefined();
+		expect(loadedLegacy?.originalTask).toBeUndefined();
+		expect(loadedLegacy?.finalFixUsed).toBeUndefined();
+	});
+
 	test("readRun returns undefined for missing or invalid manifests", async () => {
 		const dir = await tmpRunsDir();
 		expect(await readRun(dir, "nope")).toBeUndefined();
