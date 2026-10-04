@@ -766,6 +766,17 @@ export default function (pi: ExtensionAPI) {
 		state.executorLabel = pair.executorLabel;
 		state.executorThinking = pair.executorThinking;
 		state.scoutThinking = pair.scoutThinking;
+		if (state.modeEnabled) {
+			const modelSet = await pi.setModel(pair.supervisor);
+			if (!modelSet) {
+				ctx.ui.notify(
+					`Cannot use ${modelLabel(pair.supervisor)} as supervisor: no credentials configured for ${pair.supervisor.provider}.`,
+					"error",
+				);
+			} else {
+				pi.setThinkingLevel(state.supervisorThinking);
+			}
+		}
 		if (pair.executor !== prevExecutor || pair.executorThinking !== prevExecutorThinking) {
 			disposeExecutor();
 		}
