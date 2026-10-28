@@ -8,14 +8,17 @@ if (!root) throw new Error("Missing isolated Pi test directory");
 let failThinking = false;
 let failPrompt = false;
 let prompts = 0;
+let promptGate;
+let promptEntered;
+let disposals = 0;
 let durableEnabled = false;
 let durableResumes = [];
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const handle = {
 	resumeRef: () => join(root, "session.jsonl"),
 	setThinking: async () => { if (failThinking) throw new Error("thinking failed"); },
-	prompt: async () => { prompts++; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage }; },
-	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => {},
+	prompt: async () => { prompts++; promptEntered?.(); if (promptGate) await promptGate; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage }; },
+	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => { disposals++; },
 };
 mock.module("../../src/pi/executor-backend.ts", () => ({
 	createSessionExecutorBackend: () => ({ kind: "session", capabilities: { transcriptReopen: true, activeTurnReattach: false },
@@ -96,6 +99,56 @@ async function interruptedRun(id, pending) {
 	await writeRun(runsDir(root), run);
 	return run;
 }
+
+test("Pi mode changes do not dispose an active executor", async () => {
+	failPrompt = false;
+	const cwd = join(root, "active-mode-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion-mode").handler("", f.ctx);
+	expect(f.notifications.at(-1)).toContain("mode enabled");
+	let release;
+	promptGate = new Promise((resolve) => { release = resolve; });
+	const entered = new Promise((resolve) => { promptEntered = resolve; });
+	try {
+		const running = f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+		await entered;
+		const before = disposals;
+		await f.commands.get("fusion-mode").handler("", f.ctx);
+		expect(f.notifications.at(-1)).toContain("active or uncertain");
+		expect(disposals).toBe(before);
+		await f.commands.get("fusion-status").handler("", f.ctx);
+		expect(f.notifications.at(-1)).toContain("mode enabled");
+		release();
+		expect((await running).details.error).toBeUndefined();
+		await f.commands.get("fusion-mode").handler("", f.ctx);
+		expect(f.notifications.at(-1)).toContain("mode disabled");
+		expect(disposals).toBeGreaterThan(before);
+	} finally { release(); promptGate = undefined; promptEntered = undefined; }
+});
+
+test("Pi blocks delegation during mode setup and releases the guard on cancellation", async () => {
+	const cwd = join(root, "mode-setup-workspace");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	let release;
+	let entered;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const waiting = new Promise((resolve) => { entered = resolve; });
+	f.ctx.ui.input = async () => { entered(); await gate; return undefined; };
+	const enabling = f.commands.get("fusion-mode").handler("", f.ctx);
+	await waiting;
+	const before = prompts;
+	const result = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+	expect(result.content[0].text).toContain("mode change is in progress");
+	expect(prompts).toBe(before);
+	release();
+	await enabling;
+	expect(f.notifications.at(-1)).toContain("mode not enabled");
+	f.ctx.ui.input = async () => "";
+	await f.commands.get("fusion-mode").handler("", f.ctx);
+	expect(f.notifications.at(-1)).toContain("mode enabled");
+});
 
 test("an aborted Durable resume retains the original request and can retry reattachment", async () => {
 	durableEnabled = true; durableResumes = [];

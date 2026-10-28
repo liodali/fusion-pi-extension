@@ -64,13 +64,19 @@ export default {
 		const runs = new Map<string, Run>();
 		let owner: string | undefined;
 		let resetting = false;
+		// Native notification matching depends on this exact description format.
+		const services = {
+			now: () => Date.now(),
+			newRunId: () => randomUUID(),
+			newRequestId: (action: "execute" | "revise" | "final_fix" | "resume") => `Fusion ${action} ${randomUUID()}`,
+		};
 		const storageKey = `run/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
 		const saved = await ctx.storage.get(storageKey);
 		if (saved !== undefined && saved !== null) {
 			const record = readRecoveryRecord(saved, ctx.location.directory, "opencode");
 			const disposition = recoveryDisposition(record);
 			const state = { ...record.state, delegating: false };
-			const controller = new FusionController(state);
+			const controller = new FusionController(state, services);
 			if (record.pending) controller.setPending({ action: record.pending.action, requestId: record.pending.description });
 			controller.setUncertain(disposition !== "settled");
 			const run: Run = {
@@ -103,7 +109,7 @@ export default {
 			let run = runs.get(sessionID);
 			if (!run) {
 				run = {
-					controller: new FusionController({ runActive: false, phase: "idle", settleNudges: 0, delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 }),
+					controller: new FusionController({ runActive: false, phase: "idle", settleNudges: 0, delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 }, services),
 					handle: createNativeExecutor({ parentSessionID: sessionID, agent: "fusion-executor", execute: native!.execute }),
 				};
 				runs.set(sessionID, run);
@@ -130,17 +136,23 @@ export default {
 					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
 					const error = run.controller.beginDelegation(action, OPENCODE_CAPABILITIES, value.brief);
 					if (error) throw new Error(error);
-					owner = context.sessionID;
 					if (action === "execute") {
 						run.controller.startExecution(typeof value.originalTask === "string" && value.originalTask.trim() ? value.originalTask : value.brief, value.brief);
 					}
 					run.controller.setPhase(action === "execute" ? "executing" : action === "revise" ? "revising" : "finalizing");
 					const promptText = run.controller.delegationPrompt(action, value.brief);
 					const prompt = action === "execute" ? `${EXECUTOR_SYSTEM_PROMPT}\n\n${promptText}` : promptText;
+					// beginDelegation minted and recorded the pending request identity.
+					const description = run.controller.pending?.requestId;
+					if (!description) throw new Error("Fusion delegation lost its pending request identity.");
 					try {
-						const description = `Fusion ${action} ${randomUUID()}`;
-						run.controller.setPending({ requestId: description, action });
 						return await run.controller.performDelegation({
+							// Authoritative in-sequence claim: the precondition above is a
+							// fast guard, this re-check wins the workspace before intent.
+							claim: async () => {
+								if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
+								owner = context.sessionID;
+							},
 							recordIntent: () => persist(context.sessionID, run),
 							snapshot: async () => {
 								const before = await snapshotWorkspace(ctx.location.directory, nodeGitExec);
@@ -163,7 +175,7 @@ export default {
 							},
 						});
 					} catch (error) {
-						run.controller.failBeforeSubmission();
+						run.controller.failDelegation();
 						if (!run.controller.submissionBegan && !run.controller.pending) throw error;
 						if (!run.controller.submissionBegan && run.controller.pending) {
 							// No native call occurred. Clear the write-ahead intent before

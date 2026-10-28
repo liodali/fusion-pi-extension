@@ -84,6 +84,7 @@ import {
 	smallTaskThinkingLevel,
 } from "./thinking.ts";
 import { createThrottle } from "./throttle.ts";
+import { normalizeTaskSize } from "./core/task-size.ts";
 import {
 	addUsage,
 	aggregateAssistantUsage,
@@ -225,7 +226,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const sessionBackend = createSessionExecutorBackend();
-	const controller = new FusionController(state);
+	// Deterministic request keys keep durable reattach and follow-up result caching
+	// stable across restarts; timestamped run ids match the legacy manifest format.
+	const controller = new FusionController(state, {
+		now: () => Date.now(),
+		newRunId,
+		newRequestId: delegationKey,
+	});
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
 
@@ -284,6 +291,7 @@ export default function (pi: ExtensionAPI) {
 
 	const recoveryInitialization = new Map<string, Promise<void>>();
 	let resolvingRun = false;
+	let changingMode = false;
 	function initializeRecovery(cwd: string): Promise<void> {
 		let pending = recoveryInitialization.get(cwd);
 		if (!pending) {
@@ -788,8 +796,10 @@ export default function (pi: ExtensionAPI) {
 			const timingLine = (): string =>
 				`Timing: ready ${timings.readyMs ?? "-"}ms, first event ${timings.firstEventMs ?? "-"}ms, total ${timings.totalMs ?? "-"}ms`;
 
+			if (changingMode) return respond("Fusion mode change is in progress.");
 			if (resolvingRun) return respond("Fusion recovery resolution is in progress.");
 			if ((await unresolvedRuns(ctx.cwd, state.runId)).length > 0) return respond("An interrupted Fusion run requires recovery before new delegation. Use /fusion-resume or /fusion-resolve.");
+			if (changingMode) return respond("Fusion mode change is in progress.");
 			if (resolvingRun) return respond("Fusion recovery resolution is in progress.");
 			const error = controller.validateDelegation(params.action, params.brief);
 			if (error) return respond(error);
@@ -798,27 +808,27 @@ export default function (pi: ExtensionAPI) {
 			const isFinalFix = params.action === "final_fix";
 			const isResume = params.action === "resume";
 			const isFollowUp = isRevision || isFinalFix;
-			const revision = isRevision ? state.revisions + 1 : 0;
+			// Resume reuses the run's durable request identity; other actions mint one.
 			const key = isResume
 				? delegationKey("resume", state.activeRun?.runId ?? "", 0)
-				: delegationKey(params.action, params.brief, revision);
+				: controller.requestIdFor(params.action, params.brief);
+			const size = normalizeTaskSize(params.size);
 			const effective =
-				params.size === "small"
+				size === "small"
 					? smallTaskThinkingLevel(
 							state.executorThinking,
 							state.executorModel ? getSupportedThinkingLevels(state.executorModel) : [],
 						)
 					: state.executorThinking;
-			const sizeNote = params.size === "small" ? ` (small task, thinking ${effective})` : "";
+			const sizeNote = size === "small" ? ` (small task, thinking ${effective})` : "";
 			const cached = isFollowUp ? state.activeRun?.results[key] : undefined;
 			if (cached !== undefined) {
 				return respond(`${cached}\n\n(cached result, already executed)`);
 			}
 
-			const beginError = controller.beginDelegation(params.action, isResume ? (await activeBackend()).capabilities : undefined, params.brief);
+			const beginError = controller.beginDelegation(params.action, isResume ? (await activeBackend()).capabilities : undefined, params.brief, isResume ? undefined : key);
 			if (beginError) return respond(beginError);
-			if (!isResume) controller.setPending({ action: params.action, requestId: key });
-			const startedAt = Date.now();
+			const startedAt = controller.now();
 			state.delegationStartedAt = startedAt;
 			let reasoningTotalChars = 0;
 			let metricToolCalls = 0;
@@ -839,10 +849,10 @@ export default function (pi: ExtensionAPI) {
 				};
 				run.metrics.delegations.push({
 					action: params.action,
-					size: params.size ?? "standard",
+					size,
 					briefChars: params.brief.length,
 					thinking: effective,
-					totalMs: timings.totalMs ?? Date.now() - startedAt,
+					totalMs: timings.totalMs ?? controller.now() - startedAt,
 					firstEventMs: timings.firstEventMs,
 					reasoningChars: reasoningTotalChars,
 					toolCalls: metricToolCalls,
@@ -872,7 +882,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					controller.prepareExecution(params.brief);
 					state.activeRun = {
-						runId: newRunId(),
+						runId: controller.newRunId(),
 						cwd: ctx.cwd,
 						task: params.brief,
 						brief: params.brief,
@@ -910,7 +920,7 @@ export default function (pi: ExtensionAPI) {
 				emit(executorProgressText());
 				if (signal?.aborted) throw new Error("Fusion delegation aborted.");
 				const handle = await ensureExecutor(ctx);
-				timings.readyMs = Date.now() - startedAt;
+				timings.readyMs = controller.now() - startedAt;
 				if (state.activeRun) {
 					const backend = state.executorSessionBackend ?? state.executorBackend;
 					state.activeRun.backend = backend;
@@ -935,19 +945,19 @@ export default function (pi: ExtensionAPI) {
 				let reasoningStartedAt: number | undefined;
 				const onEvent = (event: ExecutorEvent): void => {
 					if (timings.firstEventMs === undefined) {
-						timings.firstEventMs = Date.now() - startedAt;
+						timings.firstEventMs = controller.now() - startedAt;
 					}
 					if (event.type === "reasoning_start") {
 						reasoningChars = 0;
-						reasoningStartedAt = Date.now();
+						reasoningStartedAt = controller.now();
 						state.executorActivity = "reasoning";
 						appendExecutorProgress("[reasoning] Executor is reasoning privately.");
 						scheduleRender();
 					} else if (event.type === "reasoning_delta") {
 						reasoningChars += event.delta.length;
 						reasoningTotalChars += event.delta.length;
-						reasoningStartedAt ??= Date.now();
-						state.executorActivity = `reasoning (${formatReasoningSize(reasoningChars)}, ${formatDuration(Date.now() - reasoningStartedAt)})`;
+						reasoningStartedAt ??= controller.now();
+						state.executorActivity = `reasoning (${formatReasoningSize(reasoningChars)}, ${formatDuration(controller.now() - reasoningStartedAt)})`;
 						scheduleRender();
 					} else if (event.type === "text_start") {
 						reasoningStartedAt = undefined;
@@ -979,7 +989,7 @@ export default function (pi: ExtensionAPI) {
 					} else if (event.type === "tool_start") {
 						reasoningStartedAt = undefined;
 						metricToolCalls += 1;
-						toolStartTimes.set(event.toolCallId, Date.now());
+						toolStartTimes.set(event.toolCallId, controller.now());
 						if (event.toolName === "edit" || event.toolName === "write") {
 							metricEditCalls += 1;
 							const path = touchedPath(event.args);
@@ -999,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
 						toolStartTimes.delete(event.toolCallId);
 						const elapsed =
 							toolStartedAt !== undefined
-								? ` ${formatDuration(Date.now() - toolStartedAt)}`
+								? ` ${formatDuration(controller.now() - toolStartedAt)}`
 								: "";
 						appendExecutorProgress(
 							`[${event.isError ? "failed" : "done"}${elapsed}] ${event.toolName}`,
@@ -1016,6 +1026,13 @@ export default function (pi: ExtensionAPI) {
 				state.executorUsed = true;
 				if (!isResume) await handle.setThinking(effective);
 				return await controller.performDelegation({
+					// Authoritative in-sequence re-check: an interrupted run in this
+					// workspace must recover before any submission is recorded.
+					claim: async () => {
+						if ((await unresolvedRuns(ctx.cwd, state.runId)).length > 0) {
+							throw new Error("An interrupted Fusion run requires recovery before new delegation. Use /fusion-resume or /fusion-resolve.");
+						}
+					},
 					recordIntent: () => persistRunCritical(),
 					snapshot: () => snapshotWorkspace(ctx.cwd, gitExec),
 					submit: () => isResume
@@ -1028,7 +1045,7 @@ export default function (pi: ExtensionAPI) {
 						return { output, workspaceBefore, workspaceAfter: await snapshotWorkspaceAfter(workspaceBefore, gitExec) };
 					},
 					settle: async ({ output, workspaceBefore, workspaceAfter }) => {
-						timings.totalMs = Date.now() - startedAt;
+						timings.totalMs = controller.now() - startedAt;
 						state.lastTimings = { ...timings };
 						const usage = output.usage;
 						state.executorUsage = addUsage(state.executorUsage, usage);
@@ -1039,7 +1056,7 @@ export default function (pi: ExtensionAPI) {
 							appendExecutorProgress(
 								`[failed] Executor stopped with status "${output.stopReason}"${reason}.`,
 							);
-							setPhase(ctx, "failed");
+							updateWidget(ctx);
 							renderThrottle.flush();
 							const text = `Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
 							recordDelegation({ stopReason: output.stopReason, usage });
@@ -1090,15 +1107,15 @@ export default function (pi: ExtensionAPI) {
 					},
 				});
 			} catch (error) {
-				controller.failBeforeSubmission();
+				controller.failDelegation();
 				if (isResume) controller.setUncertain(true);
 				if (!controller.submissionBegan && !controller.uncertain) controller.clearPending();
-				timings.totalMs = Date.now() - startedAt;
+				timings.totalMs = controller.now() - startedAt;
 				state.lastTimings = { ...timings };
 				state.executorActivity = "failed";
 				const message = error instanceof Error ? error.message : String(error);
 				appendExecutorProgress(`[failed] ${message}`);
-				setPhase(ctx, "failed");
+				updateWidget(ctx);
 				renderThrottle.flush();
 				const text = `Fusion delegation failed: ${message}\n${timingLine()}`;
 				recordDelegation({ stopReason: "error", usage: createEmptyUsage() });
@@ -1224,7 +1241,7 @@ export default function (pi: ExtensionAPI) {
 
 			const scoutError = controller.beginScout();
 			if (scoutError) return respond(scoutError);
-			const scoutStartedAt = Date.now();
+			const scoutStartedAt = controller.now();
 			const previousPhase = state.phase;
 			setPhase(ctx, "scouting");
 			appendScoutProgress(`[scout] Scouting ${params.questions.length} question(s) with ${executorLabel()}`);
@@ -1298,7 +1315,7 @@ export default function (pi: ExtensionAPI) {
 				renderThrottle.flush();
 				return respond(`Fusion scout failed: ${message}`, message);
 			} finally {
-				state.scoutMs += Date.now() - scoutStartedAt;
+				state.scoutMs += controller.now() - scoutStartedAt;
 				renderThrottle.cancel();
 				if (state.phase === "scouting") {
 					setPhase(ctx, previousPhase);
@@ -1327,6 +1344,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion", {
 		description: "Run a task through the Fusion supervisor/executor protocol",
 		handler: async (args, ctx) => {
+			if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return; }
 			if (resolvingRun) { ctx.ui.notify("Fusion recovery resolution is in progress.", "error"); return; }
 			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn. Use /fusion-resume or inspect the interrupted run before continuing.", "error"); return; }
 			if ((await unresolvedRuns(ctx.cwd)).length > 0) { ctx.ui.notify("An interrupted Fusion run requires recovery. Use /fusion-resume or /fusion-resolve.", "error"); return; }
@@ -1363,6 +1381,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const unresolved = await unresolvedRuns(ctx.cwd);
+			if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return; }
 			if (resolvingRun || unresolved.length > 0) { ctx.ui.notify("An interrupted Fusion run requires recovery. Use /fusion-resume or /fusion-resolve.", "error"); return; }
 			pi.setThinkingLevel(state.supervisorThinking);
 			startRun(ctx, task);
@@ -1373,6 +1392,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-config", {
 		description: "Select price-tiered Fusion supervisor and executor models",
 		handler: async (_args, ctx) => {
+			if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return; }
 			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn; configuration is locked until recovery.", "error"); return; }
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Fusion configuration requires a dialog-capable UI.", "error");
@@ -1394,53 +1414,58 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-mode", {
 		description: "Toggle Fusion mode for ordinary interactive prompts",
 		handler: async (_args, ctx) => {
-			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn; mode changes are locked until recovery.", "error"); return; }
+			if (changingMode || resolvingRun) { ctx.ui.notify("Fusion is busy; mode changes are locked.", "error"); return; }
+			const modeError = controller.resetError();
+			if (modeError) { ctx.ui.notify(`${modeError} Mode changes are locked.`, "error"); return; }
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Fusion mode requires a dialog-capable UI.", "error");
 				return;
 			}
-			if (state.modeEnabled) {
-				state.modeEnabled = false;
-				controller.deactivate();
-				syncFusionTools();
-				state.supervisorUsage = createEmptyUsage();
-				state.executorUsage = createEmptyUsage();
-				state.executorTranscript = [];
-				state.scoutMs = 0;
-				state.scoutUsage = createEmptyUsage();
-				disposeExecutor();
-				ctx.ui.setWidget(WIDGET_KEY, undefined);
-				ctx.ui.notify("Fusion mode disabled.", "info");
-				return;
-			}
-			let supervisor = state.supervisorModel;
-			let executor = state.executorModel;
-			if (!supervisor || !executor) {
-				const pair = await configureModels(ctx);
-				if (!pair) {
-					ctx.ui.notify("Fusion mode not enabled.", "info");
+			changingMode = true;
+			try {
+				if (state.modeEnabled) {
+					state.modeEnabled = false;
+					controller.deactivate();
+					syncFusionTools();
+					state.supervisorUsage = createEmptyUsage();
+					state.executorUsage = createEmptyUsage();
+					state.executorTranscript = [];
+					state.scoutMs = 0;
+					state.scoutUsage = createEmptyUsage();
+					disposeExecutor();
+					ctx.ui.setWidget(WIDGET_KEY, undefined);
+					ctx.ui.notify("Fusion mode disabled.", "info");
 					return;
 				}
-				supervisor = pair.supervisor;
-				executor = pair.executor;
-			}
-			const modelSet = await pi.setModel(supervisor);
-			if (!modelSet) {
+				let supervisor = state.supervisorModel;
+				let executor = state.executorModel;
+				if (!supervisor || !executor) {
+					const pair = await configureModels(ctx);
+					if (!pair) {
+						ctx.ui.notify("Fusion mode not enabled.", "info");
+						return;
+					}
+					supervisor = pair.supervisor;
+					executor = pair.executor;
+				}
+				const modelSet = await pi.setModel(supervisor);
+				if (!modelSet) {
+					ctx.ui.notify(
+						`Cannot use ${modelLabel(supervisor)} as supervisor: no credentials configured for ${supervisor.provider}.`,
+						"error",
+					);
+					return;
+				}
+				pi.setThinkingLevel(state.supervisorThinking);
+				state.modeEnabled = true;
+				syncFusionTools();
+				controller.setPhase("idle");
+				updateWidget(ctx);
 				ctx.ui.notify(
-					`Cannot use ${modelLabel(supervisor)} as supervisor: no credentials configured for ${supervisor.provider}.`,
-					"error",
+					`Fusion mode enabled. Supervisor ${modelLabel(supervisor)} (thinking ${state.supervisorThinking}), executor ${modelLabel(executor)} (thinking ${state.executorThinking}).`,
+					"info",
 				);
-				return;
-			}
-			pi.setThinkingLevel(state.supervisorThinking);
-			state.modeEnabled = true;
-			syncFusionTools();
-			controller.setPhase("idle");
-			updateWidget(ctx);
-			ctx.ui.notify(
-				`Fusion mode enabled. Supervisor ${modelLabel(supervisor)} (thinking ${state.supervisorThinking}), executor ${modelLabel(executor)} (thinking ${state.executorThinking}).`,
-				"info",
-			);
+			} finally { changingMode = false; }
 		},
 	});
 
@@ -1477,6 +1502,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-resume", {
 		description: "Resume an interrupted Fusion run",
 		handler: async (_args, ctx) => {
+			if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return; }
 			if (resolvingRun) { ctx.ui.notify("Fusion recovery resolution is in progress.", "error"); return; }
 			resolvingRun = true;
 			try {
@@ -1578,6 +1604,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-resolve", {
 		description: "Manually resolve an interrupted run after verifying its worker has stopped",
 		handler: async (_args, ctx) => {
+			if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return; }
 			if (!ctx.hasUI) { ctx.ui.notify("Fusion resolution requires a dialog-capable UI.", "error"); return; }
 			if (resolvingRun || state.delegating) { ctx.ui.notify("Fusion is busy.", "error"); return; }
 			resolvingRun = true;
@@ -1646,11 +1673,12 @@ export default function (pi: ExtensionAPI) {
 		if (event.text.trim().startsWith("/")) {
 			return { action: "continue" };
 		}
+		if (changingMode) { ctx.ui.notify("Fusion mode change is in progress.", "error"); return { action: "handled" }; }
 		if (resolvingRun || (await unresolvedRuns(ctx.cwd)).length > 0) {
 			ctx.ui.notify("An interrupted Fusion run requires recovery. Use /fusion-resume or /fusion-resolve.", "error");
 			return { action: "handled" };
 		}
-		if (resolvingRun) return { action: "handled" };
+		if (changingMode || resolvingRun) return { action: "handled" };
 		if (controller.uncertain) {
 			ctx.ui.notify("Fusion has an uncertain executor turn. Use /fusion-resume or inspect the interrupted run before continuing.", "error");
 			return { action: "handled" };

@@ -122,6 +122,7 @@ describe("OpenCode Fusion plugin", () => {
 		expect(calls).toBe(1);
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.revisions).toBe(0);
+		expect(status.phase).toBe("failed");
 		expect(status.uncertain).toBe(false);
 		await delegate.execute({ action: "revise", brief: "fix" }, context("one"));
 		expect(calls).toBe(2);
@@ -158,6 +159,9 @@ describe("OpenCode Fusion plugin", () => {
 		const first = new Map<string, Tool>();
 		await setupTest(makeContext(first), storage);
 		await expect(first.get("fusion_delegate")!.execute({ action: "execute", brief: "build", originalTask: "original" }, context("one"))).rejects.toThrow("connection lost");
+		const failedStatus = JSON.parse((await first.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(failedStatus.phase).toBe("failed");
+		expect(failedStatus.uncertain).toBe(true);
 		const restored = new Map<string, Tool>();
 		await setupTest(makeContext(restored), storage);
 		await expect(restored.get("fusion_delegate")!.execute({ action: "execute", brief: "retry" }, context("one"))).rejects.toThrow("unknown outcome");

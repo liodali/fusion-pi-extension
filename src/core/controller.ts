@@ -1,10 +1,34 @@
+import { randomUUID } from "node:crypto";
 import { delegationError, scoutLimitError, type DelegationAction, type FusionPhase, type LifecycleState } from "./workflow.ts";
 import { needsContinuation } from "../settle.ts";
 import { buildExecutorPrompt, buildFinalFixPrompt, buildRevisionPrompt } from "../prompts.ts";
 import type { WorkerCapabilities } from "./worker.ts";
 
-/** Adapter closures keep native contexts and storage formats outside the core. */
+/**
+ * Injectable time and identity. Adapters keep their native formats (deterministic
+ * request keys for durable reattach, timestamped run ids) while the policy that
+ * mints them lives in the controller.
+ */
+export interface ControllerServices {
+	now(): number;
+	newRunId(): string;
+	/** Must stay stable across restart when a runtime reattaches to a pending submission. */
+	newRequestId(action: DelegationAction, brief: string, revision: number): string;
+}
+
+export const defaultControllerServices: ControllerServices = {
+	now: () => Date.now(),
+	newRunId: () => randomUUID(),
+	newRequestId: (action, brief, revision) => `${action}:${revision}:${randomUUID()}`,
+};
+
+/**
+ * Adapter closures keep native contexts and storage formats outside the core.
+ * `claim` rejects the delegation before intent is recorded; budget refunds apply,
+ * but clearing a recorded intent stays with the adapter that persisted it.
+ */
 export interface DelegationPorts<Snapshot, Output, Evidence, Result> {
+	claim(): Promise<void>;
 	recordIntent(): Promise<void>;
 	snapshot(): Promise<Snapshot>;
 	submit(snapshot: Snapshot): Promise<Output>;
@@ -25,7 +49,16 @@ export class FusionController {
 	private previousBudget?: { revisions: number; finalFixUsed: boolean };
 	private pendingTurn?: PendingDelegation;
 	private outcomeUnknown = false;
-	constructor(readonly state: LifecycleState) {}
+	constructor(readonly state: LifecycleState, private services: ControllerServices = defaultControllerServices) {}
+
+	now(): number { return this.services.now(); }
+
+	newRunId(): string { return this.services.newRunId(); }
+
+	/** Mint a delegation's request identity without mutating state. */
+	requestIdFor(action: DelegationAction, brief: string): string {
+		return this.services.newRequestId(action, brief, action === "revise" ? this.state.revisions + 1 : 0);
+	}
 
 	validateDelegation(action: DelegationAction, brief?: string): string | undefined {
 		if (brief !== undefined && !brief.trim()) return "Fusion delegation requires a non-empty brief.";
@@ -34,16 +67,19 @@ export class FusionController {
 		return delegationError(this.state, action);
 	}
 
-	beginDelegation(action: DelegationAction, capabilities?: WorkerCapabilities, brief?: string): string | undefined {
+	beginDelegation(action: DelegationAction, capabilities?: WorkerCapabilities, brief?: string, requestId?: string): string | undefined {
 		const error = this.validateDelegation(action, brief);
 		if (error) return error;
 		if (action === "resume" && !capabilities?.activeTurnReattach) return "This worker cannot reattach to an interrupted turn.";
+		// Minted before budget mutation so a pre-begin mint and an in-begin mint agree.
+		const pendingId = action === "resume" ? undefined : requestId ?? this.requestIdFor(action, brief ?? "");
 		this.activeAction = action;
 		this.submissionStarted = false;
 		this.previousBudget = { revisions: this.state.revisions, finalFixUsed: this.state.finalFixUsed };
 		this.state.delegating = true;
 		if (action === "revise") this.state.revisions += 1;
 		if (action === "final_fix") this.state.finalFixUsed = true;
+		if (pendingId) this.pendingTurn = { action, requestId: pendingId };
 		return undefined;
 	}
 
@@ -55,6 +91,7 @@ export class FusionController {
 	get pending(): Readonly<PendingDelegation> | undefined { return this.pendingTurn; }
 	get uncertain(): boolean { return this.outcomeUnknown; }
 
+	/** Restore path only: delegation begins record their pending request directly. */
 	setPending(pending: PendingDelegation): void { this.pendingTurn = { ...pending }; }
 	clearPending(): void { this.pendingTurn = undefined; }
 	setUncertain(uncertain: boolean): void { this.outcomeUnknown = uncertain; }
@@ -88,11 +125,19 @@ export class FusionController {
 		this.previousBudget = undefined;
 	}
 
+	/** Record a failed attempt, including failures before the delegation sequence starts. */
+	failDelegation(): void {
+		this.failBeforeSubmission();
+		if (this.submissionStarted) this.outcomeUnknown = true;
+		this.state.phase = "failed";
+	}
+
 	async performDelegation<Snapshot, Output, Evidence, Result>(ports: DelegationPorts<Snapshot, Output, Evidence, Result>): Promise<Result> {
 		if (!this.state.delegating || !this.activeAction) throw new Error("No Fusion delegation is in progress.");
 		if (this.performing) throw new Error("Fusion delegation is already in progress.");
 		this.performing = true;
 		try {
+			await ports.claim();
 			await ports.recordIntent();
 			const snapshot = await ports.snapshot();
 			this.submissionStarted = true;
@@ -100,8 +145,7 @@ export class FusionController {
 			const evidence = await ports.collect(output, snapshot);
 			return await ports.settle(evidence);
 		} catch (error) {
-			this.failBeforeSubmission();
-			if (this.submissionStarted) this.outcomeUnknown = true;
+			this.failDelegation();
 			throw error;
 		} finally {
 			this.performing = false;
@@ -115,9 +159,13 @@ export class FusionController {
 	}
 
 	start(task: string): void {
-		if (this.pendingTurn || this.outcomeUnknown) throw new Error("Cannot start a Fusion run while an executor turn is unsettled.");
+		if (this.state.delegating || this.pendingTurn || this.outcomeUnknown) throw new Error("Cannot start a Fusion run while an executor turn is unsettled.");
+		this.initializeRun(task);
+	}
+
+	private initializeRun(task: string): void {
 		Object.assign(this.state, { runActive: true, phase: "planning", task, originalTask: task, executorBrief: undefined,
-			revisions: 0, finalFixUsed: false, executed: false, delegating: false, settleNudges: 0, scoutCalls: 0, resumePending: false });
+			revisions: 0, finalFixUsed: false, executed: false, settleNudges: 0, scoutCalls: 0, resumePending: false });
 	}
 
 	prepareExecution(brief: string): void {
@@ -132,8 +180,10 @@ export class FusionController {
 
 	/** Initialize a run after the delegation guard has already been acquired. */
 	startExecution(task: string, brief: string): void {
-		this.start(task);
-		this.state.delegating = true;
+		if (!this.state.delegating || this.activeAction !== "execute" || this.performing || this.submissionStarted || this.outcomeUnknown) {
+			throw new Error("An initial Fusion delegation must be acquired before starting execution.");
+		}
+		this.initializeRun(task);
 		this.prepareExecution(brief);
 	}
 
