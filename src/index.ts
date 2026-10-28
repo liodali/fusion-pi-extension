@@ -24,7 +24,7 @@ import {
 	type ExecutorEvent,
 	type ExecutorHandle,
 	type ExecutorTurnResult,
-} from "./executor-backend.ts";
+} from "./pi/executor-backend.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, type GitExec } from "./workspace/evidence.ts";
 import {
 	MAX_SCOUT_TOOL_CALLS,
@@ -797,7 +797,7 @@ export default function (pi: ExtensionAPI) {
 				return respond(`${cached}\n\n(cached result, already executed)`);
 			}
 
-			const beginError = controller.beginDelegation(params.action);
+			const beginError = controller.beginDelegation(params.action, isResume ? (await activeBackend()).capabilities : undefined);
 			if (beginError) return respond(beginError);
 			const startedAt = Date.now();
 			state.delegationStartedAt = startedAt;
@@ -1491,6 +1491,10 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
+				if (!controller.canReopen(durable.capabilities)) {
+					ctx.ui.notify("Cannot resume: the executor transcript cannot be reopened.", "error");
+					return;
+				}
 				const model =
 					ctx.modelRegistry.find(run.executor.provider, run.executor.modelId) ??
 					state.executorModel;
@@ -1529,6 +1533,10 @@ export default function (pi: ExtensionAPI) {
 				pi.sendUserMessage(
 					`The Fusion executor run was interrupted by a restart. Its durable conversation is intact and continues where it stopped. Original task:\n${state.originalTask}\n\nCall fusion_delegate with action "resume" (brief: "resume") to let the executor finish its interrupted turn and get its report. Commands cut off by the restart may still have completed, so review the full working tree with git diff, then continue the protocol: revise only for defects, then the final acceptance audit against the original task.`,
 				);
+				return;
+			}
+			if (!controller.canReopen(sessionBackend.capabilities)) {
+				ctx.ui.notify("Cannot resume: the executor transcript cannot be reopened.", "error");
 				return;
 			}
 			if (!run.sessionFile) {

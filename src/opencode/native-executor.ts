@@ -1,3 +1,15 @@
+import type { WorkerCapabilities } from "../core/worker.ts";
+
+/** Capabilities describe guarantees Fusion has verified at this boundary. */
+export const OPENCODE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.freeze({
+	transcriptReopen: true,
+	activeTurnReattach: false,
+	durableExecution: false,
+	idempotentSubmission: false,
+	readOnlyScout: false,
+	exactScoutToolLimit: false,
+});
+
 /** Narrow boundary around OpenCode v2's native `subagent` tool executor. */
 export interface NativeSubagentInput {
 	agent: string;

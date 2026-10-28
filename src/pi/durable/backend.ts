@@ -34,7 +34,8 @@ import {
 	lastAssistantOutputFromMessages,
 	type ScoutRequest,
 	type ScoutResult,
-} from "../../executor-backend.ts";
+} from "../executor-backend.ts";
+import type { WorkerCapabilities } from "../../core/worker.ts";
 import { aggregateUsage, createEmptyUsage } from "../../usage.ts";
 import { createFusionContext } from "./context.ts";
 import { createDurableEventMapper } from "./events.ts";
@@ -249,6 +250,7 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 	};
 	return {
 		kind: "durable",
+		capabilities: PI_DURABLE_CAPABILITIES,
 		async createExecutor(config: ExecutorConfig): Promise<ExecutorHandle> {
 			const harness = await openHarness();
 			const instructions = await executorContext.instructions(config.cwd);
@@ -339,3 +341,12 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 		},
 	};
 }
+
+export const PI_DURABLE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.freeze({
+	transcriptReopen: true,
+	activeTurnReattach: true,
+	durableExecution: true,
+	idempotentSubmission: false,
+	readOnlyScout: true,
+	exactScoutToolLimit: true,
+});

@@ -4,7 +4,7 @@ import { buildExecutorPrompt, buildFinalFixPrompt, buildRevisionPrompt, EXECUTOR
 import { formatCompactReport, parseExecutorReport } from "../report.ts";
 import { snapshotWorkspace, workspaceDiffStat } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
-import { createNativeExecutor, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
+import { createNativeExecutor, OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import type { DelegationAction } from "../core/workflow.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -126,7 +126,7 @@ export default {
 					if (run.reconciling) throw new Error("Fusion reconciliation is already in progress.");
 					if (run.uncertain) throw new Error("The executor's last turn has an unknown outcome. Review the child session and working tree before recovery; automatic retry is disabled.");
 					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
-					const error = run.controller.beginDelegation(action);
+					const error = run.controller.beginDelegation(action, OPENCODE_CAPABILITIES);
 					if (error) throw new Error(error);
 					owner = context.sessionID;
 					if (action === "execute") {

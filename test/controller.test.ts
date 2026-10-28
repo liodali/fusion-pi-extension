@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import { FusionController, FusionLifecycle } from "../src/core/controller.ts";
 import { readRecoveryRecord, recoveryDisposition } from "../src/core/recovery.ts";
+import { PI_SESSION_CAPABILITIES } from "../src/pi/executor-backend.ts";
+import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
 
 test("controller applies delegation budgets and releases the in-flight guard", () => {
 	const state = { delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 };
@@ -16,6 +18,19 @@ test("controller applies delegation budgets and releases the in-flight guard", (
 	expect(controller.beginDelegation("final_fix")).toContain("already used");
 	for (let i = 0; i < 4; i++) expect(controller.beginScout()).toBeUndefined();
 	expect(controller.beginScout()).toContain("Scout limit");
+});
+
+test("reopening a transcript does not imply reattaching an interrupted turn", () => {
+	const state = { delegating: false, executed: true, revisions: 0, finalFixUsed: false, resumePending: true, scoutCalls: 0 };
+	const controller = new FusionController(state);
+	for (const capabilities of [PI_SESSION_CAPABILITIES, OPENCODE_CAPABILITIES]) {
+		expect(controller.canReopen(capabilities)).toBe(true);
+		expect(controller.beginDelegation("resume", capabilities)).toContain("cannot reattach");
+		expect(state.delegating).toBe(false);
+	}
+	expect(controller.canReopen({ ...PI_SESSION_CAPABILITIES, transcriptReopen: false })).toBe(false);
+	expect(controller.beginDelegation("resume", { ...PI_SESSION_CAPABILITIES, activeTurnReattach: true })).toBeUndefined();
+	controller.endDelegation("resume");
 });
 
 test("shared lifecycle retains the original request and restores legacy runs", () => {

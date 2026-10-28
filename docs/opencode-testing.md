@@ -7,7 +7,7 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | Area | Implemented | Verified |
 |---|---|---|
 | Shared delegation/scout transitions | Yes; used by Pi and OpenCode | Unit tests |
-| Neutral catalog shape and worker events | Yes | Type checking and existing Pi tests |
+| Neutral worker contracts and Pi runtime isolation | Contracts and Pi session adapter extracted; runtime adoption remains | Dependency-free shared import test, Pi regressions, and type checking |
 | Pi-only Durable directory | Yes | Existing regression tests; no new live durable run |
 | Native OpenCode executor wrapper | Prototype | Unit tests, including foreground-to-background handling |
 | Direct-delegation guard and background reconciliation | Versioned plugin-storage record and fail-closed recovery | Mock tests including reload; real enforcement and notifications not yet tested with a child |
@@ -129,7 +129,8 @@ Its milestones replace the earlier broad implementation list:
 7. M7: independent packaging and actual harness parity.
 
 Each milestone has dependencies, implementation tasks, and an explicit test gate.
-The next slice is M1; a passed live delegation fixture does not complete M2–M7.
+M1's contracts and Pi runtime isolation are in place; the next slice is M2.
+A passed live delegation fixture does not complete M2–M7.
 
 ## Next integration tests
 

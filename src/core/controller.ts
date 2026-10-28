@@ -1,17 +1,23 @@
 import { delegationError, scoutLimitError, type DelegationAction, type DelegationState, type FusionPhase, type LifecycleState } from "./workflow.ts";
 import { needsContinuation } from "../settle.ts";
+import type { WorkerCapabilities } from "./worker.ts";
 
 /** Owns the shared workflow transitions; adapters retain their native run data. */
 export class FusionController {
 	constructor(readonly state: DelegationState & { scoutCalls: number }) {}
 
-	beginDelegation(action: DelegationAction): string | undefined {
+	beginDelegation(action: DelegationAction, capabilities?: WorkerCapabilities): string | undefined {
 		const error = delegationError(this.state, action);
 		if (error) return error;
+		if (action === "resume" && !capabilities?.activeTurnReattach) return "This worker cannot reattach to an interrupted turn.";
 		this.state.delegating = true;
 		if (action === "revise") this.state.revisions += 1;
 		if (action === "final_fix") this.state.finalFixUsed = true;
 		return undefined;
+	}
+
+	canReopen(capabilities: WorkerCapabilities): boolean {
+		return capabilities.transcriptReopen;
 	}
 
 	completeDelegation(): void {

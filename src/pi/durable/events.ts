@@ -1,5 +1,5 @@
 import type { AgentEvent } from "@earendil-works/pi-durable";
-import type { ExecutorEvent } from "../../executor-backend.ts";
+import type { ExecutorEvent } from "../../core/worker.ts";
 
 export function createDurableEventMapper(): (event: AgentEvent) => ExecutorEvent[] {
 	const toolOutput = new Map<string, string>();
