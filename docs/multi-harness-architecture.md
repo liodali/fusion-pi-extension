@@ -1,13 +1,13 @@
 # Fusion across harnesses
 
-Status: implementation started. Shared workflow transitions, model selection shape,
+Status: implementation started. Shared task lifecycle and workflow transitions, model selection shape,
 and worker event types are harness-independent. An experimental OpenCode entrypoint
-connects the shared transitions to the native subagent wrapper, with in-memory
-per-session state. Pi and OpenCode use shared Git workspace snapshots and diff
+connects the shared transitions to the native subagent wrapper and persists its
+run and pending-turn metadata in OpenCode plugin storage. Pi and OpenCode use shared Git workspace snapshots and diff
 reporting; OpenCode always asks for full review until child tool activity is
-available for attribution. A real v2.2.0 smoke test verifies tool registration and calling
-the native executor (missing-parent rejection only); actual child execution has
-not been tested against a live model. See
+available for attribution. OpenCode v2.2.0 has passed a live non-Git fixture using
+`opencode-go/glm-5.3-flash`: execute, revise and final fix used the same native
+child and produced the expected final file. See
 [readiness and testing](./opencode-testing.md) for current gaps and test commands.
 
 ## Product boundary
@@ -32,7 +32,7 @@ Pi harness. OpenCode does not depend on, configure, or use that implementation.
 - `src/runs.ts` and `src/metrics.ts` currently store Pi session/durable backend
   identities; retain those legacy fields when extracting shared persistence.
 - `src/usage.ts`, `src/thinking.ts`, and model selection use Pi catalog semantics.
-- Prompts mention Pi; lifecycle completion currently depends on a summary heading
+- Lifecycle completion currently depends on a summary heading
   plus bounded continuation nudges. This is a heuristic, not proof of acceptance.
 - Reports and workspace snapshots are shared. Pi additionally supplies touched-file
   events; OpenCode's snapshot-only evidence needs full review.
@@ -139,16 +139,23 @@ ID alone is not an exactly-once guarantee.
 
 The entrypoint in `src/opencode/index.ts` calls the registered native tool through
 the wrapper, as verified by the no-model smoke test. It supports execute, revise,
-final fix, status, reset and background reconciliation with in-memory session ownership. Actual child execution
-and lifecycle handling remain unverified. Run state and workspace ownership do not
-survive plugin reloads or cover separate OpenCode processes/locations.
+final fix, status, reset and background reconciliation. Its versioned metadata
+retains the task, budgets, owner, child ID, and pending turn across plugin reloads.
+Live execution, revision and final fix have been exercised in one isolated run;
+background reconciliation, cancellation and restart behavior remain unverified
+against a real child. Persistence is
+not a cross-process lock: concurrent plugin instances and locations are not
+coordinated, and must not operate on the same workspace simultaneously.
 When a foreground call is backgrounded, it blocks further prompts. After OpenCode
 delivers the native completion notification, `fusion_reconcile` matches the parent,
 child and unique turn description before releasing the lock and returning the
 report. A missing or mismatched notification leaves the turn locked. This path
-has mock coverage but has not been verified with a live model or after restart.
-Test actual child execution and lifecycle behavior in a running v2 instance before
-selecting this approach definitively. If unsupported, reproduce the relevant
+has mock coverage including plugin reload but has not been verified with a live
+model or a real OpenCode restart. A pending record without a child ID, or without
+the matching notification, remains locked for manual investigation. A restored
+turn has no saved workspace snapshot and requires full review.
+Test the remaining lifecycle behavior in a running v2 instance before selecting
+this approach definitively. If unsupported, reproduce the relevant
 checks using the public session API rather than importing internals.
 Restrict unmanaged delegation in the Fusion supervisor and prevent recursive
 delegation from workers. Verify effective permissions instead of relying on prompts.
@@ -183,6 +190,10 @@ location during the compatibility phase; resolve storage through an injected
 store rather than importing Pi's agent directory from the core.
 
 ## Delivery sequence
+
+Use the [implementation milestones](./multi-harness-implementation-plan.md) for
+the current execution order, concrete extraction tasks, and test gates. The
+sequence below describes the broader architectural progression.
 
 1. Extract neutral contracts and the controller from `src/index.ts`; preserve Pi
    entrypoints, behavior, existing manifests, and default selection policies.
@@ -244,5 +255,5 @@ enforcement, effective SDK-child permissions, supported progress presentation,
 completion interception, and recovery guarantees of the chosen release.
 The local v2.2.0 process loaded the actual Fusion entrypoint under an isolated
 temporary project, registered its tools, and returned the native missing-parent
-rejection through the delegate tool. Actual worker sessions still need an
-integration test.
+rejection through the delegate tool. A separate live model test confirmed three
+successive delegation actions on the same child and the expected final fixture.

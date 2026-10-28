@@ -1,6 +1,7 @@
 import { MAX_REVISIONS, MAX_SCOUT_CALLS } from "../limits.ts";
 
 export type DelegationAction = "execute" | "revise" | "final_fix" | "resume";
+export type FusionPhase = "idle" | "planning" | "executing" | "reviewing" | "revising" | "finalizing" | "scouting" | "complete" | "failed";
 
 /** The policy is independent of the agent runtime and its session types. */
 export interface DelegationState {
@@ -9,6 +10,16 @@ export interface DelegationState {
 	revisions: number;
 	finalFixUsed: boolean;
 	resumePending: boolean;
+}
+
+export interface LifecycleState extends DelegationState {
+	runActive: boolean;
+	phase: FusionPhase;
+	task?: string;
+	originalTask?: string;
+	executorBrief?: string;
+	settleNudges: number;
+	scoutCalls: number;
 }
 
 export function delegationError(state: DelegationState, action: DelegationAction): string | undefined {

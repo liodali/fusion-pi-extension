@@ -42,12 +42,14 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 	model?: string;
 	execute: NativeSubagentExecute<C>;
 	childSessionID?: string;
+	/** A previously submitted turn whose completion still needs proof. */
+	pending?: boolean;
 	/** Wait for the child to settle and return its final response. Must reject if settlement is unknown. */
 	waitForBackground?: (sessionID: string, signal: AbortSignal) => Promise<string>;
 }) {
 	let childSessionID = options.childSessionID;
 	let running = false;
-	let backgroundPending = false;
+	let backgroundPending = options.pending ?? false;
 	let settling = false;
 
 	async function settleBackground(
@@ -74,6 +76,7 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 	return {
 		get childSessionID() { return childSessionID; },
 		get backgroundPending() { return backgroundPending; },
+		markPending() { if (childSessionID) backgroundPending = true; },
 		settleBackground,
 		async prompt(prompt: string, description: string, context: C): Promise<NativeSubagentOutput> {
 			if (context.sessionID !== options.parentSessionID) throw new Error("Fusion executor belongs to a different supervisor session.");

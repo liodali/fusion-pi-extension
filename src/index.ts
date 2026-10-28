@@ -1,4 +1,5 @@
-import { FusionController } from "./core/controller.ts";
+import { FusionLifecycle } from "./core/controller.ts";
+import type { FusionPhase } from "./core/workflow.ts";
 import { delegationError, scoutLimitError } from "./core/workflow.ts";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
@@ -80,7 +81,6 @@ import {
 	writeRun,
 } from "./runs.ts";
 import { selectScrollableOption, selectSearchableOption } from "./scrollable-select.ts";
-import { needsContinuation } from "./settle.ts";
 import {
 	defaultThinkingLevel,
 	orderThinkingLevels,
@@ -96,17 +96,6 @@ import {
 } from "./usage.ts";
 
 const WIDGET_KEY = "fusion";
-
-type FusionPhase =
-	| "idle"
-	| "planning"
-	| "executing"
-	| "reviewing"
-	| "revising"
-	| "finalizing"
-	| "scouting"
-	| "complete"
-	| "failed";
 
 type ExecutorBackendKind = "session" | "durable";
 
@@ -240,7 +229,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const sessionBackend = createSessionExecutorBackend();
-	const controller = new FusionController(state);
+	const controller = new FusionLifecycle(state);
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
 
@@ -317,7 +306,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function setPhase(ctx: ExtensionContext, phase: FusionPhase): void {
-		state.phase = phase;
+		controller.setPhase(phase);
 		updateWidget(ctx);
 	}
 
@@ -438,22 +427,14 @@ export default function (pi: ExtensionAPI) {
 		warmExecutor(ctx);
 		state.executorActivity = undefined;
 		state.executorOutput = undefined;
-		state.runActive = true;
+		controller.start(task);
 		syncFusionTools();
-		state.task = task;
-		state.originalTask = task;
-		state.revisions = 0;
-		state.finalFixUsed = false;
-		state.executed = false;
-		state.settleNudges = 0;
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
 		state.executorTranscript = [];
-		state.scoutCalls = 0;
 		state.scoutMs = 0;
 		state.scoutUsage = createEmptyUsage();
 		state.runStartedAt = new Date().toISOString();
-		state.resumePending = false;
 		setPhase(ctx, "planning");
 	}
 
@@ -870,10 +851,7 @@ export default function (pi: ExtensionAPI) {
 					if (state.executorUsed || !executorConfigMatches()) {
 						disposeExecutor();
 					}
-					state.runActive = true;
-					state.task = params.brief;
-					state.originalTask ??= params.brief;
-					state.executorBrief = params.brief;
+					controller.prepareExecution(params.brief);
 					state.revisions = 0;
 					state.finalFixUsed = false;
 					state.executed = false;
@@ -1540,19 +1518,11 @@ export default function (pi: ExtensionAPI) {
 				state.executorModel = model;
 				state.executorLabel = run.executor.label;
 				state.executorThinking = run.executor.thinking;
-				state.task = run.task;
-				state.originalTask = run.originalTask ?? run.task;
-				state.executorBrief = run.brief;
-				state.revisions = run.revisions;
-				state.finalFixUsed = run.finalFixUsed ?? false;
-				state.executed = true;
-				state.settleNudges = 0;
-				state.runActive = true;
+				controller.restore(run, true);
 				state.executorUsed = true;
 				state.runId = run.runId;
 				state.runStartedAt = run.metrics?.startedAt;
 				state.activeRun = run;
-				state.resumePending = true;
 				syncFusionTools();
 				setPhase(ctx, "executing");
 				ctx.ui.notify(`Resumed interrupted Fusion run ${run.runId}.`, "info");
@@ -1595,14 +1565,7 @@ export default function (pi: ExtensionAPI) {
 			state.executorModel = model;
 			state.executorLabel = run.executor.label;
 			state.executorThinking = run.executor.thinking;
-			state.task = run.task;
-			state.originalTask = run.originalTask ?? run.task;
-			state.executorBrief = run.brief;
-			state.revisions = run.revisions;
-			state.finalFixUsed = run.finalFixUsed ?? false;
-			state.executed = true;
-			state.settleNudges = 0;
-			state.runActive = true;
+			controller.restore(run, false);
 			state.executorUsed = true;
 			state.runId = run.runId;
 			state.runStartedAt = run.metrics?.startedAt;
@@ -1627,23 +1590,13 @@ export default function (pi: ExtensionAPI) {
 				state.activeRun = undefined;
 				state.runId = undefined;
 			}
-			state.runActive = false;
+			controller.clear();
 			syncFusionTools();
-			state.task = undefined;
-			state.originalTask = undefined;
-			state.revisions = 0;
-			state.finalFixUsed = false;
-			state.executed = false;
-			state.delegating = false;
-			state.settleNudges = 0;
-			state.phase = "idle";
 			state.supervisorUsage = createEmptyUsage();
 			state.executorUsage = createEmptyUsage();
 			state.executorTranscript = [];
-			state.scoutCalls = 0;
 			state.scoutMs = 0;
 			state.scoutUsage = createEmptyUsage();
-			state.resumePending = false;
 			updateWidget(ctx);
 			ctx.ui.notify(
 				"Fusion executor context and completed run data cleared. No temporary files were created.",
@@ -1692,17 +1645,14 @@ export default function (pi: ExtensionAPI) {
 		}
 		// The nudge lands as a trailing user message, so the runtime's post-commit
 		// canContinue check passes whenever the context has any non-system message.
-		const nudge = needsContinuation({
-			executed: state.executed,
+		const nudge = controller.continuation({
 			lastAssistantText,
-			nudges: state.settleNudges,
 			outcome: event.outcome,
 			canContinue:
 				event.context.canContinue ||
 				event.context.llmMessages.some((message) => message.role !== "system"),
 		});
 		if (!nudge) return;
-		state.settleNudges += 1;
 		return {
 			entries: [
 				...event.entries,
@@ -1719,12 +1669,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_settled", (_event, ctx) => {
 		if (!state.runActive) return;
-		if (state.phase !== "failed") {
-			setPhase(ctx, "complete");
-		}
-		if (!state.modeEnabled) {
-			state.runActive = false;
-		}
+		controller.settled(state.modeEnabled);
+		updateWidget(ctx);
 		if (state.activeRun?.metrics) {
 			state.activeRun.metrics.finishedAt = new Date().toISOString();
 			void persistRun();
