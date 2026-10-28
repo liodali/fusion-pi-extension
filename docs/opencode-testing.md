@@ -10,21 +10,33 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | Neutral catalog shape and worker events | Yes | Type checking and existing Pi tests |
 | Pi-only Durable directory | Yes | Existing regression tests; no new live durable run |
 | Native OpenCode executor wrapper | Prototype | Unit tests, including foreground-to-background handling |
+| Direct-delegation guard and background reconciliation | In-memory implementation | Mock tests; real enforcement and notifications not yet tested with a child |
 | OpenCode plugin setup and native subagent registry | Experimental entrypoint | Isolated v2.2.0 registration and missing-parent smoke test |
+| Shared Git workspace evidence | Pi and OpenCode use the same snapshot/diff code | Real temporary Git worktree tests; OpenCode requires full review |
 | Actual executor child, revisions, and final fix | In-memory host wiring | Mock tests only; not tested with a model |
 | Complete OpenCode Fusion workflow | No | Not ready to install/use |
 
 The core extraction is partial: `src/index.ts` still owns most run lifecycle,
-workspace diff collection, persistence, and Pi UI. The experimental OpenCode
-entrypoint exposes delegate, status, and reset tools, with example agent files.
-It has no scout, command registration, persistence, or production settlement
-handler. Run state and workspace ownership are in memory and scoped to one plugin
+persistence, and Pi UI. The experimental OpenCode
+entrypoint exposes delegate, status, reset, and reconciliation tools, with example agent files.
+It has no scout, command registration, or persistence. Run state and workspace ownership are in memory and scoped to one plugin
 instance. A restart or separate process can lose that protection. The package
 still requires Pi peers and is not independently packaged for OpenCode. Passing
 mock tests and the no-model smoke test does not establish harness parity.
 Any native delegation failure leaves the in-memory run uncertain and blocks
 reset/retry, even when no child ID was received. Inspect the native session and
 working tree before any manual recovery. Reloading loses that in-memory guard.
+When OpenCode backgrounds a foreground delegation, wait for its completion
+notification and call `fusion_reconcile`. Fusion matches the child and unique
+turn description against the native notification before returning its report.
+Missing or mismatched notifications leave the run locked; errors with unknown
+submission state still require manual inspection. Reconciliation is not tested
+against a real child or across restarts.
+OpenCode's report compares Git status before and after the delegation, including
+hashes for pre-existing dirty files within the configured limit. It does not yet
+collect child tool events; files restored to their prior state or changes made by
+other processes can make attribution incomplete. Every OpenCode result requests
+a full working-tree review, including when the snapshot or Git is unavailable.
 
 ## Experimental local setup
 
@@ -76,14 +88,13 @@ after the test. A sandbox may require permission to bind a localhost port.
 
 ## Missing implementation, in order
 
-1. Continue extracting the controller and workspace evidence handling from the Pi
+1. Continue extracting the controller and workspace event handling from the Pi
    entrypoint, keeping the current Pi controls and saved runs compatible.
 2. Complete the OpenCode host and verify the example supervisor and executor
    permissions; add a restricted scout and its exact pre-tool budget.
-3. Implement child ownership/persistence, native event/usage mapping, cancellation,
-   and the real background settlement handler. Waiting must verify the relevant
-   executor turn finished and read its final report; an old final message or an
-   idle event alone is insufficient.
+3. Implement child ownership/persistence, native event/usage mapping and cancellation,
+   and verify background reconciliation against a real child. An old final message
+   or an idle event alone is insufficient to establish completion.
 4. Add config, run, mode, status, stats, resume, and clean controls, including
    effective tool permissions and scout caps, plus one writer per workspace.
 5. Produce an independently installable OpenCode package without Pi dependencies,

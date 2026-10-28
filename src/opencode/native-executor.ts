@@ -73,6 +73,7 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 	}
 	return {
 		get childSessionID() { return childSessionID; },
+		get backgroundPending() { return backgroundPending; },
 		settleBackground,
 		async prompt(prompt: string, description: string, context: C): Promise<NativeSubagentOutput> {
 			if (context.sessionID !== options.parentSessionID) throw new Error("Fusion executor belongs to a different supervisor session.");

@@ -3,7 +3,9 @@
 Status: implementation started. Shared workflow transitions, model selection shape,
 and worker event types are harness-independent. An experimental OpenCode entrypoint
 connects the shared transitions to the native subagent wrapper, with in-memory
-per-session state. A real v2.2.0 smoke test verifies tool registration and calling
+per-session state. Pi and OpenCode use shared Git workspace snapshots and diff
+reporting; OpenCode always asks for full review until child tool activity is
+available for attribution. A real v2.2.0 smoke test verifies tool registration and calling
 the native executor (missing-parent rejection only); actual child execution has
 not been tested against a live model. See
 [readiness and testing](./opencode-testing.md) for current gaps and test commands.
@@ -23,7 +25,7 @@ Pi harness. OpenCode does not depend on, configure, or use that implementation.
 
 ## Current coupling
 
-- `src/index.ts` combines run state, delegation, diff collection, model selection,
+- `src/index.ts` combines run state, delegation, model selection,
   persistence, commands, Pi events, and TUI rendering.
 - `src/executor-backend.ts` provides a useful worker boundary, but imports Pi at
   runtime and exposes Pi model, thinking, and usage types.
@@ -32,8 +34,8 @@ Pi harness. OpenCode does not depend on, configure, or use that implementation.
 - `src/usage.ts`, `src/thinking.ts`, and model selection use Pi catalog semantics.
 - Prompts mention Pi; lifecycle completion currently depends on a summary heading
   plus bounded continuation nudges. This is a heuristic, not proof of acceptance.
-- Reports, diff attribution, limits, transcript formatting, and most prompt
-  construction can be reused with little or no behavioral change.
+- Reports and workspace snapshots are shared. Pi additionally supplies touched-file
+  events; OpenCode's snapshot-only evidence needs full review.
 
 ## Boundaries
 
@@ -137,13 +139,14 @@ ID alone is not an exactly-once guarantee.
 
 The entrypoint in `src/opencode/index.ts` calls the registered native tool through
 the wrapper, as verified by the no-model smoke test. It supports execute, revise,
-final fix, status and reset with in-memory session ownership. Actual child execution
+final fix, status, reset and background reconciliation with in-memory session ownership. Actual child execution
 and lifecycle handling remain unverified. Run state and workspace ownership do not
 survive plugin reloads or cover separate OpenCode processes/locations.
-When a foreground call is backgrounded, it blocks further prompts until a supplied
-settlement handler confirms completion and returns the child's final response. If
-settlement fails, the adapter must reconcile the child before delegating again;
-the OpenCode integration must supply and test that handler.
+When a foreground call is backgrounded, it blocks further prompts. After OpenCode
+delivers the native completion notification, `fusion_reconcile` matches the parent,
+child and unique turn description before releasing the lock and returning the
+report. A missing or mismatched notification leaves the turn locked. This path
+has mock coverage but has not been verified with a live model or after restart.
 Test actual child execution and lifecycle behavior in a running v2 instance before
 selecting this approach definitively. If unsupported, reproduce the relevant
 checks using the public session API rather than importing internals.

@@ -14,6 +14,9 @@ permissions:
   - action: fusion_reset
     resource: "*"
     effect: deny
+  - action: fusion_reconcile
+    resource: "*"
+    effect: deny
 ---
 
 Implement the Fusion supervisor's brief in the shared working tree. Follow project instructions, run the requested checks, and return the report requested in the brief. Do not delegate.

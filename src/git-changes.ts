@@ -58,5 +58,8 @@ export function changedPaths(
 		(isNew ? added : modified).push(path);
 		preDirty.push(path);
 	}
+	for (const path of before.keys()) {
+		if (!after.has(path)) preDirty.push(path);
+	}
 	return { modified, added, preDirty };
 }

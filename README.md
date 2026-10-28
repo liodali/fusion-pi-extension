@@ -153,6 +153,7 @@ Limitations:
 | `src/index.ts` | Extension entry point: tool, commands, input interception, widget, executor lifecycle. |
 | `src/core/controller.ts` | Shared delegation and scout state transitions. |
 | `src/opencode/` | Experimental OpenCode server plugin and native subagent adapter. |
+| `src/workspace/` | Harness-independent Git snapshots and diff evidence, plus the Node process adapter. |
 | `src/pi/durable/` | Pi-only durable executor, scout tools, event mapping, and recovery. |
 | `src/limits.ts` | Central run limits and tuning constants (revisions, scout caps, throttle, timeouts). |
 | `src/prompts.ts` | Supervisor/executor/scout prompt construction. |

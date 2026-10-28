@@ -1,4 +1,3 @@
-import { relative, resolve } from "node:path";
 import { FusionController } from "./core/controller.ts";
 import { delegationError, scoutLimitError } from "./core/workflow.ts";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -25,10 +24,8 @@ import {
 	type ExecutorHandle,
 	type ExecutorTurnResult,
 } from "./executor-backend.ts";
-import { changedPaths, hashFiles, parsePorcelain } from "./git-changes.ts";
+import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, type GitExec } from "./workspace/evidence.ts";
 import {
-	GIT_TIMEOUT_MS,
-	MAX_HASHED_DIRTY_PATHS,
 	MAX_SCOUT_TOOL_CALLS,
 	RENDER_THROTTLE_MS,
 	SCOUT_ANSWER_MAX_CHARS,
@@ -435,106 +432,7 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	async function gitToplevel(ctx: ExtensionContext): Promise<string | undefined> {
-		try {
-			const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
-				cwd: ctx.cwd,
-				timeout: GIT_TIMEOUT_MS,
-			});
-			if (result.code !== 0) return undefined;
-			return result.stdout.trim() || undefined;
-		} catch {
-			return undefined;
-		}
-	}
-
-	async function gitHasHead(toplevel: string): Promise<boolean> {
-		try {
-			const result = await pi.exec("git", ["rev-parse", "--verify", "--quiet", "HEAD"], {
-				cwd: toplevel,
-				timeout: GIT_TIMEOUT_MS,
-			});
-			return result.code === 0;
-		} catch {
-			return false;
-		}
-	}
-
-	async function gitPorcelain(toplevel: string): Promise<Map<string, string> | undefined> {
-		try {
-			const status = await pi.exec("git", ["status", "--porcelain=v1", "-z", "-uall"], {
-				cwd: toplevel,
-				timeout: GIT_TIMEOUT_MS,
-			});
-			if (status.code !== 0) return undefined;
-			return parsePorcelain(status.stdout);
-		} catch {
-			return undefined;
-		}
-	}
-
-	async function executorDiffStat(
-		ctx: ExtensionContext,
-		toplevel: string,
-		headExists: boolean,
-		before: Map<string, string> | undefined,
-		after: Map<string, string> | undefined,
-		beforeHashes: Map<string, string> | undefined,
-		afterHashes: Map<string, string> | undefined,
-		touchedFiles: ReadonlySet<string>,
-	): Promise<string | undefined> {
-		if (!before || !after) return undefined;
-		try {
-			const diffBase = headExists ? ["diff", "HEAD"] : ["diff"];
-			const touchedRepoPaths = [...touchedFiles]
-				.map((path) => relative(toplevel, resolve(ctx.cwd, path)))
-				.filter((path) => path.length > 0 && !path.startsWith(".."));
-			const { modified, added, preDirty } = changedPaths(
-				before,
-				after,
-				beforeHashes,
-				afterHashes,
-			);
-			const diffPaths = new Set(modified);
-			for (const path of touchedRepoPaths) {
-				if (after.has(path)) diffPaths.add(path);
-			}
-			const remaining = touchedRepoPaths.filter((path) => !diffPaths.has(path));
-			if (remaining.length > 0) {
-				const names = await pi.exec("git", [...diffBase, "--name-only", "--", ...remaining], {
-					cwd: toplevel,
-					timeout: GIT_TIMEOUT_MS,
-				});
-				if (names.code !== 0) return undefined;
-				for (const line of names.stdout.split("\n")) {
-					const path = line.trim();
-					if (path) diffPaths.add(path);
-				}
-			}
-			const parts: string[] = [];
-			if (diffPaths.size > 0) {
-				const diff = await pi.exec("git", [...diffBase, "--stat", "--", ...diffPaths], {
-					cwd: toplevel,
-					timeout: GIT_TIMEOUT_MS,
-				});
-				if (diff.code !== 0) return undefined;
-				if (diff.stdout.trim()) {
-					parts.push(diff.stdout.trim());
-				}
-			}
-			for (const path of added) {
-				parts.push(`new: ${path}`);
-			}
-			if (preDirty.length > 0) {
-				parts.push(
-					`pre-existing changes (diff includes edits made before this delegation): ${preDirty.join(", ")}`,
-				);
-			}
-			return parts.length > 0 ? parts.join("\n") : undefined;
-		} catch {
-			return undefined;
-		}
-	}
+	const gitExec: GitExec = (args, options) => pi.exec("git", args, options);
 
 	function startRun(ctx: ExtensionContext, task: string): void {
 		warmExecutor(ctx);
@@ -1135,13 +1033,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 				state.executorUsed = true;
-				const toplevel = await gitToplevel(ctx);
-				const headExists = toplevel ? await gitHasHead(toplevel) : false;
-				const porcelainBefore = toplevel ? await gitPorcelain(toplevel) : undefined;
-				const beforeHashes =
-					toplevel && porcelainBefore && porcelainBefore.size <= MAX_HASHED_DIRTY_PATHS
-						? await hashFiles(toplevel, porcelainBefore.keys())
-						: undefined;
+				const workspaceBefore = await snapshotWorkspace(ctx.cwd, gitExec);
 				let output: ExecutorTurnResult;
 				if (isResume) {
 					output = await handle.resume({ signal, onEvent });
@@ -1155,11 +1047,7 @@ export default function (pi: ExtensionAPI) {
 				) {
 					state.activeRun.sessionFile = handle.resumeRef();
 				}
-				const porcelainAfter = toplevel ? await gitPorcelain(toplevel) : undefined;
-				const afterHashes =
-					toplevel && beforeHashes
-						? await hashFiles(toplevel, beforeHashes.keys())
-						: undefined;
+				const workspaceAfter = await snapshotWorkspaceAfter(workspaceBefore, gitExec);
 				timings.totalMs = Date.now() - startedAt;
 				state.lastTimings = { ...timings };
 				const usage = output.usage;
@@ -1191,18 +1079,7 @@ export default function (pi: ExtensionAPI) {
 				appendExecutorProgress("[finished] Executor completed the delegation.");
 				setPhase(ctx, "reviewing");
 				const parsed = parseExecutorReport(output.text);
-				const diffStat = toplevel
-					? await executorDiffStat(
-							ctx,
-							toplevel,
-							headExists,
-							porcelainBefore,
-							porcelainAfter,
-							beforeHashes,
-							afterHashes,
-							touchedFiles,
-						)
-					: undefined;
+				const diffStat = workspaceAfter ? await workspaceDiffStat(workspaceBefore, gitExec, touchedFiles, workspaceAfter) : undefined;
 				renderThrottle.flush();
 				const text = `${formatCompactReport(parsed.report, diffStat, parsed.prose, isResume ? ["resumed after restart"] : [])}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
 				recordDelegation({ reportStatus: parsed.report.status, usage });
