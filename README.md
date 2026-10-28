@@ -106,6 +106,12 @@ Fusion can run the executor and scout on one of two backends, selected in `/fusi
 - **`session`** (default): the executor is a Pi SDK `AgentSession` persisted under `<agentDir>/fusion/sessions`, and the scout is a disposable in-memory session. An interrupted run can be continued with `/fusion-resume` followed by a normal `revise` delegation.
 - **`durable`** (experimental): the executor and scout run on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable), persisted in a SQLite database at `<agentDir>/fusion/durable.sqlite`. The package is an optional peer dependency — Fusion only offers the durable option when it can be loaded, and falls back to `session` with a warning otherwise.
 
+Pi Durable is specific to the Pi harness. Future harness integrations use their own session and recovery capabilities and do not require `pi-durable`.
+
+An experimental OpenCode entrypoint is under development. Its current capabilities,
+local test setup, and remaining parity work are documented in
+[OpenCode readiness and testing](docs/opencode-testing.md).
+
 The durable backend guarantees:
 
 - An in-flight executor turn survives a hard kill of the Pi process. `/fusion-resume` restores the run, and `fusion_delegate` action `"resume"` waits for the interrupted turn to finish and returns its report. The resumed report is flagged with a `resumed after restart` review reason so the supervisor does a full review.
@@ -145,6 +151,9 @@ Limitations:
 |------|---------|
 | `src/git-changes.ts` | `git status --porcelain=v1 -z` parsing, content hashing, and before/after change detection for the diff stat. |
 | `src/index.ts` | Extension entry point: tool, commands, input interception, widget, executor lifecycle. |
+| `src/core/controller.ts` | Shared delegation and scout state transitions. |
+| `src/opencode/` | Experimental OpenCode server plugin and native subagent adapter. |
+| `src/pi/durable/` | Pi-only durable executor, scout tools, event mapping, and recovery. |
 | `src/limits.ts` | Central run limits and tuning constants (revisions, scout caps, throttle, timeouts). |
 | `src/prompts.ts` | Supervisor/executor/scout prompt construction. |
 | `src/pricing.ts` | Output-price tier logic and priced model labels. |

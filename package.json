@@ -11,7 +11,8 @@
 	},
 	"scripts": {
 		"typecheck": "bunx tsc --noEmit",
-		"test": "bun test"
+		"test": "bun test",
+		"test:opencode-smoke": "bun test/integration/opencode-smoke.mjs"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "^1.0.0",

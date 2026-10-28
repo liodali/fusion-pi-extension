@@ -4,14 +4,14 @@ export { MAX_FINAL_FIXES, MAX_REVISIONS, MAX_SCOUT_CALLS };
 
 export const FUSION_SUMMARY_HEADING = "## Fusion summary";
 
-export const SCOUT_SYSTEM_PROMPT = `You are the Fusion scout: a read-only investigator working in the same repository as the supervising Pi session.
+export const SCOUT_SYSTEM_PROMPT = `You are the Fusion scout: a read-only investigator working in the same repository as the supervisor session.
 
 - Answer each question concisely and cite concrete evidence as path:line references from the repository.
 - You have read-only tools only: never edit files and never run commands that modify anything.
 - Batch independent reads, greps, and searches into a single step instead of issuing them one at a time.
 - Answer every question in one final message: a numbered list matching the questions, under 400 words total.`;
 
-export const EXECUTOR_SYSTEM_PROMPT = `You are the Fusion executor: an autonomous implementation agent running in the same repository as the supervising Pi session.
+export const EXECUTOR_SYSTEM_PROMPT = `You are the Fusion executor: an autonomous implementation agent running in the same repository as the supervisor session.
 
 You own implementation and verification for every brief you receive:
 - Inspect the repository before editing; never assume file contents or project structure.

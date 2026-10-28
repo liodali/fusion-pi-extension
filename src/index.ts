@@ -1,4 +1,6 @@
 import { relative, resolve } from "node:path";
+import { FusionController } from "./core/controller.ts";
+import { delegationError, scoutLimitError } from "./core/workflow.ts";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
@@ -241,11 +243,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const sessionBackend = createSessionExecutorBackend();
+	const controller = new FusionController(state);
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
 
 	function loadDurableBackend(): Promise<ExecutorBackend | undefined> {
-		loadDurablePromise ??= import("./durable/backend.ts")
+		loadDurablePromise ??= import("./pi/durable/backend.ts")
 			.then((module) => module.createDurableExecutorBackend())
 			.catch((error: unknown) => {
 				durableUnavailable = error instanceof Error ? error.message : String(error);
@@ -891,31 +894,8 @@ export default function (pi: ExtensionAPI) {
 			const timingLine = (): string =>
 				`Timing: ready ${timings.readyMs ?? "-"}ms, first event ${timings.firstEventMs ?? "-"}ms, total ${timings.totalMs ?? "-"}ms`;
 
-			if (state.delegating) {
-				return respond("A fusion delegation is already in progress. Wait for it to complete before delegating again.");
-			}
-			if (params.action === "execute" && state.executed) {
-				return respond('Initial execution already completed. Review the working tree and use action "revise" with consolidated feedback.');
-			}
-			if (params.action === "revise" && !state.executed) {
-				return respond('Cannot revise before the initial execution. Call fusion_delegate with action "execute" first.');
-			}
-			if (params.action === "final_fix" && !state.executed) {
-				return respond('Cannot run the final fix before the initial execution. Call fusion_delegate with action "execute" first.');
-			}
-			if (params.action === "final_fix" && state.finalFixUsed) {
-				return respond("Final fix already used: only one final_fix is allowed per run. Report remaining gaps to the user.");
-			}
-			if (params.action === "revise" && state.revisions >= MAX_REVISIONS) {
-				return respond(
-					`Revision limit reached: at most ${MAX_REVISIONS} revisions are allowed. Take over the implementation yourself.`,
-				);
-			}
-			if (params.action === "resume" && !state.resumePending) {
-				return respond(
-					'Nothing to resume: action "resume" is only valid right after /fusion-resume restores a durable run.',
-				);
-			}
+			const error = delegationError(state, params.action);
+			if (error) return respond(error);
 
 			const isRevision = params.action === "revise";
 			const isFinalFix = params.action === "final_fix";
@@ -938,7 +918,8 @@ export default function (pi: ExtensionAPI) {
 				return respond(`${cached}\n\n(cached result, already executed)`);
 			}
 
-			state.delegating = true;
+			const beginError = controller.beginDelegation(params.action);
+			if (beginError) return respond(beginError);
 			const startedAt = Date.now();
 			state.delegationStartedAt = startedAt;
 			let reasoningTotalChars = 0;
@@ -973,13 +954,11 @@ export default function (pi: ExtensionAPI) {
 			};
 			try {
 				if (isRevision) {
-					state.revisions += 1;
 					setPhase(ctx, "revising");
 					appendExecutorProgress(
 						`[revision ${state.revisions}/${MAX_REVISIONS}] Executor resumed with ${executorLabel()}${sizeNote}`,
 					);
 				} else if (isFinalFix) {
-					state.finalFixUsed = true;
 					setPhase(ctx, "finalizing");
 					appendExecutorProgress(
 						`[final fix] Executor resumed with ${executorLabel()}${sizeNote}`,
@@ -1185,7 +1164,7 @@ export default function (pi: ExtensionAPI) {
 				state.lastTimings = { ...timings };
 				const usage = output.usage;
 				state.executorUsage = addUsage(state.executorUsage, usage);
-				state.executed = true;
+				controller.completeDelegation();
 				if (output.stopReason === "error" || output.stopReason === "aborted") {
 					const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
 					state.executorActivity = "failed";
@@ -1262,11 +1241,8 @@ export default function (pi: ExtensionAPI) {
 				return respond(text, message);
 			} finally {
 				renderThrottle.cancel();
-				state.delegating = false;
+				controller.endDelegation(params.action);
 				state.delegationStartedAt = undefined;
-				if (isResume) {
-					state.resumePending = false;
-				}
 			}
 		},
 		renderCall(args, theme) {
@@ -1367,17 +1343,15 @@ export default function (pi: ExtensionAPI) {
 			}, RENDER_THROTTLE_MS);
 			const scheduleRender = renderThrottle.schedule;
 
-			if (state.scoutCalls >= MAX_SCOUT_CALLS) {
-				return respond(
-					`Scout limit reached: at most ${MAX_SCOUT_CALLS} fusion_scout calls are allowed per run.`,
-				);
-			}
+			const limitError = scoutLimitError(state.scoutCalls);
+			if (limitError) return respond(limitError);
 
 			if (!state.executorModel) {
 				return respond("No fusion executor model configured. Run /fusion-config first.");
 			}
 
-			state.scoutCalls += 1;
+			const scoutError = controller.beginScout();
+			if (scoutError) return respond(scoutError);
 			const scoutStartedAt = Date.now();
 			const previousPhase = state.phase;
 			setPhase(ctx, "scouting");

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { pendingSubmission, staleWork } from "../src/durable/stale.ts";
+import { pendingSubmission, staleWork } from "../src/pi/durable/stale.ts";
 
 describe("staleWork", () => {
 	test("selects submissions and tasks outside the protected set", () => {

@@ -34,8 +34,8 @@ import {
 	lastAssistantOutputFromMessages,
 	type ScoutRequest,
 	type ScoutResult,
-} from "../executor-backend.ts";
-import { aggregateUsage, createEmptyUsage } from "../usage.ts";
+} from "../../executor-backend.ts";
+import { aggregateUsage, createEmptyUsage } from "../../usage.ts";
 import { createFusionContext } from "./context.ts";
 import { createDurableEventMapper } from "./events.ts";
 import { scoutCallsDoc, scoutTools } from "./scout-tools.ts";

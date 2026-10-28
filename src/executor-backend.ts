@@ -11,18 +11,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { EXECUTOR_SYSTEM_PROMPT, SCOUT_SYSTEM_PROMPT } from "./prompts.ts";
 import { aggregateUsage } from "./usage.ts";
-
-export type ExecutorEvent =
-	| { type: "reasoning_start" }
-	| { type: "reasoning_delta"; delta: string }
-	| { type: "text_start" }
-	| { type: "text_delta"; delta: string }
-	| { type: "text_end"; content: string }
-	| { type: "message_end" }
-	| { type: "tool_start"; toolCallId: string; toolName: string; args: unknown }
-	| { type: "tool_update"; toolCallId: string; partialResult: unknown }
-	| { type: "tool_end"; toolCallId: string; toolName: string; isError: boolean; result: unknown }
-	| { type: "other" };
+import type { ExecutorEvent } from "./core/worker.ts";
+export type { ExecutorEvent } from "./core/worker.ts";
 
 export interface ExecutorConfig {
 	cwd: string;

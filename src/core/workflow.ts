@@ -1,0 +1,29 @@
+import { MAX_REVISIONS, MAX_SCOUT_CALLS } from "../limits.ts";
+
+export type DelegationAction = "execute" | "revise" | "final_fix" | "resume";
+
+/** The policy is independent of the agent runtime and its session types. */
+export interface DelegationState {
+	delegating: boolean;
+	executed: boolean;
+	revisions: number;
+	finalFixUsed: boolean;
+	resumePending: boolean;
+}
+
+export function delegationError(state: DelegationState, action: DelegationAction): string | undefined {
+	if (state.delegating) return "A fusion delegation is already in progress. Wait for it to complete before delegating again.";
+	if (action === "execute" && state.executed) return 'Initial execution already completed. Review the working tree and use action "revise" with consolidated feedback.';
+	if (action === "revise" && !state.executed) return 'Cannot revise before the initial execution. Call fusion_delegate with action "execute" first.';
+	if (action === "final_fix" && !state.executed) return 'Cannot run the final fix before the initial execution. Call fusion_delegate with action "execute" first.';
+	if (action === "final_fix" && state.finalFixUsed) return "Final fix already used: only one final_fix is allowed per run. Report remaining gaps to the user.";
+	if (action === "revise" && state.revisions >= MAX_REVISIONS) return `Revision limit reached: at most ${MAX_REVISIONS} revisions are allowed. Take over the implementation yourself.`;
+	if (action === "resume" && !state.resumePending) return 'Nothing to resume: action "resume" is only valid right after /fusion-resume restores a durable run.';
+	return undefined;
+}
+
+export function scoutLimitError(calls: number): string | undefined {
+	return calls >= MAX_SCOUT_CALLS
+		? `Scout limit reached: at most ${MAX_SCOUT_CALLS} fusion_scout calls are allowed per run.`
+		: undefined;
+}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { findArgv, grepArgv, scoutCapDecision } from "../src/durable/scout-args.ts";
+import { findArgv, grepArgv, scoutCapDecision } from "../src/pi/durable/scout-args.ts";
 
 describe("grepArgv", () => {
 	test("builds the ripgrep argv with defaults", () => {

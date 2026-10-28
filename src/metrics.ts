@@ -3,7 +3,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { formatDuration } from "./progress.ts";
 import type { FusionRun } from "./runs.ts";
 
-export type DelegationAction = "execute" | "revise" | "final_fix" | "resume";
+export type { DelegationAction } from "./core/workflow.ts";
+import type { DelegationAction } from "./core/workflow.ts";
 
 export interface DelegationMetric {
 	action: DelegationAction;

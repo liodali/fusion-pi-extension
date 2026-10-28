@@ -4,7 +4,7 @@ import {
 	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { type Extension, section } from "@earendil-works/pi-durable";
-import { EXECUTOR_SYSTEM_PROMPT, SCOUT_SYSTEM_PROMPT } from "../prompts.ts";
+import { EXECUTOR_SYSTEM_PROMPT, SCOUT_SYSTEM_PROMPT } from "../../prompts.ts";
 
 export type FusionContextRole = "executor" | "scout";
 

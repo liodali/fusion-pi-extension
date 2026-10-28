@@ -1,4 +1,4 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { FusionModel } from "./core/model.ts";
 
 export const RECENT_MODEL_COHORT = "2025–2026";
 
@@ -17,13 +17,13 @@ export const RECENT_MODEL_PATTERNS: readonly RegExp[] = [
 	/mai-code-1/,
 ];
 
-function normalizedModelText(model: Model<Api>): string {
+function normalizedModelText(model: FusionModel): string {
 	return `${model.provider} ${model.id} ${model.name}`
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-");
 }
 
-export function isRecentModel(model: Model<Api>): boolean {
+export function isRecentModel(model: FusionModel): boolean {
 	const text = normalizedModelText(model);
 	return RECENT_MODEL_PATTERNS.some((pattern) => pattern.test(text));
 }
@@ -36,23 +36,23 @@ function queryTokens(query: string): string[] {
 		.filter((token) => token.length > 0);
 }
 
-function matchesQueryTokens(model: Model<Api>, tokens: string[]): boolean {
+function matchesQueryTokens(model: FusionModel, tokens: string[]): boolean {
 	const combined = `${model.provider} ${model.id} ${model.name}`.toLowerCase();
 	return tokens.every((token) => combined.includes(token));
 }
 
-export function searchRecentModels(models: Model<Api>[], query: string): Model<Api>[] {
+export function searchRecentModels<T extends FusionModel>(models: T[], query: string): T[] {
 	const recent = models.filter(isRecentModel);
 	const tokens = queryTokens(query);
 	if (tokens.length === 0) return recent;
 	return recent.filter((model) => matchesQueryTokens(model, tokens));
 }
 
-export function filterModelsByQuery(
-	models: Model<Api>[],
+export function filterModelsByQuery<T extends FusionModel>(
+	models: T[],
 	query: string,
 	emptyLimit = MODEL_PICKER_INITIAL_COUNT,
-): Model<Api>[] {
+): T[] {
 	const tokens = queryTokens(query);
 	if (tokens.length === 0) return models.slice(0, emptyLimit);
 	return models.filter((model) => matchesQueryTokens(model, tokens));

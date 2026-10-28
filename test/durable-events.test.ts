@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentEvent } from "@earendil-works/pi-durable";
 import type { Message } from "@earendil-works/pi-ai";
-import { createDurableEventMapper } from "../src/durable/events.ts";
+import { createDurableEventMapper } from "../src/pi/durable/events.ts";
 import { lastAssistantOutputFromMessages } from "../src/executor-backend.ts";
 
 const event = (value: object): AgentEvent => value as unknown as AgentEvent;
