@@ -5,6 +5,7 @@ import {
 	defaultThinkingLevel,
 	orderThinkingLevels,
 	scoutDefaultThinkingLevel,
+	smallTaskThinkingLevel,
 	toAgentThinkingLevel,
 } from "../src/thinking.ts";
 
@@ -84,5 +85,41 @@ describe("toAgentThinkingLevel", () => {
 			const converted: ThinkingLevel = toAgentThinkingLevel(level);
 			expect(converted).toBe(level);
 		}
+	});
+});
+
+describe("smallTaskThinkingLevel", () => {
+	const full: ModelThinkingLevel[] = [
+		"off",
+		"minimal",
+		"low",
+		"medium",
+		"high",
+		"xhigh",
+		"max",
+	];
+
+	test("configured max with a full supported list returns low", () => {
+		expect(smallTaskThinkingLevel("max", full)).toBe("low");
+	});
+
+	test("configured minimal never climbs above configured", () => {
+		expect(smallTaskThinkingLevel("minimal", full)).toBe("minimal");
+	});
+
+	test("configured off stays off", () => {
+		expect(smallTaskThinkingLevel("off", full)).toBe("off");
+	});
+
+	test("falls back to the next preferred level that is supported", () => {
+		expect(smallTaskThinkingLevel("max", ["high", "medium", "off"])).toBe("medium");
+	});
+
+	test("empty supported list keeps the configured level", () => {
+		expect(smallTaskThinkingLevel("max", [])).toBe("max");
+	});
+
+	test("configured low keeps low", () => {
+		expect(smallTaskThinkingLevel("low", full)).toBe("low");
 	});
 });

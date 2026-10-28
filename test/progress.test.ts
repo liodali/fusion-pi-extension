@@ -3,6 +3,7 @@ import {
 	appendProgressEntry,
 	formatDuration,
 	formatProgressTranscript,
+	formatReasoningSize,
 	MAX_PROGRESS_CHARS,
 	summarizeToolResult,
 	tailLines,
@@ -119,5 +120,19 @@ describe("summarizeToolResult", () => {
 		expect(summary?.length).toBe(100);
 		expect(summary?.endsWith("…")).toBe(true);
 		expect(summary?.startsWith("a\na")).toBe(true);
+	});
+});
+
+describe("formatReasoningSize", () => {
+	test("reports raw character counts below 1000", () => {
+		expect(formatReasoningSize(999)).toBe("999 chars");
+	});
+
+	test("reports thousands with one decimal from 1000", () => {
+		expect(formatReasoningSize(1000)).toBe("1.0k chars");
+	});
+
+	test("rounds larger counts to one decimal", () => {
+		expect(formatReasoningSize(42350)).toBe("42.4k chars");
 	});
 });

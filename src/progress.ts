@@ -45,6 +45,11 @@ export function formatDuration(ms: number): string {
 	return `${minutes}m ${String(rest).padStart(2, "0")}s`;
 }
 
+export function formatReasoningSize(chars: number): string {
+	if (chars < 1000) return `${chars} chars`;
+	return `${(chars / 1000).toFixed(1)}k chars`;
+}
+
 export function summarizeToolResult(result: unknown, max = MAX_TOOL_RESULT_CHARS): string | undefined {
 	let text: string | undefined;
 	if (typeof result === "string") {

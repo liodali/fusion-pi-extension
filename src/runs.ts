@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { FusionRunMetrics } from "./metrics.ts";
 
 export type FusionRunStatus = "running" | "done" | "failed" | "interrupted";
 
@@ -20,6 +21,9 @@ export interface FusionRun {
 	originalTask?: string;
 	executor: FusionRunExecutor;
 	sessionFile?: string;
+	backend?: "session" | "durable";
+	conversationId?: number;
+	metrics?: FusionRunMetrics;
 	status: FusionRunStatus;
 	revisions: number;
 	finalFixUsed?: boolean;

@@ -32,6 +32,22 @@ export function defaultThinkingLevel(
 	return orderThinkingLevels(levels)[0] ?? "off";
 }
 
+export function smallTaskThinkingLevel(
+	configured: ThinkingLevel,
+	supported: readonly ModelThinkingLevel[],
+): ThinkingLevel {
+	if (supported.length === 0) return configured;
+	for (const level of ["low", "minimal", "medium", "off"] as const) {
+		if (
+			supported.includes(level) &&
+			thinkingLevelRank(level) >= thinkingLevelRank(configured)
+		) {
+			return level;
+		}
+	}
+	return configured;
+}
+
 export function scoutDefaultThinkingLevel(
 	levels: readonly ModelThinkingLevel[],
 ): ThinkingLevel {

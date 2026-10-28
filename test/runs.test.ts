@@ -98,6 +98,84 @@ describe("writeRun/readRun", () => {
 		expect(loadedLegacy?.finalFixUsed).toBeUndefined();
 	});
 
+	test("roundtrips backend, conversationId, and metrics fields", async () => {
+		const dir = await tmpRunsDir();
+		const run = makeRun({
+			backend: "durable",
+			conversationId: 42,
+			metrics: {
+				backend: "durable",
+				startedAt: "2026-01-01T10:00:00.000Z",
+				finishedAt: "2026-01-01T10:05:00.000Z",
+				delegations: [
+					{
+						action: "execute",
+						size: "standard",
+						briefChars: 80,
+						thinking: "low",
+						totalMs: 1000,
+						reasoningChars: 50,
+						toolCalls: 2,
+						editCalls: 1,
+						reportStatus: "done",
+						usage: {
+							input: 1,
+							output: 2,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 3,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+						},
+					},
+				],
+				supervisorUsage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				scout: {
+					calls: 1,
+					ms: 500,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				},
+			},
+		});
+		await writeRun(dir, run);
+		const loaded = await readRun(dir, run.runId);
+		expect(loaded?.backend).toBe("durable");
+		expect(loaded?.conversationId).toBe(42);
+		expect(loaded?.metrics?.delegations).toHaveLength(1);
+		expect(loaded?.metrics?.delegations[0].action).toBe("execute");
+		expect(loaded?.metrics?.scout.calls).toBe(1);
+	});
+
+	test("still reads run manifests written before the backend and metrics fields", async () => {
+		const dir = await tmpRunsDir();
+		const legacy = makeRun({ runId: "legacy-durable" });
+		await writeRun(dir, legacy);
+		const file = join(dir, "legacy-durable.json");
+		const parsed = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+		delete parsed.backend;
+		delete parsed.conversationId;
+		delete parsed.metrics;
+		await writeFile(file, `${JSON.stringify(parsed)}\n`);
+		const loaded = await readRun(dir, "legacy-durable");
+		expect(loaded).toBeDefined();
+		expect(loaded?.backend).toBeUndefined();
+		expect(loaded?.conversationId).toBeUndefined();
+		expect(loaded?.metrics).toBeUndefined();
+	});
+
 	test("readRun returns undefined for missing or invalid manifests", async () => {
 		const dir = await tmpRunsDir();
 		expect(await readRun(dir, "nope")).toBeUndefined();

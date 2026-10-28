@@ -95,7 +95,11 @@ export interface ReviewTier {
 const DIFF_SUMMARY_PATTERN =
 	/(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/;
 
-export function reviewTier(report: ExecutorReport, diffStat?: string): ReviewTier {
+export function reviewTier(
+	report: ExecutorReport,
+	diffStat?: string,
+	extraReasons: readonly string[] = [],
+): ReviewTier {
 	const reasons: string[] = [];
 	if (report.status !== "done") reasons.push(`status ${report.status}`);
 	if (report.checks.length === 0) {
@@ -123,6 +127,7 @@ export function reviewTier(report: ExecutorReport, diffStat?: string): ReviewTie
 			reasons.push(`${changed} lines > ${CLEAN_DIFF_MAX_LINES}`);
 		}
 	}
+	reasons.push(...extraReasons);
 	return { tier: reasons.length === 0 ? "light" : "full", reasons };
 }
 
@@ -130,6 +135,7 @@ export function formatCompactReport(
 	report: ExecutorReport,
 	diffStat?: string,
 	prose?: string,
+	extraReasons: readonly string[] = [],
 ): string {
 	const lines: string[] = [`Status: ${report.status}`];
 	if (report.summary.trim()) {
@@ -172,7 +178,7 @@ export function formatCompactReport(
 			);
 		}
 	}
-	const review = reviewTier(report, diffStat);
+	const review = reviewTier(report, diffStat, extraReasons);
 	lines.push(
 		review.tier === "light" ? "Review: light" : `Review: full (${review.reasons.join(", ")})`,
 	);

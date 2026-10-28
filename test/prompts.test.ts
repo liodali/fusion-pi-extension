@@ -70,6 +70,31 @@ describe("buildSupervisorPrompt", () => {
 		expect(prompt).toContain(`${MAX_REVISIONS}`);
 		expect(prompt).toContain("do not fix them yourself");
 	});
+
+	test("instructs the supervisor to size tasks and report noticed-only issues", () => {
+		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain("# Sizing");
+		expect(prompt).toContain("Noticed, not changed");
+	});
+
+	test("limits revisions and the final audit to real defects", () => {
+		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain("A defect is something that breaks the user's task or the brief");
+		expect(prompt).toContain("Do not revise for extra hardening");
+		expect(prompt).toContain("If the diff meets the task and brief, do not revise.");
+		expect(prompt).toContain("Apply the same defect rule as step 5");
+	});
+
+	test("requires decided, structured, scope-limited briefs", () => {
+		const prompt = buildSupervisorPrompt("task", "executor");
+		expect(prompt).toContain("# Writing the brief");
+		expect(prompt).toContain("Decide the approach");
+		expect(prompt).toContain("Never hand over open trade-offs");
+		expect(prompt).toContain("resolve the conflict in the brief");
+		expect(prompt).toContain("Goal (the user's request in one line), Change (file, location, approach), Do not touch, Check");
+		expect(prompt).toContain("shorter, more decided brief");
+		expect(prompt.indexOf("# Writing the brief")).toBeLessThan(prompt.indexOf("# Protocol"));
+	});
 });
 
 describe("buildScoutPrompt", () => {
@@ -186,6 +211,13 @@ describe("EXECUTOR_SYSTEM_PROMPT", () => {
 		expect(EXECUTOR_SYSTEM_PROMPT).toContain('"status":"done"|"partial"|"blocked"');
 		expect(EXECUTOR_SYSTEM_PROMPT).toContain("no prose after it");
 		expect(EXECUTOR_SYSTEM_PROMPT).toContain("at most one short sentence");
+	});
+
+	test("acts instead of deliberating and escalates contradictions as blocked", () => {
+		expect(EXECUTOR_SYSTEM_PROMPT).toContain("make the edit");
+		expect(EXECUTOR_SYSTEM_PROMPT).toContain("debate alternatives");
+		expect(EXECUTOR_SYSTEM_PROMPT).toContain("take the simplest option");
+		expect(EXECUTOR_SYSTEM_PROMPT).toContain('report status "blocked"');
 	});
 
 	test("makes the json block the report instead of a prose summary", () => {

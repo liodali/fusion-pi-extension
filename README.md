@@ -73,6 +73,8 @@ pi --extension ./src/index.ts
 | `/fusion [task]` | Run one task through the protocol. Prompts for the task in an editor when omitted, sets the supervisor model and thinking level with `pi.setModel`/`pi.setThinkingLevel`, starts a fresh run, warms up the executor session in the background, and sends the supervisor prompt. Reuses the configured pair when present. |
 | `/fusion-mode` | Toggle persistent mode. When enabled, ordinary interactive text prompts are transformed into the supervisor protocol automatically and the supervisor thinking level is reapplied to each intercepted prompt. When disabled, the active executor is disposed and the widget cleared. |
 | `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing and thinking levels, scout thinking level, current phase, revision and final-fix counts, per-run supervisor, executor, and scout usage totals, current executor activity, and the last delegation timings (session-ready wait, first executor event, total). |
+| `/fusion-stats [N]` | Show per-run metrics (newest N, default 10) for this directory: wall time split into executor, scout, and supervisor+review time, brief size, delegation and revision counts, and total cost, plus medians and averages across the listed runs. Only runs recorded since metrics tracking was added appear. |
+| `/fusion-resume` | Continue an interrupted run left behind by a crash or restart. Session-backend runs restore the persisted executor transcript; durable-backend runs reattach to the durable conversation and finish the interrupted executor turn via `fusion_delegate` action `"resume"`. |
 | `/fusion-clean` | Wait for the agent to go idle, dispose the executor session, and clear run data (task, revisions, phase). Model configuration and mode are preserved. Creates no temporary files. |
 
 Quick start:
@@ -97,9 +99,29 @@ Quick start:
 7. Before summarizing, the supervisor runs a final acceptance audit against the original user task (not its brief): every requirement is marked met, partial, or missing with concrete evidence, and bugs (unhandled edge cases, regressions, missing tests, checks never run) are hunted down. Any gaps go back to the executor as one consolidated `fusion_delegate` `action: "final_fix"` call — allowed once per run, separate from the 3 revisions — and its diff is reviewed the same way.
 8. The supervisor takes over only if the executor is blocked, then delivers a final user-facing summary with the checks that passed and the acceptance checklist, including anything still unresolved.
 
+## Executor backend
+
+Fusion can run the executor and scout on one of two backends, selected in `/fusion-config`:
+
+- **`session`** (default): the executor is a Pi SDK `AgentSession` persisted under `<agentDir>/fusion/sessions`, and the scout is a disposable in-memory session. An interrupted run can be continued with `/fusion-resume` followed by a normal `revise` delegation.
+- **`durable`** (experimental): the executor and scout run on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable), persisted in a SQLite database at `<agentDir>/fusion/durable.sqlite`. The package is an optional peer dependency — Fusion only offers the durable option when it can be loaded, and falls back to `session` with a warning otherwise.
+
+The durable backend guarantees:
+
+- An in-flight executor turn survives a hard kill of the Pi process. `/fusion-resume` restores the run, and `fusion_delegate` action `"resume"` waits for the interrupted turn to finish and returns its report. The resumed report is flagged with a `resumed after restart` review reason so the supervisor does a full review.
+- Exactly-once submissions: a delegation retried after a crash reattaches to the same durable submission instead of starting duplicate work.
+- The scout tool-call cap is stored inside the durable conversation, so it still holds if the process restarts mid-scout.
+
+Limitations:
+
+- Only the executor turn is durable. The supervisor is the interactive Pi session — a crash loses its in-memory state, and after `/fusion-resume` it rebuilds context from the run record and the working tree.
+- Commands cut off by a crash may still have completed their side effects, so after a durable resume the supervisor reviews the full working tree with `git diff` rather than trusting the report alone.
+- Scout answers are not delivered after a crash; the supervisor simply calls `fusion_scout` again.
+- Durable runs resumed before this backend existed have no conversation id and cannot be continued.
+
 ## Session and data handling
 
-- The executor uses `SessionManager.inMemory(cwd)`: nothing is persisted to the session store.
+- With the session backend the executor session is persisted under `<agentDir>/fusion/sessions` so `/fusion-resume` can reopen it; the scout uses `SessionManager.inMemory(cwd)` and leaves nothing behind.
 - The executor session is disposed when a new task starts, when Fusion mode is disabled, on `session_shutdown`, and via `/fusion-clean`.
 - The selected supervisor/executor pair and mode flag live only in extension memory; they reset when Pi exits or the extension reloads.
 - Because both agents share the filesystem, executor edits are visible to the supervisor immediately.
@@ -115,7 +137,7 @@ Quick start:
 - Tiering depends on provider/model catalog pricing metadata. Models without trustworthy pricing are executor-only by design.
 - The recent-model cohort is a hand-maintained pattern list: a selection heuristic, not authoritative release dates, and it needs occasional updates as new model families ship.
 - Only one Fusion run is active at a time, and a run allows one initial execution, at most 3 revisions, and one final fix.
-- State is not durable across process restarts or extension reloads.
+- Supervisor and executor state is not durable across process restarts or extension reloads; run manifests under `<agentDir>/fusion/runs` let `/fusion-resume` continue an interrupted run, and the experimental durable backend additionally preserves the in-flight executor turn itself (see [Executor backend](#executor-backend)).
 
 ## Development
 

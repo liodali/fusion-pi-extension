@@ -196,4 +196,24 @@ describe("reviewTier", () => {
 		const stat = `${STAT}\npre-existing changes (diff includes edits made before this delegation): a.ts`;
 		expect(reviewTier(DONE, stat).reasons).toContain("pre-existing changes");
 	});
+
+	test("extra reasons force a full review and are appended", () => {
+		expect(reviewTier(DONE, STAT, ["resumed after restart"])).toEqual({
+			tier: "full",
+			reasons: ["resumed after restart"],
+		});
+		const report: ExecutorReport = {
+			...DONE,
+			checks: [],
+		};
+		expect(reviewTier(report, STAT, ["resumed after restart"]).reasons).toEqual([
+			"no checks run",
+			"resumed after restart",
+		]);
+	});
+
+	test("formatCompactReport renders extra reasons in the review line", () => {
+		const text = formatCompactReport(DONE, STAT, undefined, ["resumed after restart"]);
+		expect(text).toContain("Review: full (resumed after restart)");
+	});
 });
