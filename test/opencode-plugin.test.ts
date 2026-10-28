@@ -18,6 +18,115 @@ function setupTest(context: Omit<Parameters<typeof plugin.setup>[0], "storage">,
 }
 
 describe("OpenCode Fusion plugin", () => {
+	test("reset holds workspace ownership until storage removal finishes", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		let hold = true;
+		const storage = { ...backing, remove: async (key: string) => { if (hold) await gate; await backing.remove(key); } };
+		let calls = 0;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => {
+				calls++;
+				return { output: { sessionID: `child-${calls}`, status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		const delegate = tools.get("fusion_delegate")!;
+		const reset = tools.get("fusion_reset")!;
+		await delegate.execute({ action: "execute", brief: "build" }, context("one"));
+		const deleting = reset.execute({}, context("one"));
+		await expect(delegate.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("reset is in progress");
+		await expect(delegate.execute({ action: "execute", brief: "other" }, context("two"))).rejects.toThrow("reset is in progress");
+		await expect(reset.execute({}, context("one"))).rejects.toThrow("reset is in progress");
+		expect(calls).toBe(1);
+		hold = false; release();
+		await deleting;
+		await delegate.execute({ action: "execute", brief: "other" }, context("two"));
+		expect(calls).toBe(2);
+	});
+
+	test("a failed reset keeps the owner and permits a later retry", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let fail = true;
+		const storage = { ...backing, remove: async (key: string) => {
+			if (fail) { fail = false; throw new Error("remove failed"); }
+			await backing.remove(key);
+		} };
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("remove failed");
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "other" }, context("two"))).rejects.toThrow("owns this workspace");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).resolves.toHaveProperty("content", "Fusion run reset.");
+	});
+
+	test("preserves pending work when saving a completed turn fails", async () => {
+		const backing = memoryStorage();
+		let failSettlement = false;
+		let messages: unknown[] = [];
+		let description = "";
+		let calls = 0;
+		const storage = { ...backing, set: async (key: string, value: unknown) => {
+			if (failSettlement && !(value as { pending?: unknown }).pending) {
+				failSettlement = false;
+				throw new Error("settlement write failed");
+			}
+			await backing.set(key, value);
+		} };
+		const makeContext = (tools: Map<string, Tool>): Omit<Parameters<typeof plugin.setup>[0], "storage"> => ({
+			location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, ctx) => {
+					calls++;
+					await ctx.progress({ sessionID: "child" });
+					if (calls === 1) { description = input.description; failSettlement = true; }
+					return { output: { sessionID: "child", status: "completed", output: "done" } };
+				} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		});
+		const first = new Map<string, Tool>();
+		await setupTest(makeContext(first), storage);
+		await expect(first.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("settlement write failed");
+		await expect(first.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("uncertain");
+		const restored = new Map<string, Tool>();
+		await setupTest(makeContext(restored), storage);
+		await expect(restored.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("unknown outcome");
+		messages = [{ type: "synthetic", description, metadata: { source: "subagent", childID: "child", agent: "fusion-executor", state: "completed" }, text: `<subagent sessionID="child" state="completed" description="${description}">\ndone\n</subagent>` }];
+		await restored.get("fusion_reconcile")!.execute({}, context("one"));
+		await restored.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"));
+		expect(calls).toBe(2);
+	});
+
+	test("retries a revision after confirmed pre-submission storage failure", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let failNext = false;
+		const storage = { ...backing, set: async (key: string, value: unknown) => {
+			if (failNext) { failNext = false; throw new Error("temporary storage failure"); }
+			await backing.set(key, value);
+		} };
+		let calls = 0;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => {
+				calls++;
+				return { output: { sessionID: "child", status: "completed", output: "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		const delegate = tools.get("fusion_delegate")!;
+		await delegate.execute({ action: "execute", brief: "build" }, context("one"));
+		failNext = true;
+		await expect(delegate.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("temporary storage failure");
+		expect(calls).toBe(1);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.revisions).toBe(0);
+		expect(status.uncertain).toBe(false);
+		await delegate.execute({ action: "revise", brief: "fix" }, context("one"));
+		expect(calls).toBe(2);
+	});
+
 	test("does not submit work when the pending record cannot be saved", async () => {
 		const tools = new Map<string, Tool>();
 		let calls = 0;

@@ -74,7 +74,8 @@ pi --extension ./src/index.ts
 | `/fusion-mode` | Toggle persistent mode. When enabled, ordinary interactive text prompts are transformed into the supervisor protocol automatically and the supervisor thinking level is reapplied to each intercepted prompt. When disabled, the active executor is disposed and the widget cleared. |
 | `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing and thinking levels, scout thinking level, current phase, revision and final-fix counts, per-run supervisor, executor, and scout usage totals, current executor activity, and the last delegation timings (session-ready wait, first executor event, total). |
 | `/fusion-stats [N]` | Show per-run metrics (newest N, default 10) for this directory: wall time split into executor, scout, and supervisor+review time, brief size, delegation and revision counts, and total cost, plus medians and averages across the listed runs. Only runs recorded since metrics tracking was added appear. |
-| `/fusion-resume` | Continue an interrupted run left behind by a crash or restart. Session-backend runs restore the persisted executor transcript; durable-backend runs reattach to the durable conversation and finish the interrupted executor turn via `fusion_delegate` action `"resume"`. |
+| `/fusion-resume` | Reopen an interrupted Durable run with a saved request ID. The `resume` delegation looks up that exact submission and waits for its result. |
+| `/fusion-resolve` | After verifying that an interrupted worker and its commands have stopped and reviewing the workspace, explicitly resolve the run. Its manifest and transcript are retained. |
 | `/fusion-clean` | Wait for the agent to go idle, dispose the executor session, and clear run data (task, revisions, phase). Model configuration and mode are preserved. Creates no temporary files. |
 
 Quick start:
@@ -103,7 +104,7 @@ Quick start:
 
 Fusion can run the executor and scout on one of two backends, selected in `/fusion-config`:
 
-- **`session`** (default): the executor is a Pi SDK `AgentSession` persisted under `<agentDir>/fusion/sessions`, and the scout is a disposable in-memory session. An interrupted run can be continued with `/fusion-resume` followed by a normal `revise` delegation.
+- **`session`** (default): the executor is a Pi SDK `AgentSession` persisted under `<agentDir>/fusion/sessions`, and the scout is a disposable in-memory session. Interrupted turns cannot be reattached automatically; inspect the session and workspace, verify the worker has stopped, and use `/fusion-resolve`.
 - **`durable`** (experimental): the executor and scout run on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable), persisted in a SQLite database at `<agentDir>/fusion/durable.sqlite`. The package is an optional peer dependency — Fusion only offers the durable option when it can be loaded, and falls back to `session` with a warning otherwise.
 
 Pi Durable is specific to the Pi harness. Future harness integrations use their own session and recovery capabilities and do not require `pi-durable`.
@@ -112,10 +113,9 @@ An experimental OpenCode entrypoint is under development. Its current capabiliti
 local test setup, and remaining parity work are documented in
 [OpenCode readiness and testing](docs/opencode-testing.md).
 
-The durable backend guarantees:
+The durable backend supports:
 
-- An in-flight executor turn survives a hard kill of the Pi process. `/fusion-resume` restores the run, and `fusion_delegate` action `"resume"` waits for the interrupted turn to finish and returns its report. The resumed report is flagged with a `resumed after restart` review reason so the supervisor does a full review.
-- Exactly-once submissions: a delegation retried after a crash reattaches to the same durable submission instead of starting duplicate work.
+- For a run with a saved request ID, `/fusion-resume` looks up the exact durable submission and waits for its terminal result. Missing or ambiguous evidence keeps the run blocked. A resumed report requires a full working-tree review.
 - The scout tool-call cap is stored inside the durable conversation, so it still holds if the process restarts mid-scout.
 
 Limitations:
@@ -123,11 +123,12 @@ Limitations:
 - Only the executor turn is durable. The supervisor is the interactive Pi session — a crash loses its in-memory state, and after `/fusion-resume` it rebuilds context from the run record and the working tree.
 - Commands cut off by a crash may still have completed their side effects, so after a durable resume the supervisor reviews the full working tree with `git diff` rather than trusting the report alone.
 - Scout answers are not delivered after a crash; the supervisor simply calls `fusion_scout` again.
-- Durable runs resumed before this backend existed have no conversation id and cannot be continued.
+- Legacy interrupted runs without an original request ID, interrupted session runs, and runs without matching Durable evidence need manual inspection and `/fusion-resolve`. No exactly-once side-effect guarantee is implied.
+- Older Fusion versions do not enforce the new interrupted-run guard. Resolve an interrupted run before switching to an older version or running mixed versions in the same workspace.
 
 ## Session and data handling
 
-- With the session backend the executor session is persisted under `<agentDir>/fusion/sessions` so `/fusion-resume` can reopen it; the scout uses `SessionManager.inMemory(cwd)` and leaves nothing behind.
+- With the session backend the executor session is persisted under `<agentDir>/fusion/sessions` for inspection; the scout uses `SessionManager.inMemory(cwd)` and leaves nothing behind.
 - The executor session is disposed when a new task starts, when Fusion mode is disabled, on `session_shutdown`, and via `/fusion-clean`.
 - The selected supervisor/executor pair and mode flag live only in extension memory; they reset when Pi exits or the extension reloads.
 - Because both agents share the filesystem, executor edits are visible to the supervisor immediately.
@@ -143,7 +144,7 @@ Limitations:
 - Tiering depends on provider/model catalog pricing metadata. Models without trustworthy pricing are executor-only by design.
 - The recent-model cohort is a hand-maintained pattern list: a selection heuristic, not authoritative release dates, and it needs occasional updates as new model families ship.
 - Only one Fusion run is active at a time, and a run allows one initial execution, at most 3 revisions, and one final fix.
-- Supervisor and executor state is not durable across process restarts or extension reloads; run manifests under `<agentDir>/fusion/runs` let `/fusion-resume` continue an interrupted run, and the experimental durable backend additionally preserves the in-flight executor turn itself (see [Executor backend](#executor-backend)).
+- The supervisor is not durable across process restarts. Interrupted run manifests block new work in the same workspace until exact Durable recovery or explicit manual resolution (see [Executor backend](#executor-backend)). Cross-process workspace locking remains unfinished.
 
 ## Development
 

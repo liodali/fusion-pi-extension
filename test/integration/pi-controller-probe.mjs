@@ -1,0 +1,162 @@
+// Runs in a separate Bun process so SDK mocks cannot affect other tests.
+import { expect, mock, test } from "bun:test";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const root = process.env.FUSION_PI_TEST_DIR;
+if (!root) throw new Error("Missing isolated Pi test directory");
+let failThinking = false;
+let failPrompt = false;
+let prompts = 0;
+let durableEnabled = false;
+let durableResumes = [];
+const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const handle = {
+	resumeRef: () => join(root, "session.jsonl"),
+	setThinking: async () => { if (failThinking) throw new Error("thinking failed"); },
+	prompt: async () => { prompts++; if (failPrompt) throw new Error("connection lost"); return { text: '```json\n{"status":"done","summary":"ok"}\n```', usage }; },
+	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => {},
+};
+mock.module("../../src/pi/executor-backend.ts", () => ({
+	createSessionExecutorBackend: () => ({ kind: "session", capabilities: { transcriptReopen: true, activeTurnReattach: false },
+		createExecutor: async () => handle, dispose: async () => {} }),
+}));
+mock.module("../../src/pi/durable/backend.ts", () => ({ createDurableExecutorBackend: async () => {
+	if (!durableEnabled) throw new Error("unavailable");
+	return { kind: "durable", capabilities: { transcriptReopen: true, activeTurnReattach: true },
+		openExecutor: async () => ({ ...handle, resumeRef: () => "42", resume: async (options) => { durableResumes.push(options.requestId); return { text: "recovered", usage }; } }),
+		dispose: async () => {} };
+} }));
+
+const { default: registerFusion } = await import("../../src/index.ts");
+const { writeRun, readRun, runsDir } = await import("../../src/runs.ts");
+
+test("Pi keeps pre-submission revisions retryable and blocks an uncertain final fix", async () => {
+	const tools = new Map();
+	const commands = new Map();
+	const hooks = new Map();
+	const notifications = [];
+	let active = [];
+	const pi = { registerTool: (tool) => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command),
+		on: (name, callback) => hooks.set(name, callback), getActiveTools: () => active, setActiveTools: (value) => { active = value; },
+		setModel: async () => true, setThinkingLevel: () => {}, sendUserMessage: () => {},
+		exec: async () => ({ code: 1, stdout: "" }) };
+	const models = [
+		{ provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } },
+		{ provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } },
+	];
+	const ctx = { cwd: root, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { getAvailable: () => models },
+		waitForIdle: async () => {}, ui: { notify: (message) => notifications.push(message), input: async () => "",
+			select: async (_title, options) => options[0], setWidget: () => {} } };
+	registerFusion(pi);
+	await commands.get("fusion").handler("original task", ctx);
+	const delegate = (action, brief) => tools.get("fusion_delegate").execute("call", { action, brief }, undefined, undefined, ctx);
+	expect((await delegate("execute", "build")).details.error).toBeUndefined();
+	failThinking = true;
+	const failedBefore = await delegate("revise", "fix");
+	expect(failedBefore.details.error).toContain("thinking failed");
+	expect(failedBefore.details.revisions).toBe(0);
+	failThinking = false;
+	expect((await delegate("revise", "fix")).details.error).toBeUndefined();
+	expect(prompts).toBe(2);
+	failPrompt = true;
+	expect((await delegate("final_fix", "audit")).details.error).toContain("connection lost");
+	expect((await delegate("revise", "retry")).content[0].text).toContain("unknown outcome");
+	await commands.get("fusion-clean").handler("", ctx);
+	expect(notifications.at(-1)).toContain("uncertain");
+	const files = await readdir(join(root, "fusion", "runs"));
+	const run = JSON.parse(await readFile(join(root, "fusion", "runs", files[0]), "utf8"));
+	expect(run.status).toBe("interrupted");
+	expect(run.revisions).toBe(1);
+	expect(run.finalFixUsed).toBe(true);
+	expect(prompts).toBe(3);
+});
+
+function makePi(cwd) {
+	const tools = new Map(), commands = new Map(), hooks = new Map(), notifications = [];
+	let active = [], confirmed = false;
+	const pi = { registerTool: (tool) => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command),
+		on: (name, callback) => hooks.set(name, callback), getActiveTools: () => active, setActiveTools: (value) => { active = value; },
+		setModel: async () => true, setThinkingLevel: () => {}, sendUserMessage: () => {}, exec: async () => ({ code: 1, stdout: "" }) };
+	const model = { provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } };
+	const supervisor = { provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } };
+	const ctx = { cwd, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { find: () => model, getAvailable: () => [supervisor, model] },
+		waitForIdle: async () => {}, ui: { notify: (message) => notifications.push(message), input: async () => "",
+			select: async (_title, options) => options[0], confirm: async () => confirmed, setWidget: () => {} } };
+	registerFusion(pi);
+	return { tools, commands, hooks, notifications, ctx, confirm: (value) => { confirmed = value; } };
+}
+
+async function interruptedRun(id, pending) {
+	const cwd = join(root, id);
+	await mkdir(cwd, { recursive: true });
+	const run = { runId: id, cwd, task: "original", originalTask: "original", brief: "brief", backend: "durable", conversationId: 42,
+		executor: { provider: "fake", modelId: "glm-5", label: "fake/glm-5", thinking: "off" },
+		status: "interrupted", revisions: 0, results: {}, updatedAt: new Date().toISOString(), ...(pending ? { pending } : {}) };
+	await writeRun(runsDir(root), run);
+	return run;
+}
+
+test("an aborted Durable resume retains the original request and can retry reattachment", async () => {
+	durableEnabled = true; durableResumes = [];
+	const run = await interruptedRun("aborted-resume", { action: "execute", requestId: "original-request" });
+	const f = makePi(run.cwd);
+	await f.commands.get("fusion-resume").handler("", f.ctx);
+	const delegate = (signal) => f.tools.get("fusion_delegate").execute("call", { action: "resume", brief: "resume" }, signal, undefined, f.ctx);
+	const aborted = await delegate(AbortSignal.abort());
+	expect(aborted.details.error).toContain("aborted");
+	expect(durableResumes).toEqual([]);
+	const saved = await readRun(runsDir(root), run.runId);
+	expect(saved.status).toBe("interrupted");
+	expect(saved.pending.requestId).toBe("original-request");
+	const blocked = await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "retry" }, undefined, undefined, f.ctx);
+	expect(blocked.content[0].text).toContain("unknown outcome");
+	expect((await delegate(undefined)).details.error).toBeUndefined();
+	expect(durableResumes).toEqual(["original-request"]);
+	expect((await readRun(runsDir(root), run.runId)).pending).toBeUndefined();
+});
+
+test("startup blocks an interrupted legacy run until explicit manual resolution", async () => {
+	const run = await interruptedRun("legacy-restart");
+	const f = makePi(run.cwd);
+	f.hooks.get("session_start")({}, f.ctx);
+	for (let i = 0; i < 100 && !f.notifications.some((message) => message.includes("Interrupted Fusion run found")); i++) await Bun.sleep(10);
+	expect(f.notifications.some((message) => message.includes("Interrupted Fusion run found"))).toBe(true);
+	const result = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "new work" }, undefined, undefined, f.ctx);
+	expect(result.content[0].text).toContain("requires recovery");
+	await f.commands.get("fusion-resume").handler("", f.ctx);
+	expect(f.notifications.at(-1)).toContain("no valid original request ID");
+	await f.commands.get("fusion-resolve").handler("", f.ctx);
+	expect((await readRun(runsDir(root), run.runId)).status).toBe("interrupted");
+	f.confirm(true);
+	await f.commands.get("fusion-resolve").handler("", f.ctx);
+	const resolved = await readRun(runsDir(root), run.runId);
+	expect(resolved.status).toBe("failed");
+	expect(resolved.manualResolution.at).toBeString();
+	expect(resolved.task).toBe("original");
+	failPrompt = false;
+	const previousPrompts = prompts;
+	await f.commands.get("fusion").handler("new task", f.ctx);
+	const next = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "new work" }, undefined, undefined, f.ctx);
+	expect(next.details.error).toBeUndefined();
+	expect(prompts).toBe(previousPrompts + 1);
+});
+
+test("Pi does not invoke its worker if the write-ahead record cannot be saved", async () => {
+	const path = join(root, "not-a-directory");
+	await writeFile(path, "file");
+	const cwd = join(root, "failed-write-workspace");
+	await mkdir(cwd, { recursive: true });
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = path;
+	try {
+		const before = prompts;
+		const f = makePi(cwd);
+		await f.commands.get("fusion").handler("task", f.ctx);
+		const result = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+		expect(result.details.error).toBeDefined();
+		expect(prompts).toBe(before);
+		await f.commands.get("fusion-clean").handler("", f.ctx);
+		expect(f.notifications.at(-1)).toContain("uncertain");
+	} finally { process.env.PI_CODING_AGENT_DIR = previous; }
+});

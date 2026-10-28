@@ -6,7 +6,7 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 
 | Area | Implemented | Verified |
 |---|---|---|
-| Shared delegation/scout transitions | Yes; used by Pi and OpenCode | Unit tests |
+| Shared lifecycle and delegation sequencing | In progress; both adapters call the same controller | Shared port tests, Pi entrypoint and OpenCode plugin regression tests |
 | Neutral worker contracts and Pi runtime isolation | Contracts and Pi session adapter extracted; runtime adoption remains | Dependency-free shared import test, Pi regressions, and type checking |
 | Pi-only Durable directory | Yes | Existing regression tests; no new live durable run |
 | Native OpenCode executor wrapper | Prototype | Unit tests, including foreground-to-background handling |
@@ -16,9 +16,10 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | Actual executor child, revisions, and final fix | Experimental host wiring | Live v2.2.0 run with `opencode-go/glm-5.3-flash`, same child and expected final file |
 | Complete OpenCode Fusion workflow | No | Not ready to install/use |
 
-The core extraction is partial: the shared controller owns task start, restoration,
-reset, and delegation guards; `src/index.ts` still owns other lifecycle behavior,
-Pi persistence, and Pi UI. The experimental OpenCode
+The core extraction is partial: the shared controller owns task transitions,
+pending and uncertain state, delegation guards, and the main delegation sequence;
+the adapters still own native worker handles, persistence, and presentation.
+The experimental OpenCode
 entrypoint exposes delegate, status, reset, and reconciliation tools, with example agent files.
 It has no scout or command registration. OpenCode plugin storage retains the
 workspace owner, original task, budgets, child ID and pending turn across reloads.

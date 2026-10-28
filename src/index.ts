@@ -1,6 +1,6 @@
-import { FusionLifecycle } from "./core/controller.ts";
+import { FusionController } from "./core/controller.ts";
 import type { FusionPhase } from "./core/workflow.ts";
-import { delegationError, scoutLimitError } from "./core/workflow.ts";
+import { scoutLimitError } from "./core/workflow.ts";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	type Api,
@@ -23,7 +23,6 @@ import {
 	type ExecutorBackend,
 	type ExecutorEvent,
 	type ExecutorHandle,
-	type ExecutorTurnResult,
 } from "./pi/executor-backend.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, type GitExec } from "./workspace/evidence.ts";
 import {
@@ -35,9 +34,6 @@ import {
 } from "./limits.ts";
 import { type DelegationAction, formatRunStats } from "./metrics.ts";
 import {
-	buildExecutorPrompt,
-	buildFinalFixPrompt,
-	buildRevisionPrompt,
 	buildScoutPrompt,
 	buildSupervisorPrompt,
 	MAX_FINAL_FIXES,
@@ -229,7 +225,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const sessionBackend = createSessionExecutorBackend();
-	const controller = new FusionLifecycle(state);
+	const controller = new FusionController(state);
 	let loadDurablePromise: Promise<ExecutorBackend | undefined> | undefined;
 	let durableUnavailable: string | undefined;
 
@@ -267,7 +263,8 @@ export default function (pi: ExtensionAPI) {
 		return transcript ? `${header}\n\n${transcript}` : header;
 	};
 
-	const persistRun = async (): Promise<void> => {
+	let runWrites: Promise<void> = Promise.resolve();
+	const persistRunCritical = async (): Promise<void> => {
 		if (!state.activeRun) return;
 		const metrics = state.activeRun.metrics;
 		if (metrics) {
@@ -278,10 +275,28 @@ export default function (pi: ExtensionAPI) {
 				usage: state.scoutUsage,
 			};
 		}
-		try {
-			await writeRun(runsDir(getAgentDir()), state.activeRun);
-		} catch {}
+		const snapshot = structuredClone(state.activeRun);
+		const write = runWrites.then(() => writeRun(runsDir(getAgentDir()), snapshot));
+		runWrites = write.catch(() => {});
+		await write;
 	};
+	const persistRun = async (): Promise<void> => { try { await persistRunCritical(); } catch {} };
+
+	const recoveryInitialization = new Map<string, Promise<void>>();
+	let resolvingRun = false;
+	function initializeRecovery(cwd: string): Promise<void> {
+		let pending = recoveryInitialization.get(cwd);
+		if (!pending) {
+			pending = markInterrupted(runsDir(getAgentDir()), cwd).then(() => {});
+			recoveryInitialization.set(cwd, pending);
+		}
+		return pending;
+	}
+	async function unresolvedRuns(cwd: string, excludeRunId?: string): Promise<FusionRun[]> {
+		await initializeRecovery(cwd);
+		return (await listRuns(runsDir(getAgentDir()), cwd)).filter((run) =>
+			(run.status === "running" || run.status === "interrupted") && run.runId !== excludeRunId);
+	}
 
 	function updateWidget(ctx: ExtensionContext): void {
 		if (!state.runActive && !state.modeEnabled) {
@@ -773,7 +788,10 @@ export default function (pi: ExtensionAPI) {
 			const timingLine = (): string =>
 				`Timing: ready ${timings.readyMs ?? "-"}ms, first event ${timings.firstEventMs ?? "-"}ms, total ${timings.totalMs ?? "-"}ms`;
 
-			const error = delegationError(state, params.action);
+			if (resolvingRun) return respond("Fusion recovery resolution is in progress.");
+			if ((await unresolvedRuns(ctx.cwd, state.runId)).length > 0) return respond("An interrupted Fusion run requires recovery before new delegation. Use /fusion-resume or /fusion-resolve.");
+			if (resolvingRun) return respond("Fusion recovery resolution is in progress.");
+			const error = controller.validateDelegation(params.action, params.brief);
 			if (error) return respond(error);
 
 			const isRevision = params.action === "revise";
@@ -797,8 +815,9 @@ export default function (pi: ExtensionAPI) {
 				return respond(`${cached}\n\n(cached result, already executed)`);
 			}
 
-			const beginError = controller.beginDelegation(params.action, isResume ? (await activeBackend()).capabilities : undefined);
+			const beginError = controller.beginDelegation(params.action, isResume ? (await activeBackend()).capabilities : undefined, params.brief);
 			if (beginError) return respond(beginError);
+			if (!isResume) controller.setPending({ action: params.action, requestId: key });
 			const startedAt = Date.now();
 			state.delegationStartedAt = startedAt;
 			let reasoningTotalChars = 0;
@@ -852,9 +871,6 @@ export default function (pi: ExtensionAPI) {
 						disposeExecutor();
 					}
 					controller.prepareExecution(params.brief);
-					state.revisions = 0;
-					state.finalFixUsed = false;
-					state.executed = false;
 					state.activeRun = {
 						runId: newRunId(),
 						cwd: ctx.cwd,
@@ -888,7 +904,8 @@ export default function (pi: ExtensionAPI) {
 					state.activeRun.status = "running";
 					state.activeRun.revisions = state.revisions;
 					state.activeRun.finalFixUsed = state.finalFixUsed;
-					await persistRun();
+					if (!isResume) state.activeRun.pending = { action: params.action as "execute" | "revise" | "final_fix", requestId: key };
+					await persistRunCritical();
 				}
 				emit(executorProgressText());
 				if (signal?.aborted) throw new Error("Fusion delegation aborted.");
@@ -904,23 +921,9 @@ export default function (pi: ExtensionAPI) {
 					} else {
 						state.activeRun.sessionFile = ref;
 					}
-					await persistRun();
+					await persistRunCritical();
 				}
-				const promptText = isRevision
-					? buildRevisionPrompt(
-							params.brief,
-							state.revisions,
-							state.executorUsed ? undefined : state.executorBrief,
-						)
-					: isFinalFix
-						? buildFinalFixPrompt(
-								params.brief,
-								state.originalTask,
-								state.executorUsed ? undefined : state.executorBrief,
-							)
-						: isResume
-							? ""
-							: buildExecutorPrompt(params.brief);
+				const promptText = controller.delegationPrompt(params.action, params.brief, !state.executorUsed);
 				if (signal?.aborted) {
 					await handle.abort();
 					throw new Error("Fusion delegation aborted.");
@@ -1011,73 +1014,85 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 				state.executorUsed = true;
-				const workspaceBefore = await snapshotWorkspace(ctx.cwd, gitExec);
-				let output: ExecutorTurnResult;
-				if (isResume) {
-					output = await handle.resume({ signal, onEvent });
-				} else {
-					await handle.setThinking(effective);
-					output = await handle.prompt(promptText, { requestId: key, signal, onEvent });
-				}
-				if (
-					state.activeRun &&
-					(state.executorSessionBackend ?? state.executorBackend) === "session"
-				) {
-					state.activeRun.sessionFile = handle.resumeRef();
-				}
-				const workspaceAfter = await snapshotWorkspaceAfter(workspaceBefore, gitExec);
-				timings.totalMs = Date.now() - startedAt;
-				state.lastTimings = { ...timings };
-				const usage = output.usage;
-				state.executorUsage = addUsage(state.executorUsage, usage);
-				controller.completeDelegation();
-				if (output.stopReason === "error" || output.stopReason === "aborted") {
-					const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
-					state.executorActivity = "failed";
-					appendExecutorProgress(
-						`[failed] Executor stopped with status "${output.stopReason}"${reason}.`,
-					);
-					setPhase(ctx, "failed");
-					renderThrottle.flush();
-					const text = `Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
-					recordDelegation({ stopReason: output.stopReason, usage });
-					if (state.activeRun) {
-						state.activeRun.status = "failed";
-						state.activeRun.revisions = state.revisions;
-						state.activeRun.results[key] = text;
-						await persistRun();
-					}
-					return respond(
-						text,
-						output.errorMessage ?? output.stopReason,
-						usage,
-					);
-				}
-				state.executorActivity = "finished";
-				appendExecutorProgress("[finished] Executor completed the delegation.");
-				setPhase(ctx, "reviewing");
-				const parsed = parseExecutorReport(output.text);
-				const diffStat = workspaceAfter ? await workspaceDiffStat(workspaceBefore, gitExec, touchedFiles, workspaceAfter) : undefined;
-				renderThrottle.flush();
-				const text = `${formatCompactReport(parsed.report, diffStat, parsed.prose, isResume ? ["resumed after restart"] : [])}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
-				recordDelegation({ reportStatus: parsed.report.status, usage });
-				if (state.activeRun) {
-					state.activeRun.status = "done";
-					state.activeRun.revisions = state.revisions;
-					state.activeRun.results[key] = text;
-					await persistRun();
-				}
-				return respond(
-					text,
-					undefined,
-					usage,
-					{
-						output: parsed.prose || output.text,
-						report: parsed.report,
-						diffStat,
+				if (!isResume) await handle.setThinking(effective);
+				return await controller.performDelegation({
+					recordIntent: () => persistRunCritical(),
+					snapshot: () => snapshotWorkspace(ctx.cwd, gitExec),
+					submit: () => isResume
+						? handle.resume({ signal, onEvent, requestId: state.activeRun?.pending?.requestId })
+						: handle.prompt(promptText, { requestId: key, signal, onEvent }),
+					collect: async (output, workspaceBefore) => {
+						if (state.activeRun && (state.executorSessionBackend ?? state.executorBackend) === "session") {
+							state.activeRun.sessionFile = handle.resumeRef();
+						}
+						return { output, workspaceBefore, workspaceAfter: await snapshotWorkspaceAfter(workspaceBefore, gitExec) };
 					},
-				);
+					settle: async ({ output, workspaceBefore, workspaceAfter }) => {
+						timings.totalMs = Date.now() - startedAt;
+						state.lastTimings = { ...timings };
+						const usage = output.usage;
+						state.executorUsage = addUsage(state.executorUsage, usage);
+						controller.settleDelegation(output.stopReason === "error" ? "error" : output.stopReason === "aborted" ? "cancelled" : "completed");
+						if (output.stopReason === "error" || output.stopReason === "aborted") {
+							const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
+							state.executorActivity = "failed";
+							appendExecutorProgress(
+								`[failed] Executor stopped with status "${output.stopReason}"${reason}.`,
+							);
+							setPhase(ctx, "failed");
+							renderThrottle.flush();
+							const text = `Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
+							recordDelegation({ stopReason: output.stopReason, usage });
+							if (state.activeRun) {
+								state.activeRun.status = "failed";
+								state.activeRun.revisions = state.revisions;
+								state.activeRun.results[key] = text;
+								const pending = state.activeRun.pending;
+								delete state.activeRun.pending;
+								try { await persistRunCritical(); } catch (error) { state.activeRun.pending = pending; throw error; }
+							}
+							controller.clearPending();
+							controller.setUncertain(false);
+							return respond(
+								text,
+								output.errorMessage ?? output.stopReason,
+								usage,
+							);
+						}
+						state.executorActivity = "finished";
+						appendExecutorProgress("[finished] Executor completed the delegation.");
+						setPhase(ctx, "reviewing");
+						const parsed = parseExecutorReport(output.text);
+						const diffStat = workspaceAfter ? await workspaceDiffStat(workspaceBefore, gitExec, touchedFiles, workspaceAfter) : undefined;
+						renderThrottle.flush();
+						const text = `${formatCompactReport(parsed.report, diffStat, parsed.prose, isResume ? ["resumed after restart"] : [])}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
+						recordDelegation({ reportStatus: parsed.report.status, usage });
+						if (state.activeRun) {
+							state.activeRun.status = "done";
+							state.activeRun.revisions = state.revisions;
+							state.activeRun.results[key] = text;
+							const pending = state.activeRun.pending;
+							delete state.activeRun.pending;
+							try { await persistRunCritical(); } catch (error) { state.activeRun.pending = pending; throw error; }
+						}
+						controller.clearPending();
+						controller.setUncertain(false);
+						return respond(
+							text,
+							undefined,
+							usage,
+							{
+								output: parsed.prose || output.text,
+								report: parsed.report,
+								diffStat,
+							},
+						);
+					},
+				});
 			} catch (error) {
+				controller.failBeforeSubmission();
+				if (isResume) controller.setUncertain(true);
+				if (!controller.submissionBegan && !controller.uncertain) controller.clearPending();
 				timings.totalMs = Date.now() - startedAt;
 				state.lastTimings = { ...timings };
 				state.executorActivity = "failed";
@@ -1088,10 +1103,12 @@ export default function (pi: ExtensionAPI) {
 				const text = `Fusion delegation failed: ${message}\n${timingLine()}`;
 				recordDelegation({ stopReason: "error", usage: createEmptyUsage() });
 				if (state.activeRun) {
-					state.activeRun.status = "failed";
+					if (!controller.submissionBegan && !controller.uncertain) delete state.activeRun.pending;
+					state.activeRun.status = controller.uncertain ? "interrupted" : "failed";
 					state.activeRun.revisions = state.revisions;
-					state.activeRun.results[key] = text;
-					await persistRun();
+					state.activeRun.finalFixUsed = state.finalFixUsed;
+					if (controller.submissionBegan && !controller.uncertain) state.activeRun.results[key] = text;
+					try { await persistRunCritical(); } catch { controller.setUncertain(true); }
 				}
 				return respond(text, message);
 			} finally {
@@ -1310,6 +1327,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion", {
 		description: "Run a task through the Fusion supervisor/executor protocol",
 		handler: async (args, ctx) => {
+			if (resolvingRun) { ctx.ui.notify("Fusion recovery resolution is in progress.", "error"); return; }
+			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn. Use /fusion-resume or inspect the interrupted run before continuing.", "error"); return; }
+			if ((await unresolvedRuns(ctx.cwd)).length > 0) { ctx.ui.notify("An interrupted Fusion run requires recovery. Use /fusion-resume or /fusion-resolve.", "error"); return; }
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Fusion requires a dialog-capable UI.", "error");
 				return;
@@ -1342,6 +1362,8 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			const unresolved = await unresolvedRuns(ctx.cwd);
+			if (resolvingRun || unresolved.length > 0) { ctx.ui.notify("An interrupted Fusion run requires recovery. Use /fusion-resume or /fusion-resolve.", "error"); return; }
 			pi.setThinkingLevel(state.supervisorThinking);
 			startRun(ctx, task);
 			pi.sendUserMessage(buildSupervisorPrompt(task, modelLabel(executor)));
@@ -1351,6 +1373,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-config", {
 		description: "Select price-tiered Fusion supervisor and executor models",
 		handler: async (_args, ctx) => {
+			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn; configuration is locked until recovery.", "error"); return; }
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Fusion configuration requires a dialog-capable UI.", "error");
 				return;
@@ -1371,23 +1394,20 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-mode", {
 		description: "Toggle Fusion mode for ordinary interactive prompts",
 		handler: async (_args, ctx) => {
+			if (controller.uncertain) { ctx.ui.notify("Fusion has an uncertain executor turn; mode changes are locked until recovery.", "error"); return; }
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Fusion mode requires a dialog-capable UI.", "error");
 				return;
 			}
 			if (state.modeEnabled) {
 				state.modeEnabled = false;
-				state.runActive = false;
-				state.phase = "idle";
-				state.settleNudges = 0;
+				controller.deactivate();
 				syncFusionTools();
 				state.supervisorUsage = createEmptyUsage();
 				state.executorUsage = createEmptyUsage();
 				state.executorTranscript = [];
-				state.scoutCalls = 0;
 				state.scoutMs = 0;
 				state.scoutUsage = createEmptyUsage();
-				state.resumePending = false;
 				disposeExecutor();
 				ctx.ui.setWidget(WIDGET_KEY, undefined);
 				ctx.ui.notify("Fusion mode disabled.", "info");
@@ -1415,7 +1435,7 @@ export default function (pi: ExtensionAPI) {
 			pi.setThinkingLevel(state.supervisorThinking);
 			state.modeEnabled = true;
 			syncFusionTools();
-			state.phase = "idle";
+			controller.setPhase("idle");
 			updateWidget(ctx);
 			ctx.ui.notify(
 				`Fusion mode enabled. Supervisor ${modelLabel(supervisor)} (thinking ${state.supervisorThinking}), executor ${modelLabel(executor)} (thinking ${state.executorThinking}).`,
@@ -1438,7 +1458,7 @@ export default function (pi: ExtensionAPI) {
 				? ` | last timing ready ${state.lastTimings.readyMs ?? "-"}ms, first event ${state.lastTimings.firstEventMs ?? "-"}ms, total ${state.lastTimings.totalMs ?? "-"}ms`
 				: "";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${lastTimings}`,
 				"info",
 			);
 		},
@@ -1457,133 +1477,137 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("fusion-resume", {
 		description: "Resume an interrupted Fusion run",
 		handler: async (_args, ctx) => {
-			if (!ctx.hasUI) {
-				ctx.ui.notify("Fusion resume requires a dialog-capable UI.", "error");
-				return;
-			}
-			await ctx.waitForIdle();
-			const interrupted = (await listRuns(runsDir(getAgentDir()), ctx.cwd)).filter(
-				(run) => run.status === "interrupted",
-			);
-			if (interrupted.length === 0) {
-				ctx.ui.notify("No interrupted Fusion runs for this directory.", "info");
-				return;
-			}
-			const options = interrupted.map(
-				(run) => `${new Date(run.updatedAt).toLocaleString()} ${truncateInline(run.task, 60)}`,
-			);
-			const choice = await selectScrollableOption(ctx, "Resume interrupted Fusion run", options);
-			if (choice === undefined) return;
-			const run = interrupted[options.indexOf(choice)];
-			if (run.backend === "durable") {
-				if (run.conversationId === undefined) {
-					ctx.ui.notify(
-						"Cannot resume: the interrupted durable run has no conversation id.",
-						"error",
-					);
-					return;
-				}
-				const durable = await loadDurableBackend();
-				if (durable === undefined) {
-					ctx.ui.notify(
-						`Cannot resume: Pi Durable backend unavailable${durableUnavailable ? ` (${durableUnavailable})` : ""}.`,
-						"error",
-					);
-					return;
-				}
-				if (!controller.canReopen(durable.capabilities)) {
-					ctx.ui.notify("Cannot resume: the executor transcript cannot be reopened.", "error");
-					return;
-				}
-				const model =
-					ctx.modelRegistry.find(run.executor.provider, run.executor.modelId) ??
-					state.executorModel;
-				if (!model) {
-					ctx.ui.notify("Cannot resume: the executor model is unavailable.", "error");
-					return;
-				}
-				let handle: ExecutorHandle;
-				try {
-					handle = await durable.openExecutor(
-						{ cwd: ctx.cwd, model, thinking: run.executor.thinking },
-						String(run.conversationId),
-					);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`Cannot resume Fusion run: ${message}`, "error");
-					return;
-				}
-				disposeExecutor();
-				state.executorHandle = handle;
-				state.executorBackend = "durable";
-				state.executorSessionBackend = "durable";
-				state.executorSessionModel = model;
-				state.executorSessionThinking = run.executor.thinking;
-				state.executorModel = model;
-				state.executorLabel = run.executor.label;
-				state.executorThinking = run.executor.thinking;
-				controller.restore(run, true);
-				state.executorUsed = true;
-				state.runId = run.runId;
-				state.runStartedAt = run.metrics?.startedAt;
-				state.activeRun = run;
-				syncFusionTools();
-				setPhase(ctx, "executing");
-				ctx.ui.notify(`Resumed interrupted Fusion run ${run.runId}.`, "info");
-				pi.sendUserMessage(
-					`The Fusion executor run was interrupted by a restart. Its durable conversation is intact and continues where it stopped. Original task:\n${state.originalTask}\n\nCall fusion_delegate with action "resume" (brief: "resume") to let the executor finish its interrupted turn and get its report. Commands cut off by the restart may still have completed, so review the full working tree with git diff, then continue the protocol: revise only for defects, then the final acceptance audit against the original task.`,
-				);
-				return;
-			}
-			if (!controller.canReopen(sessionBackend.capabilities)) {
-				ctx.ui.notify("Cannot resume: the executor transcript cannot be reopened.", "error");
-				return;
-			}
-			if (!run.sessionFile) {
-				ctx.ui.notify(
-					"Cannot resume: the interrupted run has no persisted executor session.",
-					"error",
-				);
-				return;
-			}
-			const model =
-				ctx.modelRegistry.find(run.executor.provider, run.executor.modelId) ??
-				state.executorModel;
-			if (!model) {
-				ctx.ui.notify("Cannot resume: the executor model is unavailable.", "error");
-				return;
-			}
-			let handle: ExecutorHandle;
+			if (resolvingRun) { ctx.ui.notify("Fusion recovery resolution is in progress.", "error"); return; }
+			resolvingRun = true;
 			try {
-				handle = await sessionBackend.openExecutor(
-					{ cwd: ctx.cwd, model, thinking: run.executor.thinking },
-					run.sessionFile,
+				if (!ctx.hasUI) {
+					ctx.ui.notify("Fusion resume requires a dialog-capable UI.", "error");
+					return;
+				}
+				await ctx.waitForIdle();
+				const interrupted = (await unresolvedRuns(ctx.cwd)).filter((run) => run.status === "interrupted");
+				if (interrupted.length === 0) {
+					ctx.ui.notify("No interrupted Fusion runs for this directory.", "info");
+					return;
+				}
+				const options = interrupted.map(
+					(run) => `${new Date(run.updatedAt).toLocaleString()} ${truncateInline(run.task, 60)}`,
 				);
+				const choice = await selectScrollableOption(ctx, "Resume interrupted Fusion run", options);
+				if (choice === undefined) return;
+				const run = interrupted[options.indexOf(choice)];
+				if (interrupted.length > 1) { ctx.ui.notify("Multiple interrupted runs require manual resolution before automatic recovery.", "error"); return; }
+				if (controller.uncertain && state.activeRun?.runId !== run.runId) {
+					ctx.ui.notify("Cannot resume a different run while the current executor outcome is uncertain.", "error");
+					return;
+				}
+				if (run.backend !== "durable") {
+					ctx.ui.notify("The Pi session backend cannot reattach to an interrupted turn. Inspect its session and working tree, then use /fusion-resolve.", "error");
+					return;
+				}
+				if (!run.pending || typeof run.pending.requestId !== "string" || !run.pending.requestId || !["execute", "revise", "final_fix"].includes(run.pending.action)) {
+					ctx.ui.notify("The interrupted run has no valid original request ID. Inspect it and use /fusion-resolve after confirming the worker has stopped.", "error");
+					return;
+				}
+				if (run.backend === "durable") {
+					if (run.conversationId === undefined) {
+						ctx.ui.notify(
+							"Cannot resume: the interrupted durable run has no conversation id.",
+							"error",
+						);
+						return;
+					}
+					const durable = await loadDurableBackend();
+					if (durable === undefined) {
+						ctx.ui.notify(
+							`Cannot resume: Pi Durable backend unavailable${durableUnavailable ? ` (${durableUnavailable})` : ""}.`,
+							"error",
+						);
+						return;
+					}
+					if (!controller.canReopen(durable.capabilities)) {
+						ctx.ui.notify("Cannot resume: the executor transcript cannot be reopened.", "error");
+						return;
+					}
+					const model =
+						ctx.modelRegistry.find(run.executor.provider, run.executor.modelId) ??
+						state.executorModel;
+					if (!model) {
+						ctx.ui.notify("Cannot resume: the executor model is unavailable.", "error");
+						return;
+					}
+					let handle: ExecutorHandle;
+					try {
+						handle = await durable.openExecutor(
+							{ cwd: ctx.cwd, model, thinking: run.executor.thinking },
+							String(run.conversationId),
+						);
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						ctx.ui.notify(`Cannot resume Fusion run: ${message}`, "error");
+						return;
+					}
+					disposeExecutor();
+					state.executorHandle = handle;
+					state.executorBackend = "durable";
+					state.executorSessionBackend = "durable";
+					state.executorSessionModel = model;
+					state.executorSessionThinking = run.executor.thinking;
+					state.executorModel = model;
+					state.executorLabel = run.executor.label;
+					state.executorThinking = run.executor.thinking;
+					controller.restore(run, true);
+					controller.setPending(run.pending);
+					controller.setUncertain(true);
+					state.executorUsed = true;
+					state.runId = run.runId;
+					state.runStartedAt = run.metrics?.startedAt;
+					state.activeRun = run;
+					syncFusionTools();
+					setPhase(ctx, "executing");
+					ctx.ui.notify(`Resumed interrupted Fusion run ${run.runId}.`, "info");
+					pi.sendUserMessage(
+						`The Fusion executor run was interrupted. Original task:\n${state.originalTask}\n\nCall fusion_delegate with action "resume" (brief: "resume") to look up and wait for the original durable submission. If matching evidence is unavailable, the run remains locked. Review the full working tree, then continue the protocol and the final acceptance audit.`,
+					);
+					return;
+				}
+			} finally { resolvingRun = false; }
+		},
+	});
+
+	pi.registerCommand("fusion-resolve", {
+		description: "Manually resolve an interrupted run after verifying its worker has stopped",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) { ctx.ui.notify("Fusion resolution requires a dialog-capable UI.", "error"); return; }
+			if (resolvingRun || state.delegating) { ctx.ui.notify("Fusion is busy.", "error"); return; }
+			resolvingRun = true;
+			try {
+				await ctx.waitForIdle();
+				const interrupted = (await unresolvedRuns(ctx.cwd)).filter((run) => run.status === "interrupted");
+				if (!interrupted.length) { ctx.ui.notify("No interrupted Fusion runs for this directory.", "info"); return; }
+				const labels = interrupted.map((run) => `${run.runId} ${truncateInline(run.task, 60)}`);
+				const choice = await selectScrollableOption(ctx, "Resolve interrupted Fusion run", labels);
+				if (choice === undefined) return;
+				const run = interrupted[labels.indexOf(choice)];
+				const confirmed = await ctx.ui.confirm("Resolve interrupted Fusion run", "Have you verified that this executor and its commands have stopped, and inspected the working tree? Fusion cannot verify this automatically.");
+				if (!confirmed) return;
+				run.status = "failed";
+				run.manualResolution = { at: new Date().toISOString() };
+				await runWrites;
+				await writeRun(runsDir(getAgentDir()), run);
+				if (state.activeRun?.runId === run.runId) {
+					controller.clearPending();
+					controller.setUncertain(false);
+					controller.clear();
+					disposeExecutor();
+					state.activeRun = undefined;
+					state.runId = undefined;
+					syncFusionTools();
+				}
+				ctx.ui.notify(`Resolved interrupted Fusion run ${run.runId}; its transcript and pending metadata were retained.`, "info");
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				ctx.ui.notify(`Cannot resume Fusion run: ${message}`, "error");
-				return;
-			}
-			disposeExecutor();
-			state.executorHandle = handle;
-			state.executorBackend = "session";
-			state.executorSessionBackend = "session";
-			state.executorSessionModel = model;
-			state.executorSessionThinking = run.executor.thinking;
-			state.executorModel = model;
-			state.executorLabel = run.executor.label;
-			state.executorThinking = run.executor.thinking;
-			controller.restore(run, false);
-			state.executorUsed = true;
-			state.runId = run.runId;
-			state.runStartedAt = run.metrics?.startedAt;
-			state.activeRun = run;
-			syncFusionTools();
-			setPhase(ctx, "reviewing");
-			ctx.ui.notify(`Resumed interrupted Fusion run ${run.runId}.`, "info");
-			pi.sendUserMessage(
-				`The Fusion executor was interrupted mid-task. Original task:\n${state.originalTask}\n\nReview the working tree, then call fusion_delegate with action "revise" to have the executor continue, and finish with the final acceptance audit against the original task.`,
-			);
+				ctx.ui.notify(`Cannot resolve Fusion run: ${error instanceof Error ? error.message : String(error)}`, "error");
+			} finally { resolvingRun = false; }
 		},
 	});
 
@@ -1591,6 +1615,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Dispose executor context and clear Fusion run state",
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();
+			const resetError = controller.resetError();
+			if (resetError) { ctx.ui.notify(resetError, "error"); return; }
 			disposeExecutor();
 			if (state.activeRun) {
 				state.activeRun.status = "done";
@@ -1613,12 +1639,21 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("input", (event, ctx) => {
+	pi.on("input", async (event, ctx) => {
 		if (!state.modeEnabled || event.source !== "interactive") {
 			return { action: "continue" };
 		}
 		if (event.text.trim().startsWith("/")) {
 			return { action: "continue" };
+		}
+		if (resolvingRun || (await unresolvedRuns(ctx.cwd)).length > 0) {
+			ctx.ui.notify("An interrupted Fusion run requires recovery. Use /fusion-resume or /fusion-resolve.", "error");
+			return { action: "handled" };
+		}
+		if (resolvingRun) return { action: "handled" };
+		if (controller.uncertain) {
+			ctx.ui.notify("Fusion has an uncertain executor turn. Use /fusion-resume or inspect the interrupted run before continuing.", "error");
+			return { action: "handled" };
 		}
 		if (event.images && event.images.length > 0) {
 			ctx.ui.notify("Fusion mode is text-only; image attachments are not supported.", "warning");
@@ -1690,11 +1725,11 @@ export default function (pi: ExtensionAPI) {
 		try {
 			syncFusionTools();
 		} catch {}
-		void markInterrupted(runsDir(getAgentDir()), ctx.cwd)
-			.then((changed) => {
-				if (changed.length > 0) {
+		void unresolvedRuns(ctx.cwd)
+			.then((runs) => {
+				if (runs.length > 0) {
 					ctx.ui.notify(
-						"Interrupted Fusion run found. Run /fusion-resume to continue.",
+						"Interrupted Fusion run found. Use /fusion-resume or inspect it and use /fusion-resolve.",
 						"warning",
 					);
 				}
@@ -1703,17 +1738,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		state.runActive = false;
+		controller.deactivate();
 		state.modeEnabled = false;
-		state.phase = "idle";
-		state.settleNudges = 0;
 		state.supervisorUsage = createEmptyUsage();
 		state.executorUsage = createEmptyUsage();
 		state.executorTranscript = [];
-		state.scoutCalls = 0;
 		state.scoutMs = 0;
 		state.scoutUsage = createEmptyUsage();
-		state.resumePending = false;
 		disposeExecutor();
 		void loadDurablePromise?.then((loaded) => loaded?.dispose()).catch(() => {});
 		try {

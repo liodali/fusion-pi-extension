@@ -5,7 +5,7 @@ import { PI_SESSION_CAPABILITIES } from "../src/pi/executor-backend.ts";
 import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
 
 test("controller applies delegation budgets and releases the in-flight guard", () => {
-	const state = { delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 };
+	const state = { runActive: false, phase: "idle" as const, settleNudges: 0, delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 };
 	const controller = new FusionController(state);
 	expect(controller.beginDelegation("execute")).toBeUndefined();
 	expect(controller.beginDelegation("execute")).toContain("already in progress");
@@ -21,7 +21,7 @@ test("controller applies delegation budgets and releases the in-flight guard", (
 });
 
 test("reopening a transcript does not imply reattaching an interrupted turn", () => {
-	const state = { delegating: false, executed: true, revisions: 0, finalFixUsed: false, resumePending: true, scoutCalls: 0 };
+	const state = { runActive: false, phase: "idle" as const, settleNudges: 0, delegating: false, executed: true, revisions: 0, finalFixUsed: false, resumePending: true, scoutCalls: 0 };
 	const controller = new FusionController(state);
 	for (const capabilities of [PI_SESSION_CAPABILITIES, OPENCODE_CAPABILITIES]) {
 		expect(controller.canReopen(capabilities)).toBe(true);

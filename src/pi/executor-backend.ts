@@ -34,6 +34,8 @@ export interface ExecutorPromptOptions {
 }
 
 export interface ExecutorResumeOptions {
+	/** Original request identity; never create a new submission when resuming. */
+	requestId?: string;
 	signal?: AbortSignal;
 	onEvent: (event: ExecutorEvent) => void;
 }

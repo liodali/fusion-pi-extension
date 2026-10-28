@@ -23,6 +23,9 @@ export interface FusionRun {
 	sessionFile?: string;
 	backend?: "session" | "durable";
 	conversationId?: number;
+	/** Write-ahead identity of the last unsettled executor submission. */
+	pending?: { action: "execute" | "revise" | "final_fix"; requestId: string };
+	manualResolution?: { at: string };
 	metrics?: FusionRunMetrics;
 	status: FusionRunStatus;
 	revisions: number;

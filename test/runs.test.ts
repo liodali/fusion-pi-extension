@@ -54,6 +54,18 @@ describe("runsDir", () => {
 });
 
 describe("writeRun/readRun", () => {
+	test("roundtrips pending request identity without rewriting a legacy manifest on read", async () => {
+		const dir = await tmpRunsDir();
+		const current = makeRun({ runId: "pending", pending: { action: "final_fix", requestId: "request-1" } });
+		await writeRun(dir, current);
+		expect((await readRun(dir, "pending"))?.pending).toEqual(current.pending);
+		const legacy = makeRun({ runId: "legacy-unchanged", status: "interrupted" });
+		await writeRun(dir, legacy);
+		const file = join(dir, "legacy-unchanged.json");
+		const before = await readFile(file, "utf8");
+		expect((await readRun(dir, "legacy-unchanged"))?.pending).toBeUndefined();
+		expect(await readFile(file, "utf8")).toBe(before);
+	});
 	test("roundtrips a run manifest through a tmp dir", async () => {
 		const dir = await tmpRunsDir();
 		const run = makeRun({

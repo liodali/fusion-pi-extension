@@ -11,6 +11,7 @@ import {
 	createRegistry,
 	type Cursor,
 	type EntryRecord,
+	type EntryId,
 	type Extension,
 	Harness,
 	type HarnessOptions,
@@ -36,34 +37,43 @@ import {
 	type ScoutResult,
 } from "../executor-backend.ts";
 import type { WorkerCapabilities } from "../../core/worker.ts";
-import { aggregateUsage, createEmptyUsage } from "../../usage.ts";
+import { aggregateUsage } from "../../usage.ts";
 import { createFusionContext } from "./context.ts";
 import { createDurableEventMapper } from "./events.ts";
 import { scoutCallsDoc, scoutTools } from "./scout-tools.ts";
-import { pendingSubmission, staleWork } from "./stale.ts";
+import { staleWork } from "./stale.ts";
 
 async function collectAssistantMessages(
 	conversation: Conversation,
 	boundary: (entry: EntryRecord) => boolean,
+	requireExactTurn = false,
+	expectedAnswer?: EntryId,
 ): Promise<AssistantMessage[]> {
 	const messages: AssistantMessage[] = [];
 	let cursor: Cursor | undefined;
+	let foundBoundary = false;
+	let foundAnswer = expectedAnswer === undefined;
 	for (;;) {
 		const page = await conversation.entries({}, 50, cursor, BACKGROUND_CONTEXT);
 		let reached = false;
 		for (const entry of page.items) {
 			if (boundary(entry)) {
 				reached = true;
+				foundBoundary = true;
 				break;
 			}
+			if (requireExactTurn && UserEntry.is(entry)) throw new Error("Cannot recover: a newer user turn obscures the requested submission.");
 			const message = AssistantEntry.is(entry) ? entry.model?.[0] : undefined;
 			if (message !== undefined) {
+				if (requireExactTurn && expectedAnswer !== undefined && !foundAnswer && entry.id !== expectedAnswer) throw new Error("Cannot recover: a newer assistant message obscures the requested submission.");
+				if (entry.id === expectedAnswer) foundAnswer = true;
 				messages.push(message as unknown as AssistantMessage);
 			}
 		}
 		if (reached || page.next === undefined) break;
 		cursor = page.next;
 	}
+	if (requireExactTurn && (!foundBoundary || !foundAnswer)) throw new Error("Cannot recover: the requested submission's transcript evidence is incomplete.");
 	messages.reverse();
 	return messages;
 }
@@ -128,7 +138,8 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 		harness: Harness,
 		conversation: Conversation,
 		start: () => Promise<Submission>,
-		options: { signal?: AbortSignal; onEvent?: (event: ExecutorEvent) => void },
+	options: { signal?: AbortSignal; onEvent?: (event: ExecutorEvent) => void },
+	requireExactTurn = false,
 	): Promise<ExecutorTurnResult> => {
 		const { signal, onEvent } = options;
 		const map = createDurableEventMapper();
@@ -159,7 +170,7 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 		const messages =
 			placed === undefined
 				? []
-				: await collectAssistantMessages(conversation, (entry) => entry.id === placed);
+				: await collectAssistantMessages(conversation, (entry) => entry.id === placed, requireExactTurn, record.status === "done" ? record.answer : undefined);
 		const result: ExecutorTurnResult = {
 			...lastAssistantOutputFromMessages(messages),
 			usage: aggregateUsage(messages),
@@ -177,40 +188,16 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 		conversation: Conversation,
 		options: ExecutorResumeOptions,
 	): Promise<ExecutorTurnResult> => {
-		const inspection = await harness.inspect(BACKGROUND_CONTEXT);
-		const pending = pendingSubmission(inspection, conversation.id);
-		if (pending !== undefined) {
-			return settle(
-				harness,
-				conversation,
-				async () => {
-					const submission = await harness.submission(
-						pending as SubmissionId,
-						BACKGROUND_CONTEXT,
-					);
-					if (submission === undefined) {
-						throw new Error("Interrupted executor submission not found.");
-					}
-					return submission;
-				},
-				options,
-			);
+		if (!options.requestId) throw new Error("Cannot recover without the original executor request ID; inspect the run manually.");
+		const record = await conversation.commit((tx) => tx.submissionByRequest(conversation.id, options.requestId!), BACKGROUND_CONTEXT);
+		if (!record || record.type !== "input" || record.conversationId !== conversation.id || record.requestId !== options.requestId) {
+			throw new Error("No matching executor submission found; the outcome remains uncertain.");
 		}
-		const messages = await collectAssistantMessages(conversation, (entry) =>
-			UserEntry.is(entry),
-		);
-		if (messages.length === 0) {
-			return {
-				text: "",
-				stopReason: "error",
-				errorMessage: "No executor output to resume.",
-				usage: createEmptyUsage(),
-			};
-		}
-		return {
-			...lastAssistantOutputFromMessages(messages),
-			usage: aggregateUsage(messages),
-		};
+		return settle(harness, conversation, async () => {
+			const submission = await harness.submission(record.id, BACKGROUND_CONTEXT);
+			if (!submission) throw new Error("Interrupted executor submission not found.");
+			return submission;
+		}, options, true);
 	};
 	const makeHandle = (
 		harness: Harness,
