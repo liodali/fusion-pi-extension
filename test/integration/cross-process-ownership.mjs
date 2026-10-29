@@ -50,13 +50,17 @@ const expectClaimable = (verdict) => {
 let exitCode = 0;
 try {
 	await mkdir(workspace, { recursive: true });
-	await mkdir(ownership, { recursive: true });
+	// The registry guard requires a private directory; create it accordingly
+	// so both harnesses accept the same ownership directory.
+	await mkdir(ownership, { recursive: true, mode: 0o700 });
 	await symlink(workspace, alias, "dir");
 	const holder = spawn("bun", ["test", join(parent, "cross-process-pi-hold.test.mjs")], {
 		env: {
 			...process.env,
 			FUSION_PI_TEST_DIR: join(dir, "agent-pi"),
 			PI_CODING_AGENT_DIR: join(dir, "agent-pi"),
+			// The holder must claim the SAME registry the attempts inspect.
+			FUSION_OWNERSHIP_DIR: ownership,
 			FUSION_CROSS_WORKSPACE: workspace,
 			FUSION_CROSS_STOP: stopFile,
 		},
@@ -66,7 +70,12 @@ try {
 	const status = new Promise((resolve) => { holder.on("close", (code) => resolve(code)); });
 	holder.stdout.on("data", chunk);
 	holder.stderr.on("data", chunk);
-	await waitUntil(() => holderOut.includes("READY"));
+	try {
+		await waitUntil(() => holderOut.includes("READY"), 60000);
+	} catch {
+		// Surface the holder's own output so a stalled start is diagnosable.
+		throw new Error(`The Pi holder never became READY before stop: ${holderOut.slice(-1200)}`);
+	}
 	expectBlocked(await attempt({ phase: "blocked", directory: workspace }));
 	expectBlocked(await attempt({ phase: "blocked-alias", directory: alias }));
 	expectBlocked(await attempt({ phase: "blocked-nested", directory: workspace }));
