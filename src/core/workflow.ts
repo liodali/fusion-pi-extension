@@ -22,6 +22,16 @@ export interface LifecycleState extends DelegationState {
 	scoutCalls: number;
 }
 
+/** Validate persisted state before restoring guards or budgets. */
+export function isLifecycleState(value: unknown): value is LifecycleState {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const state = value as Record<string, unknown>;
+	return ["runActive", "executed", "delegating", "finalFixUsed", "resumePending"].every((key) => typeof state[key] === "boolean") &&
+		["revisions", "scoutCalls", "settleNudges"].every((key) => Number.isSafeInteger(state[key]) && (state[key] as number) >= 0) &&
+		["idle", "planning", "executing", "reviewing", "revising", "finalizing", "scouting", "complete", "failed"].includes(state.phase as string) &&
+		[state.task, state.originalTask, state.executorBrief].every((v) => v === undefined || typeof v === "string");
+}
+
 export function delegationError(state: DelegationState, action: DelegationAction): string | undefined {
 	if (state.delegating) return "A fusion delegation is already in progress. Wait for it to complete before delegating again.";
 	if (action === "execute" && state.executed) return 'Initial execution already completed. Review the working tree and use action "revise" with consolidated feedback.';

@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { FusionRunMetrics } from "./metrics.ts";
+import type { RunManifest } from "./core/manifest.ts";
 
 export type FusionRunStatus = "running" | "done" | "failed" | "interrupted";
 
@@ -14,6 +15,8 @@ export interface FusionRunExecutor {
 }
 
 export interface FusionRun {
+	/** Shared recovery record; legacy fields remain readable by existing Pi tooling. */
+	manifest?: RunManifest;
 	runId: string;
 	cwd: string;
 	task: string;
