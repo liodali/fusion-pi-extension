@@ -1,6 +1,6 @@
 // Runs in a separate Bun process so SDK mocks cannot affect other tests.
 import { expect, mock, setDefaultTimeout, test } from "bun:test";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const root = process.env.FUSION_PI_TEST_DIR;
@@ -295,4 +295,67 @@ test("an operator can resolve legacy Durable work when its backend is unavailabl
 	expect(resolved.status).toBe("failed");
 	expect(resolved.manualResolution.at).toBeString();
 	expect(resolved.pending.requestId).toBe("original");
+});
+
+test("a settlement storage failure retains the pending request and blocks cleanup", async () => {
+	const readDir = join(root, "fusion", "runs");
+	const byCwd = async (want) => {
+		for (const file of await readdir(readDir)) {
+			if (file.endsWith(".tmp")) continue;
+			const value = JSON.parse(await readFile(join(readDir, file), "utf8"));
+			if (value.cwd === want) return value;
+		}
+		return undefined;
+	};
+	const cwd = join(root, "settled-write-failure");
+	await mkdir(cwd, { recursive: true });
+	const f = makePi(cwd);
+	await f.commands.get("fusion").handler("original task", f.ctx);
+	expect((await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, f.ctx)).details.error).toBeUndefined();
+	const before = prompts;
+	// The legacy boundary refuses further writes while the shared registry
+	// keeps working: the write-ahead intent must still be recorded first.
+	await chmod(readDir, 0o555);
+	try {
+		const failed = await f.tools.get("fusion_delegate").execute("call", { action: "revise", brief: "mend" }, undefined, undefined, f.ctx);
+		expect(failed.details.error).toBeDefined();
+		expect(prompts).toBe(before);
+		await f.commands.get("fusion-clean").handler("", f.ctx);
+		expect(f.notifications.at(-1)).toContain("uncertain");
+		const saved = await byCwd(cwd);
+		expect(saved.status).toBe("done");
+		await chmod(readDir, 0o755);
+		await f.hooks.get("session_shutdown")();
+		const resumed = makePi(cwd);
+		await resumed.commands.get("fusion-resume").handler("", resumed.ctx);
+		expect(resumed.notifications.at(-1)).toContain("session backend cannot reattach");
+		resumed.confirm(true);
+		await resumed.commands.get("fusion-resolve").handler("", resumed.ctx);
+		const resolved = await byCwd(cwd);
+		expect(resolved.status).toBe("failed");
+		expect(resolved.manualResolution?.at ?? resolved.manualResolution.at).toBeString();
+		expect(resolved.pending?.requestId).toBeString();
+		expect(resolved.pending?.action).toBe("revise");
+		await resumed.commands.get("fusion-clean").handler("", resumed.ctx);
+		expect(resumed.notifications.at(-1)).not.toContain("uncertain");
+	} finally { await chmod(readDir, 0o755).catch(() => {}); }
+});
+
+test("a workspace cannot claim ownership when its registry directory is unusable", async () => {
+	const cwd = join(root, "registry-conflict-workspace");
+	await mkdir(cwd, { recursive: true });
+	await writeFile(join(cwd, ".test-state"), "not a directory");
+	const before = prompts;
+	const f = makePi(cwd);
+	await expect(f.commands.get("fusion").handler("original task", f.ctx)).rejects.toThrow(/ownership registry is unavailable/);
+	await expect(f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx)).rejects.toThrow(/ownership registry is unavailable/);
+	expect(prompts).toBe(before);
+	await expect(f.commands.get("fusion-clean").handler("", f.ctx)).resolves.toBeUndefined();
+	expect(f.notifications.at(-1)).toContain("cleared");
+	await rm(join(cwd, ".test-state"));
+	const misconfigured = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
+	expect(misconfigured.details.error).toContain("executor model is not configured");
+	expect(prompts).toBe(before);
+	await expect(f.commands.get("fusion-clean").handler("", f.ctx)).resolves.toBeUndefined();
+	expect(f.notifications.at(-1)).toContain("cleared");
 });

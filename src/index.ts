@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
 					revisions: state.revisions, finalFixUsed: state.finalFixUsed, executed: state.executed, delegating: !!pending && state.delegating,
 					resumePending: state.resumePending, scoutCalls: state.scoutCalls, settleNudges: state.settleNudges },
 				worker: (state.executorHandle?.resumeRef() ? { owner: prior.owner, runtime: state.executorSessionBackend ?? state.executorBackend, id: state.executorHandle.resumeRef()! } : prior.worker),
-				pending, recovery: pending ? "pending" : snapshot.status === "done" || snapshot.status === "failed" ? "settled" : "manual", lastResult: lastWorkerResult,
+				pending, recovery: pending ? "pending" : controller.uncertain ? "manual" : snapshot.status === "done" || snapshot.status === "failed" ? "settled" : "manual", lastResult: lastWorkerResult,
 			}, { harness: "pi", workspace: prior.owner.workspace });
 			state.activeRun.manifest = snapshot.manifest;
 		}
@@ -954,6 +954,7 @@ export default function (pi: ExtensionAPI) {
 						`[resume] Waiting for the interrupted executor turn with ${executorLabel()}`,
 					);
 				} else {
+					if (!state.executorModel) throw new Error("Fusion executor model is not configured; run /fusion or /fusion-config to select models before delegating.");
 					if (state.executorUsed || !executorConfigMatches()) {
 						disposeExecutor();
 					}
@@ -1206,7 +1207,20 @@ export default function (pi: ExtensionAPI) {
 				const text = `Fusion delegation failed: ${message}\n${timingLine()}`;
 				recordDelegation({ stopReason: "error", usage: createEmptyUsage() });
 				if (state.activeRun) {
-					if (!controller.submissionBegan && !controller.uncertain) delete state.activeRun.pending;
+					// A recorded write-ahead intent survives failure: the exact request
+					// stays blocked (uncertain) until reconciliation or explicit
+					// resolution, and never gets lost because the native write failed.
+					const priorPending = workspaceLease?.manifest.pending;
+					const intentOwnsKey = !controller.submissionBegan && !controller.uncertain && !!priorPending && priorPending.requestId === key;
+					if (!controller.submissionBegan && !controller.uncertain && !intentOwnsKey) {
+						controller.clearPending();
+						delete state.activeRun.pending;
+					}
+					if (intentOwnsKey) {
+						controller.setPending({ action: params.action as "execute" | "revise" | "final_fix", requestId: key });
+						controller.setUncertain(true);
+						state.activeRun.pending = { action: params.action as "execute" | "revise" | "final_fix", requestId: key };
+					}
 					state.activeRun.status = controller.uncertain ? "interrupted" : "failed";
 					state.activeRun.revisions = state.revisions;
 					state.activeRun.finalFixUsed = state.finalFixUsed;

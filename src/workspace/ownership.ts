@@ -46,7 +46,12 @@ export interface WorkspaceLease {
 
 /** SQLite provides process-lifetime coordinator exclusion; ownership survives a crash. */
 export async function openWorkspaceRegistry(directory = ownershipDirectory()) {
-	await mkdir(directory, { recursive: true, mode: 0o700 });
+	try {
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		throw new Error(`Fusion ownership registry is unavailable at ${directory}: ${reason}. Set the same FUSION_OWNERSHIP_DIR on every Pi and OpenCode process for this workspace.`);
+	}
 	if (process.platform !== "win32") {
 		const info = await lstat(directory);
 		if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())) {
