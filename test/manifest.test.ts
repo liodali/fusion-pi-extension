@@ -1,8 +1,20 @@
 import { expect, test } from "bun:test";
 import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunManifest } from "../src/core/manifest.ts";
+import { readRecoveryRecord } from "../src/core/recovery.ts";
 import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
 import { translatePiRun } from "../src/pi/manifest-translation.ts";
 import type { FusionRun } from "../src/runs.ts";
+
+test("v1 recovery readers reject v2 manifests instead of guessing", () => {
+	// Demonstrates the rollback hazard boundary: a downgraded OpenCode binary
+	// loads the same native storage and must fail closed, never treat the
+	// newer record as readable or as an empty workspace.
+	const v2 = { version: 2, runId: "run", owner: { harness: "opencode", supervisorId: "parent", workspace: "/workspace" },
+		capabilities: OPENCODE_CAPABILITIES, recovery: "pending",
+		state: { runActive: true, phase: "executing", delegating: true, executed: false, revisions: 1, finalFixUsed: false, resumePending: false, scoutCalls: 0, settleNudges: 0 },
+		pending: { action: "execute", requestId: "exact" } };
+	expect(() => readRecoveryRecord(v2, "/workspace", "opencode")).toThrow(/Unsupported Fusion recovery record version/);
+});
 
 const scope = { harness: "opencode", workspace: "/workspace" };
 const owner = { ...scope, supervisorId: "parent" };
