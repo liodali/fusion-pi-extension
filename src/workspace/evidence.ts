@@ -122,16 +122,15 @@ export async function workspaceEvidenceRefs(
 			if (!names || names.code !== 0) return undefined;
 			for (const line of names.stdout.split("\n")) if (line.trim()) diffPaths.add(line.trim());
 		}
-		// Stable, uri-style references keep offline review self-describing.
+		// Stable, uri-style references keep offline review self-describing. One
+		// slot stays reserved for the truncation marker so breaching the cap is
+		// always visible in the persisted record.
 		const refs: string[] = [];
-		for (const path of diffPaths) if (refs.length < MAX_EVIDENCE_REFS) refs.push(`git:${path}`);
-		for (const path of added) if (refs.length < MAX_EVIDENCE_REFS) refs.push(`new:${path}`);
-		for (const path of preDirty) if (refs.length < MAX_EVIDENCE_REFS) refs.push(`pre-dirty:${path}`);
-		if (previous.size > 0 && (!hashes || [...hashes.values()].includes("missing")) && refs.length < MAX_EVIDENCE_REFS) {
-			refs.push("unverifiable:pre-existing-changes");
-		}
-		const total = diffPaths.size + added.length + preDirty.length;
-		if (total > MAX_EVIDENCE_REFS && refs.length < MAX_EVIDENCE_REFS) refs.push("evidence-truncated");
+		for (const path of diffPaths) if (refs.length < MAX_EVIDENCE_REFS - 1) refs.push(`git:${path}`);
+		for (const path of added) if (refs.length < MAX_EVIDENCE_REFS - 1) refs.push(`new:${path}`);
+		for (const path of preDirty) if (refs.length < MAX_EVIDENCE_REFS - 1) refs.push(`pre-dirty:${path}`);
+		const overflow = diffPaths.size + added.length + preDirty.length + (previous.size > 0 && (!hashes || [...hashes.values()].includes("missing")) ? 1 : 0) > refs.length;
+		if (overflow && refs.length < MAX_EVIDENCE_REFS) refs.push("evidence-truncated");
 		return refs.length > 0 ? refs : undefined;
 	} catch {
 		return undefined;

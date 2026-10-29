@@ -51,6 +51,21 @@ describe("shared workspace evidence", () => {
 		} finally { await rm(root, { recursive: true, force: true }); }
 	});
 
+	test("reports truncation when evidence passes the cap and stays bounded", async () => {
+		const root = await mkdtemp(join(tmpdir(), "fusion-refs-overflow-"));
+		try {
+			const git = (args: string[]) => nodeGitExec(args, { cwd: root, timeout: 5000 });
+			await git(["init", "-q"]);
+			await git(["-c", "user.name=Fusion Test", "-c", "user.email=fusion@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "fixture"]);
+			const before = await snapshotWorkspace(root, nodeGitExec);
+			for (let i = 0; i < 40; i++) await writeFile(join(root, `overflow-${String(i).padStart(2, "0")}.txt`), "addition\n");
+			const refs = await workspaceEvidenceRefs(before, nodeGitExec);
+			expect((refs ?? []).length).toBe(MAX_EVIDENCE_REFS);
+			expect((refs ?? []).every((ref) => ref.startsWith("new:") || ref === "evidence-truncated")).toBe(true);
+			expect(refs?.at(-1)).toBe("evidence-truncated");
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
+
 	test("collects bounded evidence references for a settled turn", async () => {
 		const root = await mkdtemp(join(tmpdir(), "fusion-refs-"));
 		try {
