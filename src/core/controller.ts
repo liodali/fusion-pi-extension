@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { delegationError, scoutLimitError, type DelegationAction, type FusionPhase, type LifecycleState } from "./workflow.ts";
 import { needsContinuation } from "../settle.ts";
 import { buildExecutorPrompt, buildFinalFixPrompt, buildRevisionPrompt } from "../prompts.ts";
-import type { WorkerCapabilities } from "./worker.ts";
+import { parseExecutorReport } from "../report.ts";
+import type { WorkerCapabilities, WorkerReference, WorkerRuntime, WorkerTurnOptions, WorkerTurnRequest, WorkerTurnResult } from "./worker.ts";
 
 /**
  * Injectable time and identity. Adapters keep their native formats (deterministic
@@ -36,6 +37,11 @@ export interface DelegationPorts<Snapshot, Output, Evidence, Result> {
 	settle(evidence: Evidence): Promise<Result>;
 }
 
+export interface WorkerDelegationPorts<Snapshot, Evidence, Result> extends Omit<DelegationPorts<Snapshot, WorkerTurnResult, Evidence, Result>, "submit"> {
+	/** Persist a reference already known before submission, or first observed later. */
+	recordReference(reference: WorkerReference): Promise<void>;
+}
+
 export interface PendingDelegation {
 	action: DelegationAction;
 	requestId: string;
@@ -49,7 +55,13 @@ export class FusionController {
 	private previousBudget?: { revisions: number; finalFixUsed: boolean };
 	private pendingTurn?: PendingDelegation;
 	private outcomeUnknown = false;
-	constructor(readonly state: LifecycleState, private services: ControllerServices = defaultControllerServices) {}
+	constructor(readonly state: LifecycleState, private services: ControllerServices = defaultControllerServices, private workerRuntime?: WorkerRuntime) {}
+
+	/** Bind the runtime selected by the host before starting the acquired turn. */
+	bindWorkerRuntime(runtime: WorkerRuntime): void {
+		if (this.performing || this.submissionStarted) throw new Error("Cannot change worker runtime during a delegation.");
+		this.workerRuntime = runtime;
+	}
 
 	now(): number { return this.services.now(); }
 
@@ -110,6 +122,14 @@ export class FusionController {
 		this.state.phase = outcome === "completed" ? "reviewing" : "failed";
 	}
 
+	/** Save a terminal outcome before allowing any further delegation. */
+	async persistSettlement(outcome: "completed" | "error" | "cancelled", persist: () => Promise<void>): Promise<void> {
+		const pending = this.pendingTurn;
+		this.settleDelegation(outcome);
+		this.clearPending();
+		try { await persist(); } catch (error) { this.pendingTurn = pending; throw error; }
+	}
+
 	endDelegation(action: DelegationAction): void {
 		this.state.delegating = false;
 		if (action === "resume" && !this.outcomeUnknown && !this.pendingTurn) this.state.resumePending = false;
@@ -150,6 +170,48 @@ export class FusionController {
 		} finally {
 			this.performing = false;
 		}
+	}
+
+	/** Run through the shared worker contract; adapters keep native contexts in the runtime. */
+	async performWorkerDelegation<Snapshot, Evidence, Result>(request: WorkerTurnRequest, options: Omit<WorkerTurnOptions, "onReference">, ports: WorkerDelegationPorts<Snapshot, Evidence, Result>): Promise<Result> {
+		const runtime = this.workerRuntime;
+		if (!runtime) throw new Error("No worker runtime is configured.");
+		if (!this.activeAction || !this.pendingTurn || this.pendingTurn.requestId !== request.requestId) throw new Error("Worker request does not match the pending delegation.");
+		if (!request.runId || !request.requestId) throw new Error("Worker run and request IDs are required.");
+		if (this.activeAction === "resume" && !runtime.capabilities.activeTurnReattach) throw new Error("This worker cannot reattach to an interrupted turn.");
+		const worker = request.worker;
+		let referenceId: string | undefined;
+		const validateReference = (reference: WorkerReference): void => {
+			if (!reference.id || reference.runtime !== worker.runtime || reference.owner.harness !== worker.owner.harness || reference.owner.supervisorId !== worker.owner.supervisorId || reference.owner.workspace !== worker.owner.workspace) throw new Error("Worker reference does not match its owner and runtime.");
+			if (referenceId && referenceId !== reference.id) throw new Error("Worker reference changed during delegation.");
+			referenceId = reference.id;
+		};
+		return this.performDelegation({
+			...ports,
+			snapshot: async () => {
+				const snapshot = await ports.snapshot();
+				if (worker.reference) { validateReference(worker.reference); await ports.recordReference(worker.reference); }
+				return snapshot;
+			},
+			submit: async () => {
+				let acceptingCallbacks = true;
+				const turnOptions: WorkerTurnOptions = {
+					...options,
+					onEvent: (event) => {
+						if (acceptingCallbacks && event.worker === worker && event.runId === request.runId && event.requestId === request.requestId) options.onEvent(event);
+					},
+					onReference: async (reference) => {
+						if (!acceptingCallbacks) throw new Error("Worker turn no longer accepts reference updates.");
+						validateReference(reference); await ports.recordReference(reference);
+					},
+				};
+				try {
+					const result = this.activeAction === "resume" ? await runtime.reattach(request, turnOptions) : await runtime.submit(request, turnOptions);
+					if (result.role !== "executor" || result.worker !== worker || result.runId !== request.runId || result.requestId !== request.requestId) throw new Error("Worker result does not match the pending delegation.");
+					return result;
+				} finally { acceptingCallbacks = false; }
+			},
+		});
 	}
 
 	beginScout(): string | undefined {
@@ -193,6 +255,11 @@ export class FusionController {
 		if (action === "revise") return buildRevisionPrompt(brief, this.state.revisions, originalBrief);
 		if (action === "final_fix") return buildFinalFixPrompt(brief, this.state.originalTask, originalBrief);
 		return "";
+	}
+
+	/** Normalize executor output before native presentation and workspace review. */
+	executorReport(text: string): ReturnType<typeof parseExecutorReport> {
+		return parseExecutorReport(text);
 	}
 
 	/** Deactivate presentation state while retaining the current task metadata. */

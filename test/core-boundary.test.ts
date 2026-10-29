@@ -40,7 +40,7 @@ test("shared modules have no package imports and load without harness dependenci
 	const dir = await mkdtemp(join(tmpdir(), "fusion-core-boundary-"));
 	try {
 		await cp(coreDir, join(dir, "core"), { recursive: true });
-		for (const name of ["limits.ts", "prompts.ts", "settle.ts"]) {
+		for (const name of ["limits.ts", "prompts.ts", "report.ts", "settle.ts"]) {
 			await cp(resolve(import.meta.dir, "../src", name), join(dir, name));
 		}
 		const imports = entries.map((name) => `import(${JSON.stringify(pathToFileURL(join(dir, "core", name)).href)})`);
