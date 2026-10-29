@@ -1,4 +1,5 @@
 .plan
 node_modules/
 *.lock
+*.md
 .DS_Store
