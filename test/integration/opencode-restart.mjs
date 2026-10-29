@@ -33,7 +33,7 @@ export default { id: "fusion-restart-probe", async setup(ctx) {
     let calls = 0, description = "";
     const parent = saved ? { id: saved.parent } : await ctx.session.create({});
     const child = saved ? { id: saved.child } : await ctx.session.create({ parentID: parent.id });
-    const notification = saved && { type: "synthetic", description: saved.description, metadata: { source: "subagent", childID: child.id, agent: "fusion-executor", state: "completed" }, text: '<subagent sessionID="' + child.id + '" state="completed" description="' + saved.description + '">\\nrecovered report\\n</subagent>' };
+    const notification = saved && !saved.missing && { type: "synthetic", description: saved.description, metadata: { source: "subagent", childID: child.id, agent: "fusion-executor", state: "completed" }, text: '<subagent sessionID="' + child.id + '" state="completed" description="' + saved.description + '">\\nrecovered report\\n</subagent>' };
     const proxy = { ...ctx, session: { ...ctx.session, context: async () => notification ? [notification] : [] }, tool: { ...ctx.tool,
       list: async () => (await ctx.tool.list()).map((tool) => tool.id === "subagent" ? { ...tool, execute: async (input, toolContext) => { calls++; description = input.description; await toolContext.progress({ sessionID: child.id }); return { output: { sessionID: child.id, status: "running", output: "pending" } }; } } : tool)
     } };
@@ -43,6 +43,15 @@ export default { id: "fusion-restart-probe", async setup(ctx) {
     if (!saved) {
       const first = await tools.find((tool) => tool.id === "fusion_delegate").execute({ action: "execute", brief: "restart probe" }, toolContext);
       await writeFile(phaseFile, JSON.stringify({ version: ctx.app.version, parent: parent.id, child: child.id, description, status: first.metadata?.status, calls }));
+    } else if (saved.missing) {
+      const status = await tools.find((tool) => tool.id === "fusion_status").execute({}, toolContext);
+      const state = JSON.parse(status.content);
+      let refusal = "", blocked = false;
+      try { await tools.find((tool) => tool.id === "fusion_reconcile").execute({}, toolContext); } catch (error) { refusal = String(error); blocked = true; }
+      let resetRefusal = false;
+      try { await tools.find((tool) => tool.id === "fusion_reset").execute({}, toolContext); } catch { resetRefusal = true; }
+      const retry = await tools.find((tool) => tool.id === "fusion_delegate").execute({ action: "revise", brief: "retry" }, toolContext).catch((error) => String(error));
+      await writeFile(resultFile, JSON.stringify({ uncertain: state.uncertain, child: state.childSessionID, blocked, refusal, resetRefusal, calls, retry: typeof retry === "string" ? retry : retry?.content }));
     } else {
       const status = await tools.find((tool) => tool.id === "fusion_status").execute({}, toolContext);
       const state = JSON.parse(status.content);
@@ -89,9 +98,25 @@ export default { id: "fusion-restart-probe", async setup(ctx) {
 	const first = await waitForFile(join(project, "phase.json"));
 	assert.equal(first.status, "running"); assert.equal(first.calls, 1); assert.ok(first.parent && first.child && first.description);
 	await stop();
+	// Second restart: no completion notification exists for the still-running
+	// child (the upstream process-local parent-completion gap), so reconciliation
+	// must refuse, reset must stay blocked, and no native call may be made.
+	await writeFile(join(project, "phase.json"), JSON.stringify({ ...first, missing: true }));
+	await start();
+	const missing = await waitForFile(join(project, "result.json"));
+	if (missing.error) throw new Error(missing.error);
+	assert.equal(missing.uncertain, true); assert.equal(missing.child, first.child); assert.equal(missing.calls, 0);
+	assert.equal(missing.blocked, true); assert.ok(/No matching completion notification yet/.test(missing.refusal));
+	assert.equal(missing.resetRefusal, true); assert.ok(/unknown outcome/.test(missing.retry ?? ""));
+	await stop();
+	// Third restart: the notification arrives (child finished), so remove the
+	// missing marker, reconcile succeeds without another submission, and the
+	// run settles.
+	await writeFile(join(project, "phase.json"), JSON.stringify(first));
+	await rm(join(project, "result.json"), { force: true });
 	await start();
 	const second = await waitForFile(join(project, "result.json"));
 	if (second.error) throw new Error(second.error);
 	assert.equal(second.uncertain, true); assert.equal(second.child, first.child); assert.equal(second.calls, 0); assert.ok(second.answer.includes("recovered report"));
-	console.log(JSON.stringify({ version: first.version, processes: 2, restoredPending: true, sameChild: true, resubmissions: second.calls, reconciled: true, completion: "simulated native result and notification" }));
+	console.log(JSON.stringify({ version: first.version, processes: 3, restoredPending: true, sameChild: true, missingEvidence: { blocked: missing.blocked, resubmissions: missing.calls }, resubmissions: second.calls, reconciled: true, completion: "simulated native result and notification" }));
 } finally { await stop(); await rm(root, { recursive: true, force: true }); }
