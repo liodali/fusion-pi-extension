@@ -56,6 +56,8 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 	childSessionID?: string;
 	/** A previously submitted turn whose completion still needs proof. */
 	pending?: boolean;
+	/** Persist a newly discovered child before forwarding progress or settlement. */
+	onReference?: (sessionID: string) => Promise<void>;
 	/** Wait for the child to settle and return its final response. Must reject if settlement is unknown. */
 	waitForBackground?: (sessionID: string, signal: AbortSignal) => Promise<string>;
 }) {
@@ -63,6 +65,13 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 	let running = false;
 	let backgroundPending = options.pending ?? false;
 	let settling = false;
+	let published = !!childSessionID;
+	let publication: Promise<void> | undefined;
+	async function publish(id: string): Promise<void> {
+		if (published) return;
+		publication ??= (async () => { await options.onReference?.(id); published = true; })();
+		await publication;
+	}
 
 	async function settleBackground(
 		context: C,
@@ -88,6 +97,7 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 	return {
 		get childSessionID() { return childSessionID; },
 		get backgroundPending() { return backgroundPending; },
+		markReferencePublished() { if (childSessionID) { published = true; publication = undefined; } },
 		markPending() { if (childSessionID) backgroundPending = true; },
 		settleBackground,
 		async prompt(prompt: string, description: string, context: C): Promise<NativeSubagentOutput> {
@@ -110,7 +120,9 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 						if (typeof update.sessionID === "string" && update.sessionID) {
 							if (childSessionID && childSessionID !== update.sessionID) throw new Error("OpenCode returned a different executor session.");
 							childSessionID = update.sessionID;
+							await publish(childSessionID);
 						}
+						if (publication) await publication;
 						await context.progress(update);
 					},
 				});
@@ -125,6 +137,7 @@ export function createNativeExecutor<C extends NativeToolContext>(options: {
 				}
 				if (childSessionID && childSessionID !== value.sessionID) throw new Error("OpenCode returned a different executor session.");
 				childSessionID = value.sessionID;
+				await publish(childSessionID);
 				if (value.status === "running") return await settleBackground(context);
 				return { sessionID: childSessionID, status: "completed", output: value.output };
 			} finally {

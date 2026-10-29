@@ -214,7 +214,6 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 					harness,
 					conversation,
 					async () => {
-						protectedConversations.clear();
 						protectedConversations.add(conversation.id);
 						await discardStale(harness);
 						return conversation.submit(
@@ -266,7 +265,6 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 			if (conversation === undefined) {
 				throw new Error("Durable executor conversation not found.");
 			}
-			protectedConversations.clear();
 			protectedConversations.add(conversation.id);
 			await discardStale(harness);
 			return makeHandle(harness, conversation, config);
@@ -292,39 +290,34 @@ export async function createDurableExecutorBackend(): Promise<ExecutorBackend> {
 				BACKGROUND_CONTEXT,
 			);
 			protectedConversations.add(conversation.id);
-			try {
-				await discardStale(harness);
-				const result = await settle(
-					harness,
-					conversation,
-					() =>
-						conversation.submit(
-							{
-								type: "input",
-								content: request.prompt,
-								requestId: `scout:${randomUUID()}`,
-							},
-							BACKGROUND_CONTEXT,
-						),
-					request,
-				);
-				const doc = await harness.snapshot(
-					scoutCallsDoc,
-					conversation.id,
-					BACKGROUND_CONTEXT,
-				);
-				return { ...result, capped: (doc?.count ?? 0) > request.maxToolCalls };
-			} finally {
-				protectedConversations.delete(conversation.id);
-			}
+			// A failed wait may leave work running; retain protection for this backend lifetime.
+			await discardStale(harness);
+			const result = await settle(
+				harness,
+				conversation,
+				() =>
+					conversation.submit(
+						{
+							type: "input",
+							content: request.prompt,
+							requestId: `scout:${randomUUID()}`,
+						},
+						BACKGROUND_CONTEXT,
+					),
+				request,
+			);
+			const doc = await harness.snapshot(
+				scoutCallsDoc,
+				conversation.id,
+				BACKGROUND_CONTEXT,
+			);
+			return { ...result, capped: (doc?.count ?? 0) > request.maxToolCalls };
 		},
 		async dispose(): Promise<void> {
 			const pending = harnessPromise;
-			harnessPromise = undefined;
 			if (pending === undefined) return;
-			try {
-				await (await pending).close(BACKGROUND_CONTEXT);
-			} catch {}
+			await (await pending).close(BACKGROUND_CONTEXT);
+			if (harnessPromise === pending) harnessPromise = undefined;
 		},
 	};
 }

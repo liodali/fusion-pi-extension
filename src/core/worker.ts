@@ -39,6 +39,8 @@ export interface WorkerTurnRequest {
 	requestId: string;
 	worker: WorkerHandle;
 	prompt: string;
+	/** Per-turn override; the meaning of a variant belongs to the host adapter. */
+	variant?: string;
 }
 
 /** Missing accounting fields mean unknown, not zero. Costs use the host's currency. */
