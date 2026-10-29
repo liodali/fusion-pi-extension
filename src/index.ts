@@ -1795,8 +1795,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (exact) {
 					try {
-						const lease = await (await registry()).claim(exact.manifest, exact.token);
-						await lease.release();
+						// Retain on release failure: the claimed coordinator stays with
+						// the process so a later cleanup retries without leaking the
+						// gate or losing the ownership claim.
+						workspaceLease = workspaceLease ?? await (await registry()).claim(exact.manifest, exact.token);
+						await workspaceLease.release();
+						workspaceLease = undefined;
 					} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
 				}
 			}

@@ -381,6 +381,35 @@ test("a fresh session releases a prior run's settled ownership by explicit clean
 	await next.commands.get("fusion-clean").handler("", next.ctx);
 });
 
+test("failed cleanup retains the coordinator for retry instead of leaking it", async () => {
+	const cwd = join(root, "settled-ownership-release-fault");
+	await mkdir(cwd, { recursive: true });
+	const first = makePi(cwd);
+	await first.commands.get("fusion").handler("original task", first.ctx);
+	expect((await first.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, first.ctx)).details.error).toBeUndefined();
+	await first.hooks.get("session_shutdown")();
+	// Sabotage the archive write inside the shared registry itself.
+	const { DatabaseSync } = await import("node:sqlite");
+	const sabotage = new DatabaseSync(join(cwd, ".test-state", "owners.sqlite"));
+	sabotage.exec("CREATE TRIGGER fusion_probe_archive_denied BEFORE INSERT ON archive BEGIN SELECT RAISE(ABORT, 'archive probe denial'); END;");
+	sabotage.close();
+	const resumed = makePi(cwd, "fresh-session");
+	await resumed.hooks.get("session_start")({}, resumed.ctx);
+	await resumed.commands.get("fusion-clean").handler("", resumed.ctx);
+	expect(resumed.notifications.at(-1)).toContain("Cannot clean Fusion");
+	// Remove the fault: the retained coordinator must retry, not re-claim
+	// against its own leaked gate.
+	const edit = new DatabaseSync(join(cwd, ".test-state", "owners.sqlite"));
+	edit.exec("DROP TRIGGER fusion_probe_archive_denied");
+	edit.close();
+	await resumed.commands.get("fusion-clean").handler("", resumed.ctx);
+	expect(resumed.notifications.at(-1)).toContain("cleared");
+	const check = new DatabaseSync(join(cwd, ".test-state", "owners.sqlite"));
+	const rows = check.prepare("SELECT COUNT(*) AS n FROM owner").get();
+	check.close();
+	expect(rows.n).toBe(0);
+});
+
 test("a workspace cannot claim ownership when its registry directory is unusable", async () => {
 	const cwd = join(root, "registry-conflict-workspace");
 	await mkdir(cwd, { recursive: true });
