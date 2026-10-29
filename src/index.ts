@@ -29,7 +29,7 @@ import {
 	type ExecutorEvent,
 	type ExecutorHandle,
 } from "./pi/executor-backend.ts";
-import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, type GitExec } from "./workspace/evidence.ts";
+import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs, type GitExec } from "./workspace/evidence.ts";
 import {
 	MAX_SCOUT_TOOL_CALLS,
 	RENDER_THROTTLE_MS,
@@ -1168,6 +1168,8 @@ export default function (pi: ExtensionAPI) {
 						setPhase(ctx, "reviewing");
 						const parsed = controller.executorReport(output.text);
 						const diffStat = workspaceAfter ? await workspaceDiffStat(workspaceBefore, gitExec, touchedFiles, workspaceAfter) : undefined;
+						const evidence = await workspaceEvidenceRefs(workspaceBefore, gitExec, touchedFiles, workspaceAfter);
+						lastWorkerResult = { requestId: lastWorkerResult?.requestId ?? key, status: lastWorkerResult?.status ?? "completed", text: lastWorkerResult?.text ?? "", evidence: evidence ?? [] };
 						renderThrottle.flush();
 						const text = `${formatCompactReport(parsed.report, diffStat, parsed.prose, isResume ? ["resumed after restart"] : [])}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
 						recordDelegation({ reportStatus: parsed.report.status, usage });

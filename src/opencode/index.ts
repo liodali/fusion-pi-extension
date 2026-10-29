@@ -3,7 +3,7 @@ import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunMani
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
 import { EXECUTOR_SYSTEM_PROMPT } from "../prompts.ts";
 import { formatCompactReport } from "../report.ts";
-import { snapshotWorkspace, workspaceDiffStat } from "../workspace/evidence.ts";
+import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime } from "./worker-runtime.ts";
@@ -214,13 +214,15 @@ export default {
 							},
 							recordReference: () => persist(context.sessionID, run),
 							collect: async (result, before) => {
-								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text };
+								const workspaceAfter = await snapshotWorkspaceAfter(before, nodeGitExec);
+								const evidence = await workspaceEvidenceRefs(before, nodeGitExec, undefined, workspaceAfter);
+								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: evidence ?? [] };
 								return { result, parsed: run.controller.executorReport(result.text), diffStat: await workspaceDiffStat(before, nodeGitExec) };
 							},
 							settle: async ({ result, parsed, diffStat }) => {
 								await run.runtime.settle(request, async () => {
 									await run.controller.persistSettlement(result.status, async () => {
-										run.lastResult = { requestId: result.requestId, status: result.status, text: result.text };
+										run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: run.lastResult?.evidence ?? [] };
 										const value = { ...manifest(run), recovery: "settled" as const };
 										await run.lease!.save(value); await store.save(value);
 									});

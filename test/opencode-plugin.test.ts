@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import plugin from "../src/opencode/index.ts";
 import { nodeGitExec } from "../src/workspace/node-git.ts";
 import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
+import { readRunManifest } from "../src/core/manifest.ts";
 
 type Context = { sessionID: string; agent: string; signal: AbortSignal; progress: (update: Record<string, unknown>) => Promise<void> };
 type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string }> };
@@ -262,6 +263,7 @@ describe("OpenCode Fusion plugin", () => {
 
 	test("reports real workspace changes while requiring a full review", async () => {
 		const root = await mkdtemp(join(tmpdir(), "fusion-plugin-workspace-"));
+		const storage = memoryStorage();
 		try {
 			const init = await nodeGitExec(["init", "-q"], { cwd: root, timeout: 5000 });
 			expect(init.code).toBe(0);
@@ -272,14 +274,18 @@ describe("OpenCode Fusion plugin", () => {
 					return { output: { sessionID: "child-1", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[{"command":"check","result":"pass"}],"files_changed":[],"blockers":[]}\n```' } };
 				} }],
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
-			} });
+			} }, storage);
 			const result = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "create fixture" }, context("one"));
 			expect(result.content).toContain("new: fixture.txt");
 			expect(result.content).toContain("Review: full");
 			expect(result.content).toContain("executor tool activity unavailable");
+			const persisted = await storage.get(`run/${createHash("sha256").update(root).digest("hex")}`) as unknown;
+			expect(persisted).toBeDefined();
+			const manifest = readRunManifest(persisted, { harness: "opencode", workspace: root });
+			expect(manifest.lastResult?.status).toBe("completed");
+			expect(manifest.lastResult?.evidence).toContain("new:fixture.txt");
 		} finally { await rm(root, { recursive: true, force: true }); }
 	});
-
 	test("registers tools and continues the same child through guarded turns", async () => {
 		const tools = new Map<string, Tool>();
 		const calls: Record<string, unknown>[] = [];

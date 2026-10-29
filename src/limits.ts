@@ -9,5 +9,6 @@ export const TRANSCRIPT_TAIL_LINES = 15;
 export const TOOL_STREAM_TAIL_LINES = 8;
 export const MAX_SETTLE_NUDGES = 2;
 export const MAX_HASHED_DIRTY_PATHS = 500;
+export const MAX_EVIDENCE_REFS = 32;
 export const CLEAN_DIFF_MAX_FILES = 5;
 export const CLEAN_DIFF_MAX_LINES = 200;
