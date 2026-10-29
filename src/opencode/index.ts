@@ -278,10 +278,13 @@ export default {
 						const request: WorkerTurnRequest = { runId: run.runId, requestId: pending.requestId, worker: run.handle, prompt: "" };
 						const persistResult = async (result: import("../core/worker.ts").WorkerTurnResult) => {
 							await run.controller.persistSettlement(result.status, async () => {
-										run.lastResult = { requestId: result.requestId, status: result.status, text: result.text };
-										const value = { ...manifest(run), recovery: "settled" as const };
-										await run.lease!.save(value); await store.save(value);
-									});
+								// Reconciliation settles the same request the evidence was
+								// collected for; anything else gets empty evidence.
+								const retained = run.lastResult;
+								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: retained?.requestId === result.requestId ? retained.evidence ?? [] : [] };
+								const value = { ...manifest(run), recovery: "settled" as const };
+								await run.lease!.save(value); await store.save(value);
+							});
 						};
 						const result = run.runtime.status(run.handle).unsettled
 							? await run.runtime.settle(request, persistResult)

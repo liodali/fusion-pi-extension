@@ -463,6 +463,57 @@ test("OpenCode v1 recovery is read-only until a write and preserves legacy metad
 	await tools.get("fusion_reset")!.execute({}, context("one"));
 });
 
+test("reconciliation preserves retained evidence across reload", async () => {
+	const root = await mkdtemp(join(tmpdir(), "fusion-evidence-reload-"));
+	let host: { close(): void } | undefined;
+	try {
+		const init = await nodeGitExec(["init", "-q"], { cwd: root, timeout: 5000 });
+		expect(init.code).toBe(0);
+		await nodeGitExec(["-c", "user.name=Fusion Test", "-c", "user.email=fusion@example.invalid", "-c", "commit.gpgsign=false", `commit`, "--allow-empty", "-qm", "fixture"], { cwd: root, timeout: 5000 });
+		const storage = memoryStorage();
+		let fail = true, calls = 0;
+		const faulty = { ...storage, set: async (key: string, value: unknown) => {
+			if (fail && (value as { recovery?: string }).recovery === "settled") { fail = false; throw new Error("settlement write failed"); }
+			await storage.set(key, value);
+		} };
+		const tools = new Map<string, Tool>();
+		const build = async () => {
+			await setupTest({ location: { directory: root }, session: { context: async () => [], hook: async () => {} }, tool: { hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+					calls++;
+					await ctx.progress({ sessionID: "child-1" });
+					await writeFile(join(root, "worker-new.txt"), "evidence\n");
+					return { output: { sessionID: "child-1", status: "completed", output: "report" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, faulty);
+			return tools;
+		};
+		const first = await build();
+		await expect(first.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("settlement write failed");
+		const hash = createHash("sha256").update(root).digest("hex");
+		const firstManifest = readRunManifest(await faulty.get(`run/${hash}`), { harness: "opencode", workspace: root });
+		expect(firstManifest.recovery).toBe("pending");
+		expect(firstManifest.lastResult?.evidence).toEqual(["new:worker-new.txt"]);
+		// Reload from the retained record, then reconcile without a native call.
+		host?.close();
+		host = await setupTest({ location: { directory: root }, session: { context: async () => [], hook: async () => {} }, tool: { hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => { calls++; throw new Error("native must not be called after reload"); } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.uncertain).toBe(true);
+		expect(status.childSessionID).toBe("child-1");
+		const reconciled = await tools.get("fusion_reconcile")!.execute({}, context("one"));
+		expect(reconciled.content).toContain("reconciled background turn");
+		const manifest = readRunManifest(await storage.get(`run/${hash}`), { harness: "opencode", workspace: root });
+		expect(manifest.recovery).toBe("settled");
+		expect(manifest.lastResult?.evidence).toEqual(["new:worker-new.txt"]);
+		expect(calls).toBe(1);
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+	} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
+});
+
 test("shared settlement failure preserves the exact result and blocks another submission", async () => {
 	const root = await mkdtemp(join(tmpdir(), "fusion-shared-fault-"));
 	let host: { close(): void } | undefined;
