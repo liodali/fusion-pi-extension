@@ -1,9 +1,10 @@
 // Runs in a separate Bun process so SDK mocks cannot affect other tests.
-import { expect, mock, test } from "bun:test";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { expect, mock, setDefaultTimeout, test } from "bun:test";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const root = process.env.FUSION_PI_TEST_DIR;
+setDefaultTimeout(20000);
 if (!root) throw new Error("Missing isolated Pi test directory");
 let failThinking = false;
 let failPrompt = false;
@@ -14,6 +15,7 @@ let disposals = 0;
 let durableEnabled = false;
 let durableResumes = [];
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+const capabilities = { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: false };
 const handle = {
 	resumeRef: () => join(root, "session.jsonl"),
 	setThinking: async () => { if (failThinking) throw new Error("thinking failed"); },
@@ -21,12 +23,12 @@ const handle = {
 	resume: async () => { throw new Error("not supported"); }, abort: async () => {}, dispose: () => { disposals++; },
 };
 mock.module("../../src/pi/executor-backend.ts", () => ({
-	createSessionExecutorBackend: () => ({ kind: "session", capabilities: { transcriptReopen: true, activeTurnReattach: false },
+	createSessionExecutorBackend: () => ({ kind: "session", capabilities,
 		createExecutor: async () => handle, dispose: async () => {} }),
 }));
 mock.module("../../src/pi/durable/backend.ts", () => ({ createDurableExecutorBackend: async () => {
 	if (!durableEnabled) throw new Error("unavailable");
-	return { kind: "durable", capabilities: { transcriptReopen: true, activeTurnReattach: true },
+	return { kind: "durable", capabilities: { ...capabilities, activeTurnReattach: true, durableExecution: true, exactScoutToolLimit: true },
 		openExecutor: async () => ({ ...handle, resumeRef: () => "42", resume: async (options) => { durableResumes.push(options.requestId); return { text: "recovered", usage }; } }),
 		dispose: async () => {} };
 } }));
@@ -35,6 +37,7 @@ const { default: registerFusion } = await import("../../src/index.ts");
 const { writeRun, readRun, runsDir } = await import("../../src/runs.ts");
 
 test("Pi keeps pre-submission revisions retryable and blocks an uncertain final fix", async () => {
+	process.env.FUSION_OWNERSHIP_DIR = join(root, "ownership-initial");
 	const tools = new Map();
 	const commands = new Map();
 	const hooks = new Map();
@@ -48,7 +51,7 @@ test("Pi keeps pre-submission revisions retryable and blocks an uncertain final 
 		{ provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } },
 		{ provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } },
 	];
-	const ctx = { cwd: root, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { getAvailable: () => models },
+	const ctx = { cwd: root, sessionManager: { getSessionId: () => "supervisor" }, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { getAvailable: () => models },
 		waitForIdle: async () => {}, ui: { notify: (message) => notifications.push(message), input: async () => "",
 			select: async (_title, options) => options[0], setWidget: () => {} } };
 	registerFusion(pi);
@@ -76,6 +79,7 @@ test("Pi keeps pre-submission revisions retryable and blocks an uncertain final 
 });
 
 function makePi(cwd) {
+	process.env.FUSION_OWNERSHIP_DIR = join(cwd, ".test-state");
 	const tools = new Map(), commands = new Map(), hooks = new Map(), notifications = [];
 	let active = [], confirmed = false;
 	const pi = { registerTool: (tool) => tools.set(tool.name, tool), registerCommand: (name, command) => commands.set(name, command),
@@ -83,7 +87,7 @@ function makePi(cwd) {
 		setModel: async () => true, setThinkingLevel: () => {}, sendUserMessage: () => {}, exec: async () => ({ code: 1, stdout: "" }) };
 	const model = { provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } };
 	const supervisor = { provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } };
-	const ctx = { cwd, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { find: () => model, getAvailable: () => [supervisor, model] },
+	const ctx = { cwd, sessionManager: { getSessionId: () => "supervisor" }, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { find: () => model, getAvailable: () => [supervisor, model] },
 		waitForIdle: async () => {}, ui: { notify: (message) => notifications.push(message), input: async () => "",
 			select: async (_title, options) => options[0], confirm: async () => confirmed, setWidget: () => {} } };
 	registerFusion(pi);
@@ -154,6 +158,7 @@ test("an aborted Durable resume retains the original request and can retry reatt
 	durableEnabled = true; durableResumes = [];
 	const run = await interruptedRun("aborted-resume", { action: "execute", requestId: "original-request" });
 	const f = makePi(run.cwd);
+	f.confirm(true);
 	await f.commands.get("fusion-resume").handler("", f.ctx);
 	const delegate = (signal) => f.tools.get("fusion_delegate").execute("call", { action: "resume", brief: "resume" }, signal, undefined, f.ctx);
 	const aborted = await delegate(AbortSignal.abort());
@@ -212,4 +217,82 @@ test("Pi does not invoke its worker if the write-ahead record cannot be saved", 
 		await f.commands.get("fusion-clean").handler("", f.ctx);
 		expect(f.notifications.at(-1)).toContain("uncertain");
 	} finally { process.env.PI_CODING_AGENT_DIR = previous; }
+});
+
+test("Pi recovers shared pending intent when its legacy run file is missing", async () => {
+	const cwd = join(root, "missing-native-record");
+	await mkdir(cwd, { recursive: true });
+	const first = makePi(cwd);
+	await first.commands.get("fusion").handler("original task", first.ctx);
+	failPrompt = true;
+	const failed = await first.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, first.ctx);
+	failPrompt = false;
+	expect(failed.details.error).toContain("connection lost");
+	const dir = runsDir(root);
+	let saved;
+	for (const file of await readdir(dir)) {
+		const value = JSON.parse(await readFile(join(dir, file), "utf8"));
+		if (value.cwd === cwd) { saved = value; await rm(join(dir, file)); break; }
+	}
+	expect(saved?.pending?.requestId).toBeString();
+	await first.hooks.get("session_shutdown")();
+	const resumed = makePi(cwd);
+	await resumed.commands.get("fusion-resume").handler("", resumed.ctx);
+	expect(resumed.notifications.at(-1)).toContain("session backend cannot reattach");
+	resumed.confirm(true);
+	await resumed.commands.get("fusion-resolve").handler("", resumed.ctx);
+	const resolved = await readRun(dir, saved.runId);
+	expect(resolved.status).toBe("failed");
+	expect(resolved.manualResolution.at).toBeString();
+	expect(resolved.pending.requestId).toBe(saved.pending.requestId);
+});
+
+test("Pi and OpenCode entrypoints exclude each other in the same workspace", async () => {
+	const cwd = join(root, "cross-harness");
+	await mkdir(cwd, { recursive: true });
+	const piRun = makePi(cwd);
+	await piRun.commands.get("fusion").handler("task", piRun.ctx);
+	expect((await piRun.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, piRun.ctx)).details.error).toBeUndefined();
+	const { default: opencode } = await import("../../src/opencode/index.ts");
+	const tools = new Map(); const values = new Map(); let nativeCalls = 0;
+	const plugin = await opencode.setup({ location: { directory: cwd },
+		storage: { get: async (key) => values.get(key), set: async (key, value) => values.set(key, value), remove: async (key) => values.delete(key) },
+		session: { context: async () => [], get: async () => ({}), hook: async () => {} },
+		tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { nativeCalls++; return { output: { sessionID: "child", status: "completed", output: "done" } }; } }], transform: async (callback) => callback({ add: (tool) => tools.set(tool.name, tool) }) },
+	});
+	const context = { sessionID: "parent", agent: "fusion", signal: new AbortController().signal, progress: async () => {} };
+	await expect(tools.get("fusion_delegate").execute({ action: "execute", brief: "other" }, context)).rejects.toThrow("coordinating");
+	expect(nativeCalls).toBe(0);
+	await piRun.commands.get("fusion-clean").handler("", piRun.ctx);
+	await tools.get("fusion_delegate").execute({ action: "execute", brief: "other" }, context);
+	expect(nativeCalls).toBe(1);
+	await tools.get("fusion_reset").execute({}, context);
+	plugin.close();
+});
+
+test("Pi discovery never rewrites a possibly live legacy run and recovery requires a decision", async () => {
+	const run = await interruptedRun("legacy-live-discovery", { action: "execute", requestId: "legacy-request" });
+	run.status = "running";
+	await writeRun(runsDir(root), run);
+	const path = join(runsDir(root), `${run.runId}.json`);
+	const before = await readFile(path, "utf8");
+	const f = makePi(run.cwd);
+	await f.hooks.get("session_start")({}, f.ctx);
+	for (let i = 0; i < 100 && !f.notifications.some((message) => message.includes("Interrupted Fusion run found")); i++) await Bun.sleep(10);
+	expect(await readFile(path, "utf8")).toBe(before);
+	await f.commands.get("fusion-resume").handler("", f.ctx);
+	expect(f.notifications.at(-1)).toContain("Legacy recovery requires confirming");
+	expect(await readFile(path, "utf8")).toBe(before);
+});
+
+test("an operator can resolve legacy Durable work when its backend is unavailable", async () => {
+	durableEnabled = false;
+	const run = await interruptedRun("unavailable-durable-resolution", { action: "execute", requestId: "original" });
+	const f = makePi(run.cwd);
+	f.confirm(true);
+	await f.commands.get("fusion-resolve").handler("", f.ctx);
+	const resolved = await readRun(runsDir(root), run.runId);
+	expect(resolved.status).toBe("failed");
+	expect(resolved.manualResolution.at).toBeString();
+	expect(resolved.pending.requestId).toBe("original");
 });

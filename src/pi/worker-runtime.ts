@@ -4,6 +4,12 @@ import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerOwner, Worker
 import type { ExecutorBackend, ExecutorConfig, ExecutorHandle, ExecutorTurnResult } from "./executor-backend.ts";
 import { piWorkerReference, piWorkerUsage } from "./worker-translation.ts";
 
+export interface PiWorkerRuntime extends WorkerRuntime {
+	/** Wrap a host-owned executor; construct this runtime with disposeBackend: false. */
+	adoptExecutor(owner: WorkerOwner, config: WorkerConfig, native: ExecutorHandle): WorkerHandle;
+	nativeResult(result: WorkerTurnResult): ExecutorTurnResult | undefined;
+}
+
 const levels: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 function thinking(variant: string | undefined): ThinkingLevel {
 	if (!variant || !levels.includes(variant)) throw new Error("A valid Pi thinking level is required.");
@@ -14,14 +20,16 @@ type PiHandle = WorkerHandle & {
 	config: WorkerConfig;
 	nativeConfig: ExecutorConfig;
 	native?: ExecutorHandle;
+	ownsNative: boolean;
 	active: boolean;
 	released: boolean;
 	abortController?: AbortController;
 };
 
 /** Adapt one Pi backend. Model resolution and backend lifetime stay in the Pi host. */
-export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (config: WorkerModelConfig) => Model<Api>): WorkerRuntime {
+export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (config: WorkerModelConfig) => Model<Api>, options: { disposeBackend?: boolean } = {}): PiWorkerRuntime {
 	const handles = new Set<PiHandle>();
+	const nativeResults = new WeakMap<WorkerTurnResult, ExecutorTurnResult>();
 	let closed = false;
 	let opening = 0;
 	let shuttingDown: Promise<void> | undefined;
@@ -44,14 +52,14 @@ export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (c
 		if (shutdownStarted || !handles.has(handle) || handle.released) throw new Error("Pi worker is unavailable.");
 		return handle;
 	}
-	function make(owner: WorkerOwner, config: WorkerConfig, nativeConfig: ExecutorConfig, native?: ExecutorHandle): PiHandle {
+	function make(owner: WorkerOwner, config: WorkerConfig, nativeConfig: ExecutorConfig, native?: ExecutorHandle, ownsNative = true): PiHandle {
 		const owned = Object.freeze({ ...owner });
 		const id = native?.resumeRef();
-		if (native && !id) { native.dispose(); throw new Error("Pi executor reference is unavailable before submission."); }
+		if (native && !id) { if (ownsNative) native.dispose(); throw new Error("Pi executor reference is unavailable before submission."); }
 		const reference = id ? Object.freeze(piWorkerReference(owned, backend.kind, id)) : undefined;
 		if (reference) Object.freeze(reference.owner);
 		const savedConfig = { ...config, model: config.model && { ...config.model } };
-		const handle: PiHandle = { owner: owned, runtime: backend.kind, reference, config: savedConfig, nativeConfig, native, active: false, released: false };
+		const handle: PiHandle = { owner: owned, runtime: backend.kind, reference, config: savedConfig, nativeConfig, native, ownsNative, active: false, released: false };
 		handles.add(handle);
 		return handle;
 	}
@@ -86,7 +94,9 @@ export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (c
 				capped = scout.capped;
 			}
 			const common = { runId: request.runId, requestId: request.requestId, worker: handle, status: result.stopReason === "error" ? "error" as const : result.stopReason === "aborted" ? "cancelled" as const : "completed" as const, text: result.text, errorMessage: result.errorMessage, usage: piWorkerUsage(result.usage) };
-			return handle.config.role === "scout" ? { ...common, role: "scout", capped } : { ...common, role: "executor" };
+			const translated: WorkerTurnResult = handle.config.role === "scout" ? { ...common, role: "scout", capped } : { ...common, role: "executor" };
+			nativeResults.set(translated, result);
+			return translated;
 		} finally {
 			options.signal?.removeEventListener("abort", forwardAbort);
 			handle.abortController = undefined;
@@ -95,6 +105,17 @@ export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (c
 	}
 	return {
 		capabilities: backend.capabilities,
+		adoptExecutor(owner, config, native) {
+			if (shutdownStarted) throw new Error("Pi runtime is shut down.");
+			if (options.disposeBackend !== false) throw new Error("Adopting a Pi executor requires a host-owned backend.");
+			if (config.role !== "executor") throw new Error("Only a Pi executor can be adopted.");
+			if ([...handles].some((handle) => handle.native === native)) throw new Error("Pi executor is already owned by a worker.");
+			if (backend.kind === "durable" && (durableExecutorOpening || [...handles].some((handle) => handle.native || handle.active))) throw new Error("Pi Durable backend already has an executor or active work.");
+			const nativeConfig = configFor(owner, config);
+			if (!native.resumeRef()) throw new Error("Pi executor reference is unavailable before submission.");
+			return make(owner, config, nativeConfig, native, false);
+		},
+		nativeResult(result) { return nativeResults.get(result); },
 		async create(owner, config) {
 			if (shutdownStarted) throw new Error("Pi runtime is shut down.");
 			const nativeConfig = configFor(owner, config);
@@ -126,7 +147,7 @@ export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (c
 		submit: (request, options) => turn(request, options, false),
 		reattach: (request, options) => turn(request, options, true),
 		async abort(worker) { const handle = valid(worker); handle.abortController?.abort(); if (handle.native && handle.active) await handle.native.abort(); },
-		async release(worker) { const handle = valid(worker); if (handle.active) throw new Error("Cannot release an active Pi worker."); handle.native?.dispose(); handle.released = true; handles.delete(handle); },
+		async release(worker) { const handle = valid(worker); if (handle.active) throw new Error("Cannot release an active Pi worker."); if (handle.ownsNative) handle.native?.dispose(); handle.released = true; handles.delete(handle); },
 		async shutdown() {
 			if (closed) return;
 			if (shuttingDown) return shuttingDown;
@@ -135,10 +156,10 @@ export function createPiWorkerRuntime(backend: ExecutorBackend, resolveModel: (c
 			shuttingDown = (async () => {
 				const errors: unknown[] = [];
 				for (const handle of handles) {
-					try { handle.native?.dispose(); handle.released = true; handles.delete(handle); }
+					try { if (handle.ownsNative) handle.native?.dispose(); handle.released = true; handles.delete(handle); }
 					catch (error) { errors.push(error); }
 				}
-				if (!backendDisposed) {
+				if (!backendDisposed && options.disposeBackend !== false) {
 					try { await backend.dispose(); backendDisposed = true; }
 					catch (error) { errors.push(error); }
 				}

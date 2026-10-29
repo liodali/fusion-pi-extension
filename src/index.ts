@@ -1,4 +1,9 @@
 import { FusionController } from "./core/controller.ts";
+import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
+import { piModelConfig } from "./pi/worker-translation.ts";
+import { translatePiRun } from "./pi/manifest-translation.ts";
+import { readRunManifest, type RunManifest } from "./core/manifest.ts";
+import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
 import { scoutLimitError } from "./core/workflow.ts";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -65,13 +70,11 @@ import {
 import {
 	type ExecutorReport,
 	formatCompactReport,
-	parseExecutorReport,
 } from "./report.ts";
 import {
 	type FusionRun,
 	delegationKey,
 	listRuns,
-	markInterrupted,
 	newRunId,
 	runsDir,
 	writeRun,
@@ -271,6 +274,29 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	let runWrites: Promise<void> = Promise.resolve();
+	let workspaceLease: WorkspaceLease | undefined;
+	let lastWorkerResult: RunManifest["lastResult"];
+	const registry = async () => (await import("./workspace/ownership.ts")).openWorkspaceRegistry();
+	const canonical = async (cwd: string) => (await import("./workspace/ownership.ts")).canonicalWorkspace(cwd);
+	async function claimWorkspace(ctx: ExtensionContext, run: FusionRun, allowUnavailableForResolution = false): Promise<void> {
+		if (workspaceLease?.manifest.runId === run.runId) return;
+		if (workspaceLease) { await workspaceLease.release(); workspaceLease = undefined; }
+		const workspace = await canonical(ctx.cwd);
+		const store = await registry();
+		const existing = await store.inspect(workspace);
+		if (existing && (existing.manifest.runId !== run.runId || existing.manifest.owner.harness !== "pi" || existing.manifest.owner.workspace !== workspace)) throw new Error("Another Fusion run owns this workspace. Reconcile or explicitly resolve it first.");
+		const currentOwner = existing?.manifest.owner ?? { harness: "pi", supervisorId: ctx.sessionManager.getSessionId(), workspace };
+		const backend = (run.backend ?? state.executorBackend) === "durable" ? await loadDurableBackend() : sessionBackend;
+		if (!backend && !allowUnavailableForResolution) throw new Error("Pi Durable backend is unavailable.");
+		let initial: RunManifest;
+		if (existing) initial = existing.manifest;
+		else if (run.manifest) initial = readRunManifest(run.manifest, { harness: "pi", workspace });
+		else initial = translatePiRun({ ...run, cwd: workspace }, currentOwner, backend?.capabilities ?? { transcriptReopen: false, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false });
+		workspaceLease = await store.claim(initial, existing?.token);
+		lastWorkerResult = initial.lastResult;
+		run.manifest = initial;
+		if (existing) { run.pending = initial.pending; run.revisions = initial.state.revisions; run.finalFixUsed = initial.state.finalFixUsed; }
+	}
 	const persistRunCritical = async (): Promise<void> => {
 		if (!state.activeRun) return;
 		const metrics = state.activeRun.metrics;
@@ -283,7 +309,24 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		const snapshot = structuredClone(state.activeRun);
-		const write = runWrites.then(() => writeRun(runsDir(getAgentDir()), snapshot));
+		const lease = workspaceLease;
+		if (lease?.manifest.runId === snapshot.runId) {
+			const pending = controller.pending;
+			if (pending?.action === "resume") throw new Error("Invalid Pi pending action.");
+			const prior = lease.manifest;
+			snapshot.manifest = readRunManifest({ ...prior,
+				state: { runActive: state.runActive, phase: state.phase, task: state.task, originalTask: state.originalTask, executorBrief: state.executorBrief,
+					revisions: state.revisions, finalFixUsed: state.finalFixUsed, executed: state.executed, delegating: !!pending && state.delegating,
+					resumePending: state.resumePending, scoutCalls: state.scoutCalls, settleNudges: state.settleNudges },
+				worker: (state.executorHandle?.resumeRef() ? { owner: prior.owner, runtime: state.executorSessionBackend ?? state.executorBackend, id: state.executorHandle.resumeRef()! } : prior.worker),
+				pending, recovery: pending ? "pending" : snapshot.status === "done" || snapshot.status === "failed" ? "settled" : "manual", lastResult: lastWorkerResult,
+			}, { harness: "pi", workspace: prior.owner.workspace });
+			state.activeRun.manifest = snapshot.manifest;
+		}
+		const write = runWrites.then(async () => {
+			if (snapshot.manifest && lease) await lease.save(snapshot.manifest);
+			await writeRun(runsDir(getAgentDir()), snapshot);
+		});
 		runWrites = write.catch(() => {});
 		await write;
 	};
@@ -295,15 +338,47 @@ export default function (pi: ExtensionAPI) {
 	function initializeRecovery(cwd: string): Promise<void> {
 		let pending = recoveryInitialization.get(cwd);
 		if (!pending) {
-			pending = markInterrupted(runsDir(getAgentDir()), cwd).then(() => {});
+			// Listing a run does not establish ownership. A different Pi process
+			// may still be executing it; never rewrite its status during discovery.
+			pending = Promise.resolve();
 			recoveryInitialization.set(cwd, pending);
 		}
 		return pending;
 	}
 	async function unresolvedRuns(cwd: string, excludeRunId?: string): Promise<FusionRun[]> {
 		await initializeRecovery(cwd);
-		return (await listRuns(runsDir(getAgentDir()), cwd)).filter((run) =>
-			(run.status === "running" || run.status === "interrupted") && run.runId !== excludeRunId);
+		const store = await registry();
+		const candidates = (await listRuns(runsDir(getAgentDir()), cwd)).filter((run) => (run.status === "running" || run.status === "interrupted") && run.runId !== excludeRunId).map((run) => run.status === "running" ? { ...run, status: "interrupted" as const } : run);
+		const unresolved: FusionRun[] = [];
+		const workspace = await canonical(cwd);
+		for (const run of candidates) {
+			const archived = await store.archived(run.runId);
+			const proven = archived?.owner.harness === "pi" && archived.owner.workspace === workspace && archived.recovery === "settled" &&
+				(!run.pending || archived.lastResult?.requestId === run.pending.requestId || archived.operatorResolution?.pending?.requestId === run.pending.requestId);
+			if (!proven) unresolved.push(run);
+		}
+		// A shared write can succeed immediately before the legacy file write fails.
+		// Recover the same run from the authoritative shared record without writing
+		// or submitting anything merely because the native file is absent or stale.
+		const owned = await store.inspect(workspace);
+		const saved = owned?.manifest;
+		if (saved && saved.owner.harness === "pi" && saved.owner.workspace === workspace && saved.recovery !== "settled" && saved.runId !== excludeRunId) {
+			const index = unresolved.findIndex((run) => run.runId === saved.runId);
+			const legacy = index >= 0 ? unresolved[index] : saved.adapterData?.legacyPi as FusionRun | undefined;
+			if (!legacy || legacy.runId !== saved.runId || !legacy.executor || !legacy.results || typeof legacy.results !== "object") throw new Error("Shared Pi recovery metadata is incomplete; inspect the workspace and resolve ownership manually.");
+			const run: FusionRun = { ...structuredClone(legacy), cwd, status: "interrupted", manifest: saved,
+				task: saved.state.task ?? legacy.task, originalTask: saved.state.originalTask, brief: saved.state.executorBrief ?? legacy.brief,
+				revisions: saved.state.revisions, finalFixUsed: saved.state.finalFixUsed, pending: saved.pending };
+			if (saved.worker?.runtime === "session") { run.backend = "session"; run.sessionFile = saved.worker.id; }
+			if (saved.worker?.runtime === "durable") {
+				const id = Number(saved.worker.id);
+				if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Invalid shared Pi Durable reference; inspect the workspace manually.");
+				run.backend = "durable"; run.conversationId = id;
+			}
+			if (index >= 0) unresolved[index] = run;
+			else unresolved.push(run);
+		}
+		return unresolved;
 	}
 
 	function updateWidget(ctx: ExtensionContext): void {
@@ -426,6 +501,8 @@ export default function (pi: ExtensionAPI) {
 		if (state.executorUsed || !executorConfigMatches()) {
 			disposeExecutor();
 		}
+		// Durable recovery can start persisted work; acquire workspace ownership first.
+		if (state.executorBackend === "durable") return;
 		if (!state.executorReady && !state.executorHandle) {
 			launchExecutor(ctx);
 		}
@@ -915,10 +992,11 @@ export default function (pi: ExtensionAPI) {
 					state.activeRun.revisions = state.revisions;
 					state.activeRun.finalFixUsed = state.finalFixUsed;
 					if (!isResume) state.activeRun.pending = { action: params.action as "execute" | "revise" | "final_fix", requestId: key };
-					await persistRunCritical();
 				}
 				emit(executorProgressText());
 				if (signal?.aborted) throw new Error("Fusion delegation aborted.");
+				if (!state.activeRun) throw new Error("Fusion run is unavailable.");
+				await claimWorkspace(ctx, state.activeRun);
 				const handle = await ensureExecutor(ctx);
 				timings.readyMs = controller.now() - startedAt;
 				if (state.activeRun) {
@@ -931,7 +1009,6 @@ export default function (pi: ExtensionAPI) {
 					} else {
 						state.activeRun.sessionFile = ref;
 					}
-					await persistRunCritical();
 				}
 				const promptText = controller.delegationPrompt(params.action, params.brief, !state.executorUsed);
 				if (signal?.aborted) {
@@ -1025,20 +1102,30 @@ export default function (pi: ExtensionAPI) {
 				};
 				state.executorUsed = true;
 				if (!isResume) await handle.setThinking(effective);
-				return await controller.performDelegation({
+				const model = state.executorSessionModel;
+				if (!model || !state.runId) throw new Error("Fusion executor model or run identity is unavailable.");
+				const backend = await activeBackend();
+				const runtime = createPiWorkerRuntime(backend, () => model, { disposeBackend: false });
+				const worker = runtime.adoptExecutor(workspaceLease!.manifest.owner, { role: "executor", model: piModelConfig(model, state.executorSessionThinking ?? state.executorThinking) }, handle);
+				const requestId = isResume ? state.activeRun?.pending?.requestId : key;
+				if (!requestId) throw new Error("Fusion executor request identity is unavailable.");
+				controller.bindWorkerRuntime(runtime);
+				return await controller.performWorkerDelegation({ runId: state.runId, requestId, worker, prompt: promptText, variant: effective }, { signal, onEvent: ({ event }) => onEvent(event) }, {
 					// Authoritative in-sequence re-check: an interrupted run in this
 					// workspace must recover before any submission is recorded.
 					claim: async () => {
 						if ((await unresolvedRuns(ctx.cwd, state.runId)).length > 0) {
 							throw new Error("An interrupted Fusion run requires recovery before new delegation. Use /fusion-resume or /fusion-resolve.");
 						}
+						await claimWorkspace(ctx, state.activeRun!);
 					},
 					recordIntent: () => persistRunCritical(),
 					snapshot: () => snapshotWorkspace(ctx.cwd, gitExec),
-					submit: () => isResume
-						? handle.resume({ signal, onEvent, requestId: state.activeRun?.pending?.requestId })
-						: handle.prompt(promptText, { requestId: key, signal, onEvent }),
-					collect: async (output, workspaceBefore) => {
+					recordReference: () => persistRunCritical(),
+					collect: async (translated, workspaceBefore) => {
+						lastWorkerResult = { requestId: translated.requestId, status: translated.status, text: translated.text };
+						const output = runtime.nativeResult(translated);
+						if (!output) throw new Error("Pi executor result is unavailable.");
 						if (state.activeRun && (state.executorSessionBackend ?? state.executorBackend) === "session") {
 							state.activeRun.sessionFile = handle.resumeRef();
 						}
@@ -1049,7 +1136,6 @@ export default function (pi: ExtensionAPI) {
 						state.lastTimings = { ...timings };
 						const usage = output.usage;
 						state.executorUsage = addUsage(state.executorUsage, usage);
-						controller.settleDelegation(output.stopReason === "error" ? "error" : output.stopReason === "aborted" ? "cancelled" : "completed");
 						if (output.stopReason === "error" || output.stopReason === "aborted") {
 							const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
 							state.executorActivity = "failed";
@@ -1060,15 +1146,15 @@ export default function (pi: ExtensionAPI) {
 							renderThrottle.flush();
 							const text = `Fusion executor stopped with status "${output.stopReason}"${reason}.\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
 							recordDelegation({ stopReason: output.stopReason, usage });
-							if (state.activeRun) {
+							await controller.persistSettlement(output.stopReason === "error" ? "error" : "cancelled", async () => {
+								if (!state.activeRun) return;
 								state.activeRun.status = "failed";
 								state.activeRun.revisions = state.revisions;
 								state.activeRun.results[key] = text;
 								const pending = state.activeRun.pending;
 								delete state.activeRun.pending;
 								try { await persistRunCritical(); } catch (error) { state.activeRun.pending = pending; throw error; }
-							}
-							controller.clearPending();
+							});
 							controller.setUncertain(false);
 							return respond(
 								text,
@@ -1079,20 +1165,20 @@ export default function (pi: ExtensionAPI) {
 						state.executorActivity = "finished";
 						appendExecutorProgress("[finished] Executor completed the delegation.");
 						setPhase(ctx, "reviewing");
-						const parsed = parseExecutorReport(output.text);
+						const parsed = controller.executorReport(output.text);
 						const diffStat = workspaceAfter ? await workspaceDiffStat(workspaceBefore, gitExec, touchedFiles, workspaceAfter) : undefined;
 						renderThrottle.flush();
 						const text = `${formatCompactReport(parsed.report, diffStat, parsed.prose, isResume ? ["resumed after restart"] : [])}\n\nExecutor usage this delegation: ${formatUsageSummary(usage)}\nExecutor usage this run: ${formatUsageSummary(state.executorUsage)}\n${timingLine()}`;
 						recordDelegation({ reportStatus: parsed.report.status, usage });
-						if (state.activeRun) {
+						await controller.persistSettlement("completed", async () => {
+							if (!state.activeRun) return;
 							state.activeRun.status = "done";
 							state.activeRun.revisions = state.revisions;
 							state.activeRun.results[key] = text;
 							const pending = state.activeRun.pending;
 							delete state.activeRun.pending;
 							try { await persistRunCritical(); } catch (error) { state.activeRun.pending = pending; throw error; }
-						}
-						controller.clearPending();
+						});
 						controller.setUncertain(false);
 						return respond(
 							text,
@@ -1482,8 +1568,10 @@ export default function (pi: ExtensionAPI) {
 			const lastTimings = state.lastTimings
 				? ` | last timing ready ${state.lastTimings.readyMs ?? "-"}ms, first event ${state.lastTimings.firstEventMs ?? "-"}ms, total ${state.lastTimings.totalMs ?? "-"}ms`
 				: "";
+			const owned = workspaceLease?.manifest ?? (await (await registry()).inspect(await canonical(ctx.cwd)))?.manifest;
+			const ownership = owned ? ` | owner ${owned.owner.harness}:${owned.owner.supervisorId} | run ${owned.runId} | recovery ${owned.recovery}${owned.pending ? ` | pending ${owned.pending.action}:${owned.pending.requestId}` : ""}` : "";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${ownership}${lastTimings}`,
 				"info",
 			);
 		},
@@ -1564,6 +1652,14 @@ export default function (pi: ExtensionAPI) {
 					}
 					let handle: ExecutorHandle;
 					try {
+						const existingOwner = await (await registry()).inspect(await canonical(ctx.cwd));
+						if (!existingOwner && !run.manifest) {
+							if (!ctx.hasUI || !await ctx.ui.confirm("Recover legacy Fusion run", "Have you verified that no other Fusion supervisor is coordinating this run? Its legacy record predates shared workspace ownership.")) {
+								ctx.ui.notify("Legacy recovery requires confirming that no other supervisor is coordinating the run.", "error");
+								return;
+							}
+						}
+						await claimWorkspace(ctx, run);
 						handle = await durable.openExecutor(
 							{ cwd: ctx.cwd, model, thinking: run.executor.thinking },
 							String(run.conversationId),
@@ -1618,10 +1714,15 @@ export default function (pi: ExtensionAPI) {
 				const run = interrupted[labels.indexOf(choice)];
 				const confirmed = await ctx.ui.confirm("Resolve interrupted Fusion run", "Have you verified that this executor and its commands have stopped, and inspected the working tree? Fusion cannot verify this automatically.");
 				if (!confirmed) return;
+				await claimWorkspace(ctx, run, true);
 				run.status = "failed";
 				run.manualResolution = { at: new Date().toISOString() };
 				await runWrites;
+				const prior = workspaceLease!.manifest;
+				run.manifest = { ...prior, recovery: "settled", pending: undefined, state: { ...prior.state, delegating: false, phase: "failed" }, operatorResolution: { at: run.manualResolution.at, pending: prior.pending } };
+				await workspaceLease!.save(run.manifest);
 				await writeRun(runsDir(getAgentDir()), run);
+				await workspaceLease!.release(); workspaceLease = undefined;
 				if (state.activeRun?.runId === run.runId) {
 					controller.clearPending();
 					controller.setUncertain(false);
@@ -1644,13 +1745,16 @@ export default function (pi: ExtensionAPI) {
 			await ctx.waitForIdle();
 			const resetError = controller.resetError();
 			if (resetError) { ctx.ui.notify(resetError, "error"); return; }
-			disposeExecutor();
 			if (state.activeRun) {
 				state.activeRun.status = "done";
-				await persistRun();
+				try {
+					await persistRunCritical();
+					await workspaceLease?.release(); workspaceLease = undefined;
+				} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
 				state.activeRun = undefined;
 				state.runId = undefined;
 			}
+			disposeExecutor();
 			controller.clear();
 			syncFusionTools();
 			state.supervisorUsage = createEmptyUsage();
@@ -1765,7 +1869,7 @@ export default function (pi: ExtensionAPI) {
 			.catch(() => {});
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		controller.deactivate();
 		state.modeEnabled = false;
 		state.supervisorUsage = createEmptyUsage();
@@ -1774,7 +1878,8 @@ export default function (pi: ExtensionAPI) {
 		state.scoutMs = 0;
 		state.scoutUsage = createEmptyUsage();
 		disposeExecutor();
-		void loadDurablePromise?.then((loaded) => loaded?.dispose()).catch(() => {});
+		try { await runWrites; await loadDurablePromise?.then((loaded) => loaded?.dispose()); }
+		finally { workspaceLease?.close(); workspaceLease = undefined; }
 		try {
 			syncFusionTools();
 		} catch {}

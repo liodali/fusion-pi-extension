@@ -117,3 +117,27 @@ test("shutdown attempts all cleanup and retries only failed resources", async ()
 	await runtime.shutdown();
 	expect(calls).toHaveLength(5);
 });
+
+test("a small turn does not change the configured thinking for the next standard turn", async () => {
+	const f = fixture();
+	const worker = await f.runtime.create(owner, config);
+	await f.runtime.submit({ runId: "r", requestId: "small", worker, prompt: "work", variant: "low" }, options);
+	await f.runtime.submit({ runId: "r", requestId: "standard", worker, prompt: "work" }, options);
+	expect(f.calls).toEqual(["thinking:low", "submit:small", "thinking:high", "submit:standard"]);
+	await f.runtime.release(worker);
+});
+
+test("adopted executors retain host ownership and cannot be adopted twice", async () => {
+	const f = fixture();
+	expect(() => f.runtime.adoptExecutor(owner, config, f.native)).toThrow("host-owned backend");
+	const runtime = createPiWorkerRuntime(f.backend, () => model, { disposeBackend: false });
+	const worker = runtime.adoptExecutor(owner, config, f.native);
+	expect(() => runtime.adoptExecutor(owner, config, f.native)).toThrow("already owned");
+	expect(() => runtime.adoptExecutor(owner, config, { ...f.native })).toThrow("already has an executor");
+	await runtime.release(worker);
+	const next = runtime.adoptExecutor(owner, config, f.native);
+	await runtime.shutdown();
+	expect(f.calls).not.toContain("release");
+	expect(f.calls).not.toContain("shutdown");
+	await expect(runtime.submit({ runId: "r", requestId: "q", worker: next, prompt: "work" }, options)).rejects.toThrow("unavailable");
+});

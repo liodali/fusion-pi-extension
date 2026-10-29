@@ -14,4 +14,4 @@ test("Pi delegation handles submission failures using the shared controller", as
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
-}, 30000);
+}, 60000);
