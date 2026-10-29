@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import plugin from "../src/opencode/index.ts";
 import { nodeGitExec } from "../src/workspace/node-git.ts";
+import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
 
 type Context = { sessionID: string; agent: string; signal: AbortSignal; progress: (update: Record<string, unknown>) => Promise<void> };
 type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string }> };
@@ -13,8 +15,18 @@ function memoryStorage() {
 	const values = new Map<string, unknown>();
 	return { get: async (key: string) => values.get(key), set: async (key: string, value: unknown) => { values.set(key, structuredClone(value)); }, remove: async (key: string) => { values.delete(key); } };
 }
-function setupTest(context: Omit<Parameters<typeof plugin.setup>[0], "storage">, storage = memoryStorage()) {
-	return plugin.setup({ ...context, storage });
+type TestContext = Omit<Parameters<typeof plugin.setup>[0], "storage" | "session"> & { session: Omit<Parameters<typeof plugin.setup>[0]["session"], "get"> & Partial<Pick<Parameters<typeof plugin.setup>[0]["session"], "get">> };
+const ownershipFixtures = new WeakMap<object, { root: string; close?: () => void }>();
+const fixtureCleanup: { root: string; close?: () => void }[] = [];
+afterEach(async () => { for (const fixture of fixtureCleanup.splice(0)) { fixture.close?.(); await rm(fixture.root, { recursive: true, force: true }); } });
+async function setupTest(context: TestContext, storage = memoryStorage()) {
+	let fixture = ownershipFixtures.get(storage);
+	if (!fixture) { fixture = { root: await mkdtemp(join(tmpdir(), "fusion-plugin-owner-")) }; ownershipFixtures.set(storage, fixture); fixtureCleanup.push(fixture); }
+	fixture.close?.();
+	const get = context.session.get ?? (async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: sessionID.startsWith("child") ? "one" : undefined, location: { directory: context.location.directory } }));
+	const result = await plugin.setup({ ...context, session: { ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path });
+	fixture.close = result.close;
+	return result;
 }
 
 describe("OpenCode Fusion plugin", () => {
@@ -77,7 +89,7 @@ describe("OpenCode Fusion plugin", () => {
 			}
 			await backing.set(key, value);
 		} };
-		const makeContext = (tools: Map<string, Tool>): Omit<Parameters<typeof plugin.setup>[0], "storage"> => ({
+		const makeContext = (tools: Map<string, Tool>): TestContext => ({
 			location: { directory: tmpdir() }, session: { context: async () => messages, hook: async () => {} }, tool: {
 				hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, ctx) => {
 					calls++;
@@ -146,7 +158,7 @@ describe("OpenCode Fusion plugin", () => {
 		let description = "";
 		let messages: unknown[] = [];
 		const calls: Record<string, unknown>[] = [];
-		const makeContext = (tools: Map<string, Tool>): Omit<Parameters<typeof plugin.setup>[0], "storage"> => ({
+		const makeContext = (tools: Map<string, Tool>): TestContext => ({
 			location: { directory: "/workspace" }, session: { context: async () => messages, hook: async () => {} }, tool: {
 				hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, ctx) => {
 					calls.push({ ...input });
@@ -162,6 +174,9 @@ describe("OpenCode Fusion plugin", () => {
 		const failedStatus = JSON.parse((await first.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(failedStatus.phase).toBe("failed");
 		expect(failedStatus.uncertain).toBe(true);
+		expect(failedStatus.pending.requestId).toBe(description);
+		expect(failedStatus.owner.supervisorId).toBe("one");
+		expect(failedStatus.runId).toBeString();
 		const restored = new Map<string, Tool>();
 		await setupTest(makeContext(restored), storage);
 		await expect(restored.get("fusion_delegate")!.execute({ action: "execute", brief: "retry" }, context("one"))).rejects.toThrow("unknown outcome");
@@ -334,4 +349,136 @@ describe("OpenCode Fusion plugin", () => {
 		finish();
 		await first;
 	});
+});
+
+test("restoration rejects a child owned by a different supervisor", async () => {
+	const storage = memoryStorage();
+	const first = new Map<string, Tool>();
+	const base: TestContext = { location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }],
+		transform: async (callback) => { callback({ add: (tool) => first.set(tool.name, tool) }); },
+	} };
+	await setupTest(base, storage);
+	await first.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+	const wrong = { ...base, session: { ...base.session, get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: "other", location: { directory: "/workspace" } }) } };
+	await expect(setupTest(wrong, storage)).rejects.toThrow("ownership or workspace");
+});
+
+test("a rejected concurrent delegation cannot replace the active native tool context", async () => {
+	const tools = new Map<string, Tool>();
+	const backing = memoryStorage();
+	let release!: () => void, seen!: () => void;
+	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const ready = new Promise<void>((resolve) => { seen = resolve; });
+	let held = true, nativeContext: Context | undefined;
+	const storage = { ...backing, set: async (key: string, value: unknown) => { if (held) { held = false; seen(); await gate; } await backing.set(key, value); } };
+	await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { nativeContext = ctx; return { output: { sessionID: "child", status: "completed", output: "done" } }; } }],
+		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} }, storage);
+	const firstContext = { ...context("one"), marker: "first" }; const secondContext = { ...context("one"), marker: "second" };
+	const first = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, firstContext);
+	await ready;
+	await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "other" }, secondContext)).rejects.toThrow("already in progress");
+	release(); await first;
+	expect((nativeContext as (Context & { marker: string }) | undefined)?.marker).toBe("first");
+});
+
+test("a foreground result can be settled after a failed write without another native call", async () => {
+	const tools = new Map<string, Tool>();
+	const backing = memoryStorage();
+	let fail = true, calls = 0;
+	const storage = { ...backing, set: async (key: string, value: unknown) => {
+		if (fail && !(value as { pending?: unknown }).pending) { fail = false; throw new Error("settlement write failed"); }
+		await backing.set(key, value);
+	} };
+	await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { calls++; return { output: { sessionID: "child", status: "completed", output: "report" } }; } }],
+		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} }, storage);
+	await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("settlement write failed");
+	await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("uncertain");
+	expect((await tools.get("fusion_reconcile")!.execute({}, context("one"))).content).toContain("report");
+	expect(calls).toBe(1);
+	await tools.get("fusion_reset")!.execute({}, context("one"));
+});
+
+test("an archived settled request does not resurrect stale native intent on reload", async () => {
+	const backing = memoryStorage();
+	let key = "", stale: unknown;
+	const storage = { ...backing, set: async (k: string, value: unknown) => {
+		key = k;
+		const record = value as { pending?: unknown; worker?: unknown };
+		if (record.pending && record.worker) stale = structuredClone(value);
+		await backing.set(k, value);
+	} };
+	const createContext = (tools: Map<string, Tool>): TestContext => ({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { await ctx.progress({ sessionID: "child" }); return { output: { sessionID: "child", status: "completed", output: "done" } }; } }],
+		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} });
+	const first = new Map<string, Tool>(); await setupTest(createContext(first), storage);
+	await first.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+	await first.get("fusion_reset")!.execute({}, context("one"));
+	expect(stale).toBeDefined(); await backing.set(key, stale);
+	const restarted = new Map<string, Tool>(); await setupTest(createContext(restarted), storage);
+	expect((await restarted.get("fusion_status")!.execute({}, context("one"))).content).toContain("No Fusion run");
+});
+
+test("shared terminal proof recovers after native storage fails across restart", async () => {
+	const backing = memoryStorage(); let fail = false, calls = 0;
+	const storage = { ...backing, set: async (key: string, value: unknown) => { if (fail) throw new Error("storage offline"); await backing.set(key, value); } };
+	const makeContext = (tools: Map<string, Tool>): TestContext => ({ location: { directory: tmpdir() }, session: { context: async () => { throw new Error("notifications unavailable"); }, hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { calls++; await ctx.progress({ sessionID: "child" }); fail = true; return { output: { sessionID: "child", status: "completed", output: "persisted report" } }; } }],
+		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} });
+	const first = new Map<string, Tool>(); await setupTest(makeContext(first), storage);
+	await expect(first.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"))).rejects.toThrow("storage offline");
+	fail = false;
+	const restored = new Map<string, Tool>(); await setupTest(makeContext(restored), storage);
+	expect((await restored.get("fusion_reconcile")!.execute({}, context("one"))).content).toContain("persisted report");
+	expect(calls).toBe(1);
+	await restored.get("fusion_reset")!.execute({}, context("one"));
+});
+
+test("OpenCode v1 recovery is read-only until a write and preserves legacy metadata", async () => {
+	const tools = new Map<string, Tool>(); const backing = memoryStorage();
+	const workspace = tmpdir(); const key = `run/${createHash("sha256").update(workspace).digest("hex")}`;
+	const legacy = { version: 1, harness: "opencode", workspace, parentSessionID: "one", childSessionID: "child", extra: "preserve me", state: { runActive: true, phase: "reviewing", task: "task", originalTask: "original", executorBrief: "brief", delegating: false, executed: true, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0, settleNudges: 0 } };
+	await backing.set(key, legacy); let writes = 0;
+	const storage = { ...backing, set: async (k: string, value: unknown) => { writes++; await backing.set(k, value); } };
+	await setupTest({ location: { directory: workspace }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }],
+		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} }, storage);
+	expect(writes).toBe(0); expect(await backing.get(key)).toEqual(legacy);
+	await tools.get("fusion_delegate")!.execute({ action: "revise", brief: "feedback" }, context("one"));
+	const migrated = await backing.get(key) as { version: number; adapterData: { legacyOpenCode: unknown } };
+	expect(migrated.version).toBe(2); expect(migrated.adapterData.legacyOpenCode).toEqual(legacy);
+	await tools.get("fusion_reset")!.execute({}, context("one"));
+});
+
+test("shared settlement failure preserves the exact result and blocks another submission", async () => {
+	const root = await mkdtemp(join(tmpdir(), "fusion-shared-fault-"));
+	let host: { close(): void } | undefined;
+	try {
+		const workspace = tmpdir(); const tools = new Map<string, Tool>(); const storage = memoryStorage();
+		const registry = await openWorkspaceRegistry(root); let fail = true, calls = 0;
+		const openRegistry: typeof openWorkspaceRegistry = async () => ({ ...registry, claim: async (...args) => {
+			const lease = await registry.claim(...args);
+			return { get token() { return lease.token; }, get manifest() { return lease.manifest; }, close: () => lease.close(), release: () => lease.release(),
+				save: async (value) => { if (fail && value.recovery === "settled") throw new Error("shared settlement unavailable"); await lease.save(value); } };
+		} });
+		host = await plugin.setup({ location: { directory: workspace }, storage, session: { context: async () => [], get: async ({ sessionID }) => ({ id: sessionID, parentID: "one", location: { directory: workspace } }), hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { calls++; return { output: { sessionID: "child", status: "completed", output: "report" } }; } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, { ownershipRoot: root, canonicalize: async (path) => path, openRegistry });
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"))).rejects.toThrow("shared settlement unavailable");
+		const saved = (await registry.inspect(workspace))!.manifest;
+		expect(saved.recovery).toBe("pending"); expect(saved.pending?.requestId).toBe(saved.lastResult?.requestId);
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "retry" }, context("one"))).rejects.toThrow("unknown outcome");
+		fail = false;
+		expect((await tools.get("fusion_reconcile")!.execute({}, context("one"))).content).toContain("report");
+		expect(calls).toBe(1);
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+	} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
 });

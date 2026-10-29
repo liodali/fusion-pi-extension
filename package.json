@@ -13,7 +13,9 @@
 		"typecheck": "bunx tsc --noEmit",
 		"test": "bun test",
 		"test:opencode-smoke": "bun test/integration/opencode-smoke.mjs",
-		"test:opencode-workflow": "bun test/integration/opencode-workflow.mjs"
+		"test:opencode-workflow": "bun test/integration/opencode-workflow.mjs",
+		"test:opencode-restart": "bun test/integration/opencode-restart.mjs",
+		"test:opencode-restart-live": "bun test/integration/opencode-restart-live.mjs"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "^1.0.0",

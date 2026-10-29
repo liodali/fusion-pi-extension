@@ -37,6 +37,7 @@ export default { id: "fusion-workflow-observer", async setup(ctx) {
   ] }));
   const env = Object.fromEntries(["PATH", "HOME", "SHELL", "TMPDIR", "LANG", "SYSTEMROOT"].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
   for (const [key, folder] of Object.entries({ XDG_DATA_HOME: "data", XDG_CONFIG_HOME: "config", XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state" })) env[key] = join(root, folder);
+  env.FUSION_OWNERSHIP_DIR = join(root, "ownership");
   await mkdir(join(env.XDG_DATA_HOME, "opencode"), { recursive: true });
   // Copy only credentials, never the user's database, plugins, or project config.
   const provider = model.split("/")[0];
