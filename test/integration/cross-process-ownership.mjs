@@ -38,8 +38,12 @@ const attempt = (invocation) => new Promise((resolve) => {
 });
 
 const failures = [];
+// Valid refusal surfaces: a live coordinator holds the gate (busy), a dead
+// process leaves a claiming record (owner row), and an overlapping workspace
+// is caught before plugins even register.
+const REFUSALS = /Another Fusion (?:run owns|process is coordinating) this workspace|overlapping Fusion workspace requires recovery/;
 const expectBlocked = (verdict) => {
-	if (!verdict.ok && /Another Fusion run owns this workspace/.test(verdict.message ?? "")) return;
+	if (!verdict.ok && REFUSALS.test(verdict.message ?? "")) return;
 	failures.push(`${verdict.phase}: expected an ownership refusal, got ${JSON.stringify(verdict)}`);
 };
 const expectClaimable = (verdict) => {
@@ -82,7 +86,11 @@ try {
 	await writeFile(stopFile, "");
 	await waitUntil(() => holderOut.includes("DONE"));
 	expectClaimable(await attempt({ phase: "fresh", directory: workspace }));
-	console.log(JSON.stringify({ direction: "pi holds, opencode refuses", alias: "symlink", nested: true }));
+	if (failures.length) {
+		exitCode = 1;
+		console.log(failures.join("\n"));
+	}
+	console.log(JSON.stringify({ direction: "pi holds, opencode refuses", alias: "symlink", nested: true, verdict: failures.length === 0 ? "pass" : "fail" }));
 } catch (error) {
 	exitCode = 1;
 	console.log(`CROSS-PROCESS FAILED: ${error instanceof Error ? error.stack : error}`);
