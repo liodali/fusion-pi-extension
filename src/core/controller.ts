@@ -195,10 +195,18 @@ export class FusionController {
 			},
 			submit: async () => {
 				let acceptingCallbacks = true;
+				// Duplicate native event identities deliver once; events without a
+				// native id cannot be deduplicated and always deliver.
+				const seenEventIds = new Set<string>();
 				const turnOptions: WorkerTurnOptions = {
 					...options,
 					onEvent: (event) => {
-						if (acceptingCallbacks && event.worker === worker && event.runId === request.runId && event.requestId === request.requestId) options.onEvent(event);
+						if (!acceptingCallbacks || event.worker !== worker || event.runId !== request.runId || event.requestId !== request.requestId) return;
+						if (event.nativeEventId !== undefined) {
+							if (seenEventIds.has(event.nativeEventId)) return;
+							seenEventIds.add(event.nativeEventId);
+						}
+						options.onEvent(event);
 					},
 					onReference: async (reference) => {
 						if (!acceptingCallbacks) throw new Error("Worker turn no longer accepts reference updates.");

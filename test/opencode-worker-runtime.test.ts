@@ -26,7 +26,10 @@ test("awaits reference persistence before native progress and preserves tool con
 	await observed;
 	expect(f.forwarded).toEqual([]);
 	proceed();
-	expect((await pending).text).toBe("done");
+	const result = await pending;
+	expect(result.text).toBe("done");
+	// Missing OpenCode accounting stays unknown: the adapter never invents zeros.
+	expect(result.usage).toBeUndefined();
 	expect(f.forwarded).toHaveLength(1);
 	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
 	await f.runtime.release(worker);

@@ -59,11 +59,16 @@ test("worker events are delivered only for the active request and handle", async
 	f.runtime.submit = async (request, options) => {
 		options.onEvent({ runId: request.runId, requestId: "other", worker: request.worker, event: { type: "text_delta", delta: "wrong" } });
 		options.onEvent({ runId: request.runId, requestId: request.requestId, worker: request.worker, event: { type: "text_delta", delta: "right" } });
+		// A repeated native identity delivers once; id-less events always deliver.
+		options.onEvent({ runId: request.runId, requestId: request.requestId, worker: request.worker, nativeEventId: "n1", event: { type: "text_delta", delta: "dup" } });
+		options.onEvent({ runId: request.runId, requestId: request.requestId, worker: request.worker, nativeEventId: "n1", event: { type: "text_delta", delta: "dup" } });
+		options.onEvent({ runId: request.runId, requestId: request.requestId, worker: request.worker, nativeEventId: "n2", event: { type: "text_delta", delta: "unique" } });
+		options.onEvent({ runId: request.runId, requestId: request.requestId, worker: request.worker, event: { type: "text_delta", delta: "untagged" } });
 		return { ...request, role: "executor", status: "completed", text: "done" };
 	};
 	f.controller.beginDelegation("execute", undefined, "brief");
 	await f.controller.performWorkerDelegation({ runId: "run", requestId: "req", worker: f.worker, prompt: "work" }, { onEvent: ({ event }) => { if (event.type === "text_delta") observed.push(event.delta); } }, f.ports);
-	expect(observed).toEqual(["right"]);
+	expect(observed).toEqual(["right", "dup", "unique", "untagged"]);
 });
 
 for (const harness of ["pi", "opencode"] as const) {
