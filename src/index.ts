@@ -1769,6 +1769,15 @@ export default function (pi: ExtensionAPI) {
 				} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
 				state.activeRun = undefined;
 				state.runId = undefined;
+			} else if (workspaceLease) {
+				// A settled lease adopted at startup from a previous process: release it.
+				if (workspaceLease.manifest.recovery !== "settled") {
+					ctx.ui.notify("Completed Fusion cleanup requires settled ownership; the retained record has an unsettled request. Reconcile or explicitly resolve it first.", "error");
+					return;
+				}
+				try {
+					await workspaceLease.release(); workspaceLease = undefined;
+				} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
 			}
 			disposeExecutor();
 			controller.clear();
@@ -1869,20 +1878,31 @@ export default function (pi: ExtensionAPI) {
 		syncFusionTools();
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		try {
 			syncFusionTools();
 		} catch {}
-		void unresolvedRuns(ctx.cwd)
-			.then((runs) => {
-				if (runs.length > 0) {
-					ctx.ui.notify(
-						"Interrupted Fusion run found. Use /fusion-resume or inspect it and use /fusion-resolve.",
-						"warning",
-					);
+		// A previous process may have left a settled run owning this workspace:
+		// adopt that claim so /fusion-clean can release it instead of leaving the
+		// ownership record permanently stranded.
+		try {
+			if (!workspaceLease) {
+				const owned = await (await registry()).inspect(await canonical(ctx.cwd));
+				if (owned && owned.manifest.recovery === "settled" && owned.manifest.owner.harness === "pi" &&
+					owned.manifest.owner.workspace === await canonical(ctx.cwd) && owned.manifest.owner.supervisorId === ctx.sessionManager.getSessionId()) {
+					workspaceLease = await (await registry()).claim(owned.manifest, owned.token);
 				}
-			})
-			.catch(() => {});
+			}
+		} catch { /* Fail closed: an unreadable ownership record stays owned. */ }
+		try {
+			const runs = await unresolvedRuns(ctx.cwd);
+			if (runs.length > 0) {
+				ctx.ui.notify(
+					"Interrupted Fusion run found. Use /fusion-resume or inspect it and use /fusion-resolve.",
+					"warning",
+				);
+			}
+		} catch { /* Interrupted discovery stays silent; the guards re-check later. */ }
 	});
 
 	pi.on("session_shutdown", async () => {

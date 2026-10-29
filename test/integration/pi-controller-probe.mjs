@@ -341,6 +341,26 @@ test("a settlement storage failure retains the pending request and blocks cleanu
 	} finally { await chmod(readDir, 0o755).catch(() => {}); }
 });
 
+test("a completed run's settled ownership is releasable after restart", async () => {
+	const cwd = join(root, "settled-ownership-restart");
+	await mkdir(cwd, { recursive: true });
+	const first = makePi(cwd);
+	await first.commands.get("fusion").handler("original task", first.ctx);
+	expect((await first.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, first.ctx)).details.error).toBeUndefined();
+	// Skip cleanup: shutdown leaves the settled ownership record behind.
+	await first.hooks.get("session_shutdown")();
+	const resumed = makePi(cwd);
+	await resumed.hooks.get("session_start")({}, resumed.ctx);
+	await resumed.commands.get("fusion-clean").handler("", resumed.ctx);
+	expect(resumed.notifications.at(-1)).toContain("cleared");
+	// Ownership was actually released: a fresh run can claim the workspace.
+	const second = makePi(cwd);
+	await second.hooks.get("session_start")({}, second.ctx);
+	await second.commands.get("fusion").handler("second task", second.ctx);
+	expect((await second.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, second.ctx)).details.error).toBeUndefined();
+	await second.commands.get("fusion-clean").handler("", second.ctx);
+});
+
 test("a workspace cannot claim ownership when its registry directory is unusable", async () => {
 	const cwd = join(root, "registry-conflict-workspace");
 	await mkdir(cwd, { recursive: true });
