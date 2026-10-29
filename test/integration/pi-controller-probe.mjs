@@ -78,7 +78,7 @@ test("Pi keeps pre-submission revisions retryable and blocks an uncertain final 
 	expect(prompts).toBe(3);
 });
 
-function makePi(cwd) {
+function makePi(cwd, supervisorId = "supervisor") {
 	process.env.FUSION_OWNERSHIP_DIR = join(cwd, ".test-state");
 	const tools = new Map(), commands = new Map(), hooks = new Map(), notifications = [];
 	let active = [], confirmed = false;
@@ -87,7 +87,7 @@ function makePi(cwd) {
 		setModel: async () => true, setThinkingLevel: () => {}, sendUserMessage: () => {}, exec: async () => ({ code: 1, stdout: "" }) };
 	const model = { provider: "fake", id: "glm-5", name: "GLM 5", reasoning: false, cost: { output: 1 } };
 	const supervisor = { provider: "fake", id: "gpt-6", name: "GPT 6", reasoning: false, cost: { output: 20 } };
-	const ctx = { cwd, sessionManager: { getSessionId: () => "supervisor" }, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { find: () => model, getAvailable: () => [supervisor, model] },
+	const ctx = { cwd, sessionManager: { getSessionId: () => supervisorId }, hasUI: true, mode: "rpc", scopedModels: [], modelRegistry: { find: () => model, getAvailable: () => [supervisor, model] },
 		waitForIdle: async () => {}, ui: { notify: (message) => notifications.push(message), input: async () => "",
 			select: async (_title, options) => options[0], confirm: async () => confirmed, setWidget: () => {} } };
 	registerFusion(pi);
@@ -361,6 +361,26 @@ test("a completed run's settled ownership is releasable after restart", async ()
 	await second.commands.get("fusion-clean").handler("", second.ctx);
 });
 
+test("a fresh session releases a prior run's settled ownership by explicit cleanup", async () => {
+	const cwd = join(root, "settled-ownership-fresh-session");
+	await mkdir(cwd, { recursive: true });
+	const first = makePi(cwd);
+	await first.commands.get("fusion").handler("original task", first.ctx);
+	expect((await first.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "build" }, undefined, undefined, first.ctx)).details.error).toBeUndefined();
+	await first.hooks.get("session_shutdown")();
+	// A fresh session ID cannot adopt the prior owner, and startup does not:
+	// guarded cleanup after confirming the record is settled does the release.
+	const resumed = makePi(cwd, "fresh-session");
+	await resumed.hooks.get("session_start")({}, resumed.ctx);
+	await resumed.commands.get("fusion-clean").handler("", resumed.ctx);
+	expect(resumed.notifications.at(-1)).toContain("cleared");
+	const next = makePi(cwd, "next-session");
+	await next.hooks.get("session_start")({}, next.ctx);
+	await next.commands.get("fusion").handler("second task", next.ctx);
+	expect((await next.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, next.ctx)).details.error).toBeUndefined();
+	await next.commands.get("fusion-clean").handler("", next.ctx);
+});
+
 test("a workspace cannot claim ownership when its registry directory is unusable", async () => {
 	const cwd = join(root, "registry-conflict-workspace");
 	await mkdir(cwd, { recursive: true });
@@ -371,7 +391,7 @@ test("a workspace cannot claim ownership when its registry directory is unusable
 	await expect(f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx)).rejects.toThrow(/ownership registry is unavailable/);
 	expect(prompts).toBe(before);
 	await expect(f.commands.get("fusion-clean").handler("", f.ctx)).resolves.toBeUndefined();
-	expect(f.notifications.at(-1)).toContain("cleared");
+	expect(f.notifications.at(-1)).toContain("Cannot clean Fusion");
 	await rm(join(cwd, ".test-state"));
 	const misconfigured = await f.tools.get("fusion_delegate").execute("call", { action: "execute", brief: "work" }, undefined, undefined, f.ctx);
 	expect(misconfigured.details.error).toContain("executor model is not configured");

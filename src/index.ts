@@ -1778,6 +1778,27 @@ export default function (pi: ExtensionAPI) {
 				try {
 					await workspaceLease.release(); workspaceLease = undefined;
 				} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
+			} else {
+				// A prior process's settled ownership is releasable from any fresh
+				// session, without adopting it: exact workspace, terminal recovery,
+				// and the claim's token guard guarantee the row is not live work.
+				const workspace = await canonical(ctx.cwd).catch((error) => { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return undefined; });
+				if (!workspace) return;
+				let owned: { token: string; manifest: RunManifest } | undefined;
+				try {
+					owned = await (await registry()).inspect(workspace);
+				} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
+				const exact = owned && owned.manifest.owner.workspace === workspace ? owned : undefined;
+				if (exact && exact.manifest.recovery !== "settled") {
+					ctx.ui.notify("Retained Fusion ownership has an unsettled request. Reconcile or explicitly resolve it first.", "error");
+					return;
+				}
+				if (exact) {
+					try {
+						const lease = await (await registry()).claim(exact.manifest, exact.token);
+						await lease.release();
+					} catch (error) { ctx.ui.notify(`Cannot clean Fusion: ${String(error)}`, "error"); return; }
+				}
 			}
 			disposeExecutor();
 			controller.clear();
