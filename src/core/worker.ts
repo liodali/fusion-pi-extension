@@ -127,4 +127,6 @@ export interface WorkerCapabilities {
 	idempotentSubmission: boolean;
 	readOnlyScout: boolean;
 	exactScoutToolLimit: boolean;
+	/** The runtime can interrupt a native child turn it owns; absence means unsupported. */
+	workerAbort: boolean;
 }

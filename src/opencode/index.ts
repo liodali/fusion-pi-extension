@@ -31,6 +31,8 @@ interface PluginContext {
 		context(input: { sessionID: string }): Promise<readonly unknown[]>;
 		get(input: { sessionID: string }): Promise<{ id: string; parentID?: string; location?: { directory?: string } }>;
 		hook(name: "context", callback: (event: { agent: string; tools: Record<string, unknown> }) => void): Promise<unknown>;
+		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
+		interrupt?(input: { sessionID: string }): Promise<unknown>;
 	};
 }
 
@@ -90,6 +92,7 @@ export default {
 			const runtime = createOpenCodeWorkerRuntime<ToolContext>({
 				execute: native!.execute,
 				contextFor: () => { if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
+				interrupt: typeof ctx.session.interrupt === "function" ? ((childSessionID: string) => Promise.resolve(ctx.session.interrupt!({ sessionID: childSessionID }))) : undefined,
 				validateReference: async (reference) => {
 					const [parent, child] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.get({ sessionID: reference.id })]);
 					if (parent.id !== sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace || child.id !== reference.id || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("OpenCode child ownership or workspace does not match.");

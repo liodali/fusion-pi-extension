@@ -299,6 +299,7 @@ export const PI_SESSION_CAPABILITIES: Readonly<WorkerCapabilities> = Object.free
 	activeTurnReattach: false,
 	durableExecution: false,
 	idempotentSubmission: false,
+	workerAbort: true,
 	readOnlyScout: true,
 	exactScoutToolLimit: false,
 });

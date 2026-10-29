@@ -291,7 +291,7 @@ export default function (pi: ExtensionAPI) {
 		let initial: RunManifest;
 		if (existing) initial = existing.manifest;
 		else if (run.manifest) initial = readRunManifest(run.manifest, { harness: "pi", workspace });
-		else initial = translatePiRun({ ...run, cwd: workspace }, currentOwner, backend?.capabilities ?? { transcriptReopen: false, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false });
+		else initial = translatePiRun({ ...run, cwd: workspace }, currentOwner, backend?.capabilities ?? { transcriptReopen: false, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false, workerAbort: false });
 		workspaceLease = await store.claim(initial, existing?.token);
 		lastWorkerResult = initial.lastResult;
 		run.manifest = initial;

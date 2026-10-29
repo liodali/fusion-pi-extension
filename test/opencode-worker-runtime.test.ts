@@ -76,8 +76,25 @@ test("validates reopened ownership and rejects unsupported operations", async ()
 	Object.assign(f.context, { sessionID: "wrong" });
 	const request = { runId: "r", requestId: "q", worker, prompt: "work" };
 	await expect(f.runtime.submit(request, { onEvent: () => {}, onReference: async () => {} })).rejects.toThrow("different supervisor");
-	await expect(f.runtime.abort(worker)).rejects.toThrow("not supported");
+	await expect(f.runtime.abort(worker)).rejects.toThrow("the host does not expose session interruption");
 	await f.runtime.release(worker);
+});
+
+test("abort interrupts the owned child when the host exposes interruption", async () => {
+	const interrupted: string[] = [];
+	const runtime = createOpenCodeWorkerRuntime({
+		execute: async () => ({ output: { sessionID: "child", status: "running", output: "pending" } }),
+		contextFor: () => ({ sessionID: "parent", signal: new AbortController().signal, progress: async () => {} }),
+		validateReference: async () => {},
+		interrupt: async (childSessionID) => { interrupted.push(childSessionID); },
+	});
+	expect(runtime.capabilities.workerAbort).toBe(true);
+	const referenceless = await runtime.create(owner, config);
+	await expect(runtime.abort(referenceless)).rejects.toThrow("no native child");
+	const worker = await runtime.open({ owner, runtime: "native-subagent", id: "child" }, config);
+	await runtime.abort(worker);
+	expect(interrupted).toEqual(["child"]);
+	await runtime.shutdown();
 });
 
 test("an uncertain child cannot be reopened to bypass its lock", async () => {

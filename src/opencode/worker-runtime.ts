@@ -22,11 +22,15 @@ export interface OpenCodeWorkerRuntime extends WorkerRuntime {
 	reconcile(request: WorkerTurnRequest, options: WorkerTurnOptions, wait: (childId: string, request: WorkerTurnRequest, signal: AbortSignal) => Promise<{ status: "completed" | "error" | "cancelled"; text: string }>, persistSettlement: (result: WorkerTurnResult) => Promise<void>): Promise<WorkerTurnResult>;
 }
 
-/** The host supplies the original tool context and validates ownership on reopen. */
+/** The host supplies the original tool context and validates ownership on reopen.
+ * `interrupt` is the host's native session interruption (session.interrupt in
+ * OpenCode v2); when absent, aborting an owned child is unsupported and the
+ * adapter must say so instead of implying the control exists. */
 export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params: {
 	execute: NativeSubagentExecute<C>;
 	contextFor: (request: WorkerTurnRequest) => C;
 	validateReference: (reference: WorkerReference) => Promise<void>;
+	interrupt?: (childSessionID: string) => Promise<unknown>;
 	agent?: string;
 }): OpenCodeWorkerRuntime {
 	const handles = new Set<Handle<C>>();
@@ -70,7 +74,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		return { runId: request.runId, requestId: request.requestId, worker: request.worker, role: "executor", status: "completed", text };
 	}
 	return {
-		capabilities: OPENCODE_CAPABILITIES,
+		capabilities: { ...OPENCODE_CAPABILITIES, workerAbort: !!params.interrupt },
 		async create(owner, config) { if (closed) throw new Error("OpenCode runtime is shut down."); check(owner, config); return make(owner, config); },
 		async restorePending(owner, config, pending, reference) {
 			if (closed) throw new Error("OpenCode runtime is shut down.");
@@ -151,7 +155,12 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 				return settled;
 			} finally { handle.active = false; }
 		},
-		async abort(worker) { valid(worker); throw new Error("OpenCode worker abort is not supported; use the host tool signal."); },
+		async abort(worker) {
+			const handle = valid(worker);
+			if (!params.interrupt) throw new Error("OpenCode worker abort is unavailable: the host does not expose session interruption.");
+			if (!handle.reference) throw new Error("OpenCode worker has no native child session to interrupt.");
+			await params.interrupt(handle.reference.id);
+		},
 		async release(worker) { const handle = valid(worker); if (handle.active || handle.uncertain || handle.unsettled) throw new Error("Cannot release an active, uncertain or unsettled OpenCode worker."); handles.delete(handle); },
 		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); closed = true; handles.clear(); },
 	};

@@ -23,7 +23,7 @@ export interface RunManifest {
 export interface ManifestScope { harness: string; workspace: string }
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const nonempty = (value: unknown): value is string => typeof value === "string" && !!value.trim();
-const capabilityKeys: (keyof WorkerCapabilities)[] = ["transcriptReopen", "activeTurnReattach", "durableExecution", "idempotentSubmission", "readOnlyScout", "exactScoutToolLimit"];
+const capabilityKeys: (keyof WorkerCapabilities)[] = ["transcriptReopen", "activeTurnReattach", "durableExecution", "idempotentSubmission", "readOnlyScout", "exactScoutToolLimit", "workerAbort"];
 
 function ownerIs(value: unknown, scope: ManifestScope): value is WorkerOwner {
 	return object(value) && nonempty(value.harness) && nonempty(value.workspace) && value.harness === scope.harness && value.workspace === scope.workspace && nonempty(value.supervisorId);

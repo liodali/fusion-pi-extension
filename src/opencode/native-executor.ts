@@ -1,6 +1,8 @@
 import type { WorkerCapabilities } from "../core/worker.ts";
 
-/** Capabilities describe guarantees Fusion has verified at this boundary. */
+/** Capabilities describe guarantees Fusion has verified at this boundary.
+ * The static shape records the verified floor; the OpenCode runtime widens
+ * `workerAbort` when the host exposes session interruption. */
 export const OPENCODE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.freeze({
 	transcriptReopen: true,
 	activeTurnReattach: false,
@@ -8,6 +10,7 @@ export const OPENCODE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.freeze
 	idempotentSubmission: false,
 	readOnlyScout: false,
 	exactScoutToolLimit: false,
+	workerAbort: false,
 });
 
 /** Narrow boundary around OpenCode v2's native `subagent` tool executor. */
