@@ -21,7 +21,7 @@ import fusion from "../fusion/opencode/index.ts";
 export default {
   id: "fusion-smoke",
   async setup(ctx) {
-    const result = { version: ctx.app.version, nativeFound: false, registered: false, catalogModels: 0, catalogProviders: 0, configureValidated: false, configureApplied: false, runStarted: false, nativeInvoked: false, recursiveRefused: false };
+    const result = { version: ctx.app.version, nativeFound: false, registered: false, catalogModels: 0, catalogProviders: 0, configureValidated: false, configureApplied: false, runStarted: false, agentSwitch: false, messageIdReused: false, nativeInvoked: false, recursiveRefused: false };
     try {
       const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
       if (!native || typeof native.execute !== "function") throw new Error("Native subagent executor is unavailable");
@@ -39,6 +39,13 @@ export default {
       result.catalogProviders = [...new Set(usable.map((m) => m.providerID))].length;
       if (!(usable.length > 0)) throw new Error("The host model catalog was empty or malformed");
       const parent = await ctx.session.create({});
+      await ctx.session.switchAgent({ sessionID: parent.id, agent: "fusion" });
+      const switched = await ctx.session.context({ sessionID: parent.id });
+      result.agentSwitch = switched.some((entry) => entry.type === "agent-switched" && entry.agent === "fusion");
+      const probeID = "msg_fusion_smoke_repeated_id";
+      const firstMessage = await ctx.session.synthetic({ sessionID: parent.id, id: probeID, text: "Fusion ID probe", description: "Fusion ID probe", resume: false });
+      const secondMessage = await ctx.session.synthetic({ sessionID: parent.id, id: probeID, text: "Fusion ID probe", description: "Fusion ID probe", resume: false });
+      result.messageIdReused = firstMessage.id === probeID && secondMessage.id === probeID;
       const toolContext = { sessionID: parent.id, agent: "fusion", messageID: "msg_start_probe", id: "call_start_probe", signal: new AbortController().signal, progress: async () => {} };
       await registered.find((tool) => tool.id === "fusion_start").execute({ task: "Original smoke task" }, toolContext);
       const state = JSON.parse((await registered.find((tool) => tool.id === "fusion_status").execute({}, toolContext)).content);
@@ -128,6 +135,10 @@ export default {
 	const commandSessionID = commandSessionBody.id ?? commandSessionBody.data?.id;
 	const commandInvoked = await fetch(`${url}/api/session/${commandSessionID}/command`, { method: "POST", headers: { authorization: authHeader2, "content-type": "application/json" }, body: JSON.stringify({ name: "fusion-status", text: "" }) });
 	assert.ok(commandInvoked.status >= 200 && commandInvoked.status < 300, `fusion-status command invocation failed (${commandInvoked.status})`);
+	const inboxResponse = await fetch(`${url}/api/session/${commandSessionID}/inbox`, { headers: { authorization: authHeader2 } });
+	assert.equal(inboxResponse.status, 200, "Could not inspect the command output inbox");
+	const inbox = await inboxResponse.json();
+	assert.ok(inbox.data?.some((entry) => entry.type === "synthetic" && entry.payload?.description === "Fusion status" && typeof entry.payload?.text === "string" && entry.payload.text.includes("Fusion")), "Fusion status output was not delivered to the session inbox");
 	let result;
 	while (Date.now() < deadline) {
 		try { result = JSON.parse(await readFile(join(project, "probe-result.json"), "utf8")); break; }
@@ -141,6 +152,8 @@ export default {
 	assert.equal(result.configureValidated, true, result.error);
 	assert.equal(result.configureApplied, true, result.error);
 	assert.equal(result.runStarted, true, result.error);
+	assert.equal(result.agentSwitch, true, result.error);
+	assert.equal(result.messageIdReused, true, result.error);
 	assert.equal(result.nativeInvoked, true, result.error);
 	assert.equal(result.recursiveRefused, true, result.error);
 	console.log(JSON.stringify({ ...result, scope: "Fusion registration, run start/status/reset, native missing-parent rejection and recursive worker refusal; no model execution" }));

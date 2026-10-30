@@ -27,13 +27,125 @@ async function setupTest(context: TestContext, storage = memoryStorage()) {
 	if (!fixture) { fixture = { root: await mkdtemp(join(tmpdir(), "fusion-plugin-owner-")) }; ownershipFixtures.set(storage, fixture); fixtureCleanup.push(fixture); }
 	fixture.close?.();
 	const get = context.session.get ?? (async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: sessionID.startsWith("child") ? "one" : undefined, location: { directory: context.location.directory } }));
-	const result = await plugin.setup({ ...context, session: { ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path });
+	const result = await plugin.setup({ ...context, session: { switchAgent: async () => {}, synthetic: async () => {}, ...context.session, get }, storage }, { ownershipRoot: fixture.root, canonicalize: async (path) => path });
 	fixture.close = result.close;
 	return result;
 }
 
 describe("OpenCode Fusion plugin", () => {
-	test("registers native commands and /fusion starts a run and injects the supervisor prompt", async () => {
+	test("completion nudges are bounded and sent only for unfinished protocols", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const nudges: (string | undefined)[] = [];
+		const injections: (string | undefined)[] = [];
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, switchAgent: async () => {}, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id) injections.push(value.text); else nudges.push(value.text); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const settle = async (text?: string) => {
+			busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+			busWake?.();
+			if (text !== undefined) { busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } }); busWake?.(); }
+			busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+			busWake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		};
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
+		expect(injections).toHaveLength(1);
+		// Turn 1 ends without delegating: one bounded nudge tells the model to continue.
+		await settle("I looked around a little.");
+		expect(nudges).toHaveLength(1);
+		expect(nudges[0]).toContain('fusion_delegate with action "execute"');
+		// Turn 2: second and final nudge.
+		await settle("Still thinking.");
+		expect(nudges).toHaveLength(2);
+		// Turn 3: the nudge budget is exhausted; nothing loops.
+		await settle("Still thinking more.");
+		expect(nudges).toHaveLength(2);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.settleNudges).toBe(2);
+		// A turn that writes the Fusion summary after execution is complete: no nudge, run settles.
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await settle("All requirements audited.\n## Fusion summary\nDone.");
+		expect(nudges).toHaveLength(2);
+		// Interrupted turns never nudge.
+		busQueue.push({ type: "session.execution.interrupted", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(nudges).toHaveLength(2);
+	});
+
+	test("a backgrounded executor turn suppresses completion nudges and settles uncertain runs", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const nudges: (string | undefined)[] = [];
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, switchAgent: async () => {}, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id) injectionsGuard(value.text); else nudges.push(value.text); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-bg" });
+				// The host backgrounds the delegation; the turn ends awaiting its notification.
+				return { output: { sessionID: "child-bg", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const injectionsGuard = (text?: string) => { void text; };
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Build it" } });
+		// The host backgrounded the delegation: the tool resolves with the notice and the run is uncertain.
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		// The turn ends while the executor is backgrounded and the run is uncertain: no nudge.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(nudges).toHaveLength(0);
+	});
+
+	test("settled turns deactivate non-persistent runs and keep persistent ones", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		const runActive = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive;
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {}, switchAgent: async () => {}, prompt: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Task" } });
+		expect(await runActive()).toBe(true);
+		// Interrupted turn with mode off: the run deactivates.
+		busQueue.push({ type: "session.execution.interrupted", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(await runActive()).toBe(false);
+		// Persistent mode keeps the run active across turn ends.
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Task again" } });
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(await runActive()).toBe(true);
+	});
+
+	test("registers native commands and /fusion-run delivers the supervisor prompt with a reusable message id", async () => {
 		const tools = new Map<string, Tool>();
 		const storage = memoryStorage();
 		const commands: CommandDefinition[] = [];
@@ -59,6 +171,7 @@ describe("OpenCode Fusion plugin", () => {
 		expect(status.originalTask).toBe("Build the thing");
 		expect(status.runActive).toBe(true);
 		expect(status.workspaceClaimed).toBe(true);
+		await expect(commands[4].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "Another" } })).rejects.toThrow("Finish and reset");
 		// /fusion-status command reports the same payload as the tool.
 		const commandStatus = JSON.parse(String(await commands[2].execute({ sessionID: "one" })));
@@ -78,6 +191,48 @@ describe("OpenCode Fusion plugin", () => {
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async () => {} },
 		});
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "task" } })).rejects.toThrow("cannot inject the run prompt");
+	});
+
+	test("run command selects the Fusion agent and retries uncertain delivery with the same message ID after reload", async () => {
+		const storage = memoryStorage();
+		const tools = new Map<string, Tool>();
+		const messages: { id?: string; text?: string }[] = [];
+		const selections: string[] = [];
+		let fail = true;
+		const makeContext = (commands: CommandDefinition[]): TestContext => ({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, switchAgent: async ({ agent }) => { selections.push(agent); }, prompt: async (input) => {
+				messages.push(input);
+				if (fail) { fail = false; throw new Error("response lost after admission"); }
+			} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => { commands.push(command); } }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const first: CommandDefinition[] = [];
+		await setupTest(makeContext(first), storage);
+		await expect(first[0].execute({ sessionID: "one", prompt: { text: "Build it" } })).rejects.toThrow("Retry /fusion-run with the same task");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("delivery is unconfirmed");
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).promptDelivery).toBe("pending");
+		const second: CommandDefinition[] = [];
+		await setupTest(makeContext(second), storage);
+		await expect(second[0].execute({ sessionID: "one", prompt: { text: "Different task" } })).rejects.toThrow("Finish and reset");
+		await second[0].execute({ sessionID: "one", prompt: { text: "Build it" } });
+		expect(selections).toEqual(["fusion", "fusion"]);
+		expect(messages).toHaveLength(2);
+		expect(messages[0].id).toBeString();
+		expect(messages[1]).toEqual(messages[0]);
+	});
+
+	test("status and stats commands publish their results without resuming the model", async () => {
+		const commands: CommandDefinition[] = [];
+		const published: { sessionID: string; text: string; description?: string; resume?: boolean }[] = [];
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => { commands.push(command); } }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async () => {} },
+		});
+		await commands[2].execute({ sessionID: "one" });
+		await commands[3].execute({ sessionID: "one" });
+		expect(published).toEqual([{ sessionID: "one", description: "Fusion status", text: "No Fusion run in this session.", resume: false }, { sessionID: "one", description: "Fusion stats", text: "No Fusion run in this session.", resume: false }]);
 	});
 
 	test("persistent mode gates fusion tools per session until a run is active", async () => {
@@ -161,7 +316,7 @@ describe("OpenCode Fusion plugin", () => {
 		} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
 	});
 
-	test("fusion-clean releases a settled foreign record through claim-then-release", async () => {
+	test("fusion-clean refuses a foreign run that is active between worker turns", async () => {
 		const root = await mkdtemp(join(tmpdir(), "fusion-plugin-clean-settled-"));
 		const storage = memoryStorage();
 		const tools = new Map<string, Tool>();
@@ -181,14 +336,16 @@ describe("OpenCode Fusion plugin", () => {
 			const ownedStatus = JSON.parse((await tools.get("fusion_status")!.execute({}, context("B"))).content);
 			expect(ownedStatus.recovery).toBe("settled");
 			runId = ownedStatus.runId;
-			// Instance B adopts the settled record; clean from B's own session releases it.
+			await expect(commandsA.find((command) => command.name === "fusion-clean")!.execute({ sessionID: "B" })).rejects.toThrow("still active");
+			expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("A"))).content).workspaceClaimed).toBe(true);
+			// Instance B adopts the record, but the supervisor run is still active.
 			host.close(); host = undefined;
 			const commandsB: CommandDefinition[] = [];
 			let cleanB: ((args: { sessionID: string }) => unknown) | undefined;
 			host = await setupTest({ ...makeContext(commandsB), command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => unknown) => { await callback({ add: (command) => { commandsB.push(command); if (command.name === "fusion-clean") cleanB = command.execute; } }); } } } as TestContext, storage);
-			expect(await cleanB!({ sessionID: "B" })).toBe("Released settled Fusion ownership for this workspace.");
-			// The record is released: another session sees no Fusion run here.
-			expect(await tools.get("fusion_status")!.execute({}, context("B"))).toHaveProperty("content", "No Fusion run in this session.");
+			await expect(cleanB!({ sessionID: "B" })).rejects.toThrow("still active");
+			const retained = JSON.parse((await tools.get("fusion_status")!.execute({}, context("A"))).content);
+			expect(retained.workspaceClaimed).toBe(true);
 			expect(runId).toBeString();
 		} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
 	});
@@ -203,13 +360,14 @@ describe("OpenCode Fusion plugin", () => {
 			{ providerID: "prov", id: "no-variants", name: "No Variants", status: "active", enabled: true, cost: [{ output: 20 }] },
 			{ providerID: "other", id: "disabled-model", name: "Disabled", status: "active", enabled: false, cost: [] },
 		] }) };
-		await setupTest({ location: { directory: "/workspace" }, model: catalog, session: { context: async () => [], hook: async () => {} }, tool: {
+		const makeContext = (): TestContext => ({ location: { directory: "/workspace" }, model: catalog, session: { context: async () => [], hook: async () => {} }, tool: {
 			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
 				nativeInputs.push({ agent: input.agent, model: input.model });
 				return { output: { sessionID: input.agent === "fusion-scout" ? "scout" : "child", status: "completed", output: input.agent === "fusion-scout" ? "answer" : executorReport } };
 			} }],
 			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
-		} }, storage);
+		} });
+		await setupTest(makeContext(), storage);
 		const configure = tools.get("fusion_configure")!;
 		await expect(configure.execute({ provider: "prov", model: "missing-model" }, context("one"))).rejects.toThrow("not in the OpenCode model catalog");
 		await expect(configure.execute({ provider: "prov", model: "executor-model", variant: "turbo" }, context("one"))).rejects.toThrow('has no variant "turbo"');
@@ -234,8 +392,13 @@ describe("OpenCode Fusion plugin", () => {
 		// Reconfiguration after executor work applies to the next run only.
 		const later = await configure.execute({ provider: "prov", model: "no-variants" }, context("one"));
 		expect(later.metadata).toMatchObject({ applied: "next-run" });
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).model.modelId).toBe("executor-model");
+		await setupTest(makeContext(), storage);
 		await tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"));
 		expect(nativeInputs[2]).toEqual({ agent: "fusion-executor", model: "prov/executor-model#low" });
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "next run" }, context("one"));
+		expect(nativeInputs[3]).toEqual({ agent: "fusion-executor", model: "prov/no-variants" });
 	});
 
 	test("configure without a host catalog refuses honestly and fusion tools stay on host defaults", async () => {
@@ -253,6 +416,27 @@ describe("OpenCode Fusion plugin", () => {
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		// Without configuration no model override reaches the native call.
 		expect(modelSeen).toBe(false);
+	});
+
+	test("configuration blocks new work until its model choice is saved", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let release!: () => void, entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const waiting = new Promise<void>((resolve) => { entered = resolve; });
+		const storage = { ...backing, set: async (key: string, value: unknown) => { if (key.startsWith("model/")) { entered(); await gate; } await backing.set(key, value); } };
+		await setupTest({ location: { directory: "/workspace" }, model: { list: async () => ({ data: [{ providerID: "prov", id: "model", enabled: true }] }) },
+			session: { context: async () => [], hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { throw new Error("unexpected submission"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		const configure = tools.get("fusion_configure")!.execute({ provider: "prov", model: "model" }, context("one"));
+		await waiting;
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"))).rejects.toThrow("configuration is in progress");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("configuration is in progress");
+		release();
+		await configure;
 	});
 
 	test("persists the original request before delegation and retains it through the final fix after reload", async () => {

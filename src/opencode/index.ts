@@ -69,7 +69,9 @@ interface PluginContext {
 		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
 		interrupt?(input: { sessionID: string }): Promise<unknown>;
 		/** Present in OpenCode v2 hosts; absence leaves /fusion unable to inject the supervisor prompt. */
-		prompt?(input: { sessionID: string; text?: string }): Promise<unknown>;
+		prompt?(input: { sessionID: string; id?: string; text?: string }): Promise<unknown>;
+		switchAgent?(input: { sessionID: string; agent: string }): Promise<unknown>;
+		synthetic?(input: { sessionID: string; text: string; description?: string; resume?: boolean }): Promise<unknown>;
 	};
 	/** Pinned in OpenCode v2.2.2: options-object subscribe returning a lazy async iterable. Absence leaves worker events unsupported. */
 	event?: {
@@ -137,13 +139,25 @@ export default {
 		let owner: string | undefined;
 		let resetting = false;
 		let starting = false;
+		let configuring = false;
+		let promptInFlight = false;
+		const modelKey = `model/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
+		const storedModel = await ctx.storage.get(modelKey);
+		function readModel(value: unknown): WorkerModelConfig | undefined {
+			if (value === undefined || value === null) return undefined;
+			if (!value || typeof value !== "object") throw new Error("Invalid saved Fusion model configuration.");
+			const model = value as Record<string, unknown>;
+			if (typeof model.provider !== "string" || !model.provider.trim() || typeof model.modelId !== "string" || !model.modelId.trim() || (model.variant !== undefined && (typeof model.variant !== "string" || !model.variant.trim()))) throw new Error("Invalid saved Fusion model configuration.");
+			return { provider: model.provider, modelId: model.modelId, ...(typeof model.variant === "string" ? { variant: model.variant } : {}) };
+		}
+		let preferredModel = readModel(storedModel);
 		// Persistent mode (default off, persisted per location): when off, gated
 		// Fusion tools are visible to a fusion session only while a run is active;
 		// /fusion starts runs, so the user keeps explicit control.
 		let fusionMode = (await ctx.storage.get("fusion-mode")) === true;
 		const setFusionMode = async (enabled: boolean): Promise<void> => {
-			fusionMode = enabled;
 			await ctx.storage.set("fusion-mode", enabled);
+			fusionMode = enabled;
 		};
 		// One subscription fans every raw bus event out to each runtime's owned-child
 		// routing (one async iterable cannot be consumed twice). When the host does
@@ -217,6 +231,51 @@ export default {
 			entry.release?.();
 		};
 		busSinks.add(onScoutBusEvent);
+		// Supervisor-turn completion channel (pinned live on v2.2.3: every session
+		// turn ends in exactly one session.execution.succeeded | interrupted |
+		// failed event carrying the session ID; session.text.ended carries each
+		// text part's final text). A normal end feeds the shared completion
+		// policy: when the protocol is unfinished and the nudge budget allows, the
+		// controller's continuation text is sent as the next turn via
+		// session.prompt, bounded by MAX_SETTLE_NUDGES. Interrupted and failed
+		// turns never nudge, and the run settles either way.
+		const supervisorText = new Map<string, string>();
+		const onTurnBusEvent = (event: { type: string; data?: Record<string, unknown> }): void => {
+			const data = event.data && typeof event.data === "object" ? event.data : undefined;
+			const sessionID = data && typeof data.sessionID === "string" ? data.sessionID : undefined;
+			if (!sessionID) return;
+			const run = runs.get(sessionID);
+			if (!run) return;
+			if (event.type === "session.execution.started") {
+				supervisorText.delete(sessionID);
+				return;
+			}
+			if (event.type === "session.text.ended" && typeof data?.text === "string") {
+				const previous = supervisorText.get(sessionID);
+				supervisorText.set(sessionID, `${previous ? `${previous}\n` : ""}${data.text}`.slice(-20000));
+				return;
+			}
+			if (event.type === "session.execution.interrupted" || event.type === "session.execution.failed") {
+				// Cancelled or errored turns are settled without continuation.
+				supervisorText.delete(sessionID);
+				run.controller.settled(fusionMode);
+				return;
+			}
+			if (event.type !== "session.execution.succeeded") return;
+			const lastAssistantText = supervisorText.get(sessionID) ?? "";
+			supervisorText.delete(sessionID);
+			const status = run.runtime.status(run.handle);
+			// A backgrounded executor or in-flight reconciliation means the turn is
+			// not really settled: the completion notification steers what happens next.
+			const canContinue = !status.backgroundPending && !status.unsettled && !run.reconciling && !scoutInFlight;
+			const nudge = run.controller.continuation({ lastAssistantText, outcome: "completed", canContinue });
+			if (nudge && typeof ctx.session.prompt === "function") {
+				void Promise.resolve(ctx.session.prompt({ sessionID, text: nudge })).catch(() => {});
+				return;
+			}
+			if (!nudge) run.controller.settled(fusionMode);
+		};
+		busSinks.add(onTurnBusEvent);
 		function resolveScoutGuard(event: ToolHookEvent): ScoutGuardEntry | undefined {
 			if (typeof event.sessionID === "string" && event.sessionID) {
 				const tracked = scoutGuards.get(event.sessionID);
@@ -284,11 +343,12 @@ export default {
 			const reference = record?.worker;
 			// A configured model reaches the executor handle at creation; the scout
 			// role reads it per call from the run record.
-			const config: WorkerConfig = { role: "executor", ...(record?.model ? { model: record.model } : {}) };
+			const model = record ? record.model : preferredModel;
+			const config: WorkerConfig = { role: "executor", ...(model ? { model } : {}) };
 			const handle = record?.pending ? await runtime.restorePending(workerOwner, config, { runId, requestId: record.pending.requestId }, reference) : reference ? await runtime.open(reference, config) : await runtime.create(workerOwner, config);
 			if (record?.pending) controller.setPending({ action: record.pending.action, requestId: record.pending.requestId });
 			controller.setUncertain(!!record && record.recovery !== "settled");
-			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model: record?.model, adapterData: record?.adapterData, setContext(worker, context) { toolContexts.set(worker, context); } };
+			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model, adapterData: record?.adapterData, setContext(worker, context) { toolContexts.set(worker, context); } };
 		}
 		const store = createManifestStore({
 			read: () => ctx.storage.get(storageKey), write: async (value) => { await ctx.storage.set(storageKey, value); }, remove: async () => { await ctx.storage.remove(storageKey); },
@@ -327,6 +387,10 @@ export default {
 			const value = manifest(run);
 			await run.lease.save(value);
 			await store.save(value);
+		}
+		function hasUnconfirmedPrompt(run: Run): boolean {
+			const prompt = run.adapterData?.fusionPrompt;
+			return !!prompt && typeof prompt === "object" && (prompt as { state?: unknown }).state === "pending";
 		}
 		// The native executor is called directly below; model-originated calls pass
 		// through OpenCode's tool hook and must not bypass Fusion's run guards.
@@ -382,11 +446,11 @@ export default {
 		}
 		/** Shared run-start control behind fusion_start and the /fusion command. */
 		async function startRun(sessionID: string, task: string): Promise<Run> {
-			if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+			if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
 			if (owner && owner !== sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
 			if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before starting a run.");
 			const run = await runFor(sessionID);
-			if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+			if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
 			if (run.controller.state.runActive || run.controller.state.executed || run.controller.pending || run.controller.uncertain || run.reconciling) throw new Error("Finish and reset the existing Fusion run before starting another.");
 			starting = true;
 			const priorState = structuredClone(run.controller.state);
@@ -408,9 +472,11 @@ export default {
 		}
 		/** Release settled Fusion resources for a session, or a settled workspace record left by another one. */
 		async function cleanWorkspace(sessionID: string): Promise<string> {
-			if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
 			const run = runs.get(sessionID);
 			if (run) {
+				if (hasUnconfirmedPrompt(run)) throw new Error("Fusion prompt delivery is unconfirmed. Retry /fusion-run with the same task before cleaning.");
+				if (run.controller.state.runActive) throw new Error("The Fusion run is still active; finish and reset it before cleaning.");
 				const error = run.controller.resetError(false, run.reconciling);
 				if (error) throw new Error(`${error} Clean releases settled resources only.`);
 				if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before cleaning.");
@@ -425,21 +491,32 @@ export default {
 					return "Released Fusion resources for this session.";
 				} finally { resetting = false; }
 			}
-			const owned = await registry.inspect(workspace);
-			if (!owned) return "No Fusion resources to clean in this workspace.";
-			if (owned.manifest.recovery !== "settled") throw new Error(`The workspace Fusion record is ${owned.manifest.recovery}; reconcile it or run the explicit operator resolution before cleaning.`);
-			// An adopted run's held lease is the same record: release through it
-			// rather than claiming the workspace a second time in this process.
-			const holder = [...runs.values()].find((candidate) => candidate.lease && candidate.lease.manifest.runId === owned.manifest.runId);
-			if (holder?.lease) {
-				await holder.lease.release();
-				holder.lease = undefined;
+			resetting = true;
+			try {
+				const owned = await registry.inspect(workspace);
+				if (!owned) return "No Fusion resources to clean in this workspace.";
+				if (owned.manifest.recovery !== "settled") throw new Error(`The workspace Fusion record is ${owned.manifest.recovery}; reconcile it or run the explicit operator resolution before cleaning.`);
+				if (owned.manifest.state.runActive || scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion run or scout is still active; clean it from its owning session after it finishes.");
+				// An adopted run's held lease is the same record: release through it
+				// rather than claiming the workspace a second time in this process.
+				const holder = [...runs.values()].find((candidate) => candidate.lease && candidate.lease.manifest.runId === owned.manifest.runId);
+				if (holder?.lease) {
+					const error = holder.controller.resetError(false, holder.reconciling);
+					if (error || holder.controller.state.runActive) throw new Error("The owning Fusion run is still active; clean it from its owning session after it finishes.");
+					await store.removeSettled(holder.runId);
+					await holder.lease.release();
+					holder.lease = undefined;
+					await holder.runtime.release(holder.handle);
+					await holder.runtime.shutdown();
+					runs.delete(holder.handle.owner.supervisorId);
+					if (owner === holder.handle.owner.supervisorId) owner = undefined;
+					return "Released settled Fusion ownership for this workspace.";
+				}
+				// Claim-then-release archives the settled record without touching any transcript.
+				const lease = await registry.claim(owned.manifest, owned.token);
+				await lease.release();
 				return "Released settled Fusion ownership for this workspace.";
-			}
-			// Claim-then-release archives the settled record without touching any transcript.
-			const lease = await registry.claim(owned.manifest, owned.token);
-			await lease.release();
-			return "Released settled Fusion ownership for this workspace.";
+			} finally { resetting = false; }
 		}
 		async function statusContent(sessionID: string): Promise<string> {
 			const run = runs.get(sessionID);
@@ -449,14 +526,17 @@ export default {
 				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, nextAction: "Reconcile in the owning harness or explicitly resolve ownership after inspecting the worker and workspace." });
 			}
 			const status = run.runtime.status(run.handle);
+			const promptDelivery = run.adapterData?.fusionPrompt as { state?: unknown } | undefined;
 			const nextAction = run.controller.uncertain
 				? status.backgroundPending || status.unsettled
 					? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
 					: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
-				: !run.controller.state.executed
+					: promptDelivery?.state === "pending"
+						? "Prompt delivery is unconfirmed. Retry /fusion-run with the same task and message ID, or inspect the session before cleaning."
+					: !run.controller.state.executed
 					? "Investigate the original task, then call fusion_delegate with action execute."
 					: "Review the working tree and audit the original task; reset when the run is finished.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
 		}
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
@@ -493,27 +573,35 @@ export default {
 					const value = input as Record<string, unknown>;
 					if (typeof value.provider !== "string" || !value.provider.trim() || typeof value.model !== "string" || !value.model.trim() || (value.variant !== undefined && (typeof value.variant !== "string" || !value.variant.trim()))) throw new Error("Invalid Fusion configuration input.");
 					const { config, metadata } = await validateCatalogModel(value.provider.trim(), value.model.trim(), typeof value.variant === "string" ? value.variant.trim() : undefined);
-					const run = await runFor(context.sessionID);
-					const active = run.runtime.status(run.handle);
-					const workStarted = run.controller.state.executed || !!run.controller.pending || run.controller.uncertain || run.reconciling || active.backgrounded || active.backgroundPending || active.unsettled;
-					run.model = config;
-					// Recreate the executor handle only while it cannot have produced
-					// work: no submission yet and no native child to orphan.
-					let applied: "now" | "next-run";
-					let appliedReason = "";
-					if (!workStarted && !run.handle.reference) {
-						await run.runtime.release(run.handle);
-						run.handle = await run.runtime.create({ harness: "opencode", supervisorId: context.sessionID, workspace }, { role: "executor", model: config });
-						applied = "now";
-					} else {
-						applied = "next-run";
-						appliedReason = workStarted ? "executor work has already started" : "the executor child already exists";
-					}
-					if (run.lease) await persist(context.sessionID, run);
-					return {
-						content: `Fusion executor model configured for ${applied === "now" ? "this run" : `the next run (${appliedReason})`}: ${config.provider}/${config.modelId}${config.variant ? ` (variant ${config.variant})` : ""}. The scout uses the same model. ${JSON.stringify(metadata)}`,
-						metadata: { model: config, applied, ...metadata },
-					};
+					if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
+					configuring = true;
+					try {
+						const run = await runFor(context.sessionID);
+						const active = run.runtime.status(run.handle);
+						const workStarted = run.controller.state.executed || !!run.controller.pending || run.controller.uncertain || run.reconciling || active.backgrounded || active.backgroundPending || active.unsettled;
+						// Recreate the executor handle only while it cannot have produced
+						// work: no submission yet and no native child to orphan.
+						let applied: "now" | "next-run";
+						let appliedReason = "";
+						if (!workStarted && !run.handle.reference) {
+							const replacement = await run.runtime.create({ harness: "opencode", supervisorId: context.sessionID, workspace }, { role: "executor", model: config });
+							try { await ctx.storage.set(modelKey, config); } catch (error) { await run.runtime.release(replacement); throw error; }
+							await run.runtime.release(run.handle);
+							run.handle = replacement;
+							run.model = config;
+							applied = "now";
+						} else {
+							await ctx.storage.set(modelKey, config);
+							applied = "next-run";
+							appliedReason = workStarted ? "executor work has already started" : "the executor child already exists";
+						}
+						preferredModel = config;
+						if (run.lease) await persist(context.sessionID, run);
+						return {
+							content: `Fusion executor model configured for ${applied === "now" ? "this run" : `the next run (${appliedReason})`}: ${config.provider}/${config.modelId}${config.variant ? ` (variant ${config.variant})` : ""}. The scout uses its run's executor model. ${JSON.stringify(metadata)}`,
+							metadata: { model: config, applied, ...metadata },
+						};
+					} finally { configuring = false; }
 				},
 			});
 			editor.add({
@@ -523,13 +611,13 @@ export default {
 				options: { codemode: false },
 				async execute(input, context) {
 					requireSupervisor(context);
-					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
+					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					if (!input || typeof input !== "object") throw new Error("Invalid Fusion delegation input.");
 					const value = input as Record<string, unknown>;
 					if ((value.action !== "execute" && value.action !== "revise" && value.action !== "final_fix") || typeof value.brief !== "string" || !value.brief.trim() || (value.originalTask !== undefined && typeof value.originalTask !== "string")) throw new Error("Invalid Fusion delegation input.");
 					const action = value.action;
 					const run = await runFor(context.sessionID);
-					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
+					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					if (run.reconciling) throw new Error("Fusion reconciliation is already in progress.");
 					if (run.controller.uncertain) throw new Error("The executor's last turn has an unknown outcome. Review the child session and working tree before recovery; automatic retry is disabled.");
 					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
@@ -621,7 +709,7 @@ export default {
 				options: { codemode: false },
 				async execute(input, context) {
 					requireSupervisor(context);
-					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
+					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					if (!input || typeof input !== "object") throw new Error("Invalid Fusion scout input.");
 					const value = input as Record<string, unknown>;
 					if (!Array.isArray(value.questions) || value.questions.length < 1 || value.questions.length > 5 || !value.questions.every((question) => typeof question === "string" && !!question.trim())) throw new Error("Invalid Fusion scout input.");
@@ -631,7 +719,7 @@ export default {
 					// native call until a real delegation submits; the invocation budget
 					// is still the shared per-run controller budget.
 					const run = await runFor(context.sessionID);
-					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
+					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					// Set synchronously so concurrent tool calls cannot double-submit.
 					if (scoutInFlight) throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
 					if (scoutGuards.size >= MAX_TRACKED_SCOUTS) throw new Error("Fusion scout tracking is full; wait for an existing scout to stop.");
@@ -698,7 +786,7 @@ export default {
 				name: "fusion_reconcile", description: "Reconcile a backgrounded Fusion executor after OpenCode delivers its completion notification.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
-					if (resetting) throw new Error("Fusion reset is in progress.");
+					if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
 					const run = runs.get(context.sessionID);
 					if (!run?.controller.uncertain || !run.controller.pending || !run.runtime.status(run.handle).backgroundPending && !run.runtime.status(run.handle).unsettled) throw new Error("No backgrounded Fusion turn is available for reconciliation.");
 					if (run.controller.state.delegating || run.reconciling) throw new Error("Fusion reconciliation is already in progress.");
@@ -756,13 +844,15 @@ export default {
 				name: "fusion_reset", description: "Finish a settled Fusion run and release its workspace for another session.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
-					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
+					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
+					if (promptInFlight) throw new Error("Fusion prompt delivery is in progress.");
 					// Refuse before any mutation: dismantling storage, ownership, or the
 					// executor underneath an in-flight scout leaves the run partially
 					// reset and unrecoverable by retry.
 					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before resetting.");
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
+					if (hasUnconfirmedPrompt(run)) throw new Error("Fusion prompt delivery is unconfirmed. Retry /fusion-run with the same task before resetting.");
 					const error = run.controller.resetError(false, run.reconciling);
 					if (error) throw new Error(error);
 					resetting = true;
@@ -782,6 +872,11 @@ export default {
 		// v2.2.3: `execute` receives { sessionID, prompt: { text } } and its return
 		// value is presentation-only, so commands perform actions; the run's task
 		// prompt is injected through session.prompt).
+		async function reportCommand(sessionID: string, description: string, content: string): Promise<string> {
+			if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output; use the Fusion status or stats tool.");
+			await ctx.session.synthetic({ sessionID, text: content, description, resume: false });
+			return content;
+		}
 		await ctx.command?.transform?.((editor) => {
 			editor.add({
 				name: "fusion-run",
@@ -790,38 +885,62 @@ export default {
 					const task = args.prompt?.text?.trim();
 					if (!task) throw new Error("Provide a task: /fusion-run <task>");
 					if (typeof ctx.session.prompt !== "function") throw new Error("This host cannot inject the run prompt; tell the fusion agent the task directly instead.");
-					const run = await startRun(args.sessionID, task);
-					const label = run.model ? `${run.model.provider}/${run.model.modelId}${run.model.variant ? `#${run.model.variant}` : ""}` : "the host-configured model";
-					await ctx.session.prompt({ sessionID: args.sessionID, text: buildSupervisorPrompt(task, label) });
-					return `Fusion run started (${label}).`;
+					if (typeof ctx.session.switchAgent !== "function") throw new Error("This host cannot select the Fusion agent; select it before starting a run.");
+					if (promptInFlight) throw new Error("Fusion prompt delivery is already in progress.");
+					const existing = runs.get(args.sessionID);
+					const delivery = existing?.adapterData?.fusionPrompt as { id?: unknown; task?: unknown; state?: unknown } | undefined;
+					const retry = !!existing && delivery?.state === "pending" && delivery.task === task && typeof delivery.id === "string";
+					const run = retry ? existing! : await startRun(args.sessionID, task);
+					promptInFlight = true;
+					try {
+						const messageID = retry ? delivery!.id as string : `msg_fusion_${randomUUID().replaceAll("-", "")}`;
+						if (!retry) {
+							run.adapterData = { ...run.adapterData, fusionPrompt: { id: messageID, task, state: "pending" } };
+						}
+						await persist(args.sessionID, run);
+						const label = run.model ? `${run.model.provider}/${run.model.modelId}${run.model.variant ? `#${run.model.variant}` : ""}` : "the host-configured model";
+						await ctx.session.switchAgent({ sessionID: args.sessionID, agent: "fusion" });
+						await ctx.session.prompt({ sessionID: args.sessionID, id: messageID, text: buildSupervisorPrompt(task, label) });
+						run.adapterData = { ...run.adapterData, fusionPrompt: { id: messageID, task, state: "delivered" } };
+						try { await persist(args.sessionID, run); }
+						catch (error) { run.adapterData = { ...run.adapterData, fusionPrompt: { id: messageID, task, state: "pending" } }; throw error; }
+						return `Fusion run started (${label}).`;
+					} catch (error) {
+						throw new Error(`Fusion prompt delivery could not be confirmed. Retry /fusion-run with the same task to reuse the same message ID, or inspect the session before cleaning. ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+					} finally { promptInFlight = false; }
 				},
 			});
 			editor.add({
 				name: "fusion-mode",
 				description: "Toggle Fusion persistent mode [on|off]",
 				execute: async (args) => {
+					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
 					const arg = args.prompt?.text?.trim().toLowerCase();
-					const enabled = arg === "on" ? true : arg === "off" ? false : !fusionMode;
+					if (arg !== "on" && arg !== "off") throw new Error("Use /fusion-mode on or /fusion-mode off.");
+					const enabled = arg === "on";
 					await setFusionMode(enabled);
-					return enabled
+					return await reportCommand(args.sessionID, "Fusion mode", enabled
 						? "Fusion persistent mode enabled: fusion tools stay available to the fusion agent between runs."
-						: "Fusion persistent mode disabled: fusion tools require an active run (/fusion starts one).";
+						: "Fusion persistent mode disabled: fusion tools require an active run (/fusion-run starts one).");
 				},
 			});
 			editor.add({
 				name: "fusion-status",
 				description: "Show the current Fusion run state",
-				execute: async (args) => await statusContent(args.sessionID),
+				execute: async (args) => await reportCommand(args.sessionID, "Fusion status", await statusContent(args.sessionID)),
 			});
 			editor.add({
 				name: "fusion-stats",
 				description: "Show the current Fusion run's budgets",
-				execute: async (args) => statsContent(args.sessionID),
+				execute: async (args) => await reportCommand(args.sessionID, "Fusion stats", statsContent(args.sessionID)),
 			});
 			editor.add({
 				name: "fusion-clean",
 				description: "Release settled Fusion resources for this workspace",
-				execute: async (args) => await cleanWorkspace(args.sessionID),
+				execute: async (args) => {
+					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					return await reportCommand(args.sessionID, "Fusion clean", await cleanWorkspace(args.sessionID));
+				},
 			});
 		});
 		// Embedding hosts may call this on unload. Process exit also releases SQLite locks.

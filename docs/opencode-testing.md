@@ -38,22 +38,30 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | Run control, status, budget stats (M6.1) | `fusion_start` retains the original task and claims the workspace; `fusion_status` shows claim/capabilities/next action; `fusion_stats` shows budgets with usage explicitly unavailable | Unit tests; model-free live v2.2.3 session start → status → stats → reset |
 | Configure and model validation (M6.2) | `fusion_configure` validates provider/model/variant against the live catalog; configured model reaches scout and executor submissions; shared price/cohort metadata reported | Unit tests; model-free live catalog + configure-unknown-refused/real-applied (v2.2.3); live scout child ran on the configured model (`opencode-go/glm-5.3-flash`), child session model observed |
 | Commands, persistent mode, clean (M6.3) | `fusion-run`, `fusion-mode`, `fusion-status`, `fusion-stats`, `fusion-clean` native commands; mode gates mutation tools per session; clean releases settled resources only | Unit tests (registration, /fusion-run prompt injection, mode gating + persistence, clean settled/foreign/uncertain); model-free live: all five commands in `/api/command` and `fusion-status` invoked through the command API (v2.2.3) |
+| Completion hooks, bounded nudges (M6.4) | Turn-end bus events feed the shared completion policy; nudges sent via session.prompt; interrupted/failed never nudge; runs settle per mode | Channel pinned live (v2.2.3 execution/text event shapes); unit-pinned nudge bound (2), summary suppression, backgrounded suppression, interrupt settle; live early-settle observation deferred to the M6.6 parity run |
 | Complete OpenCode Fusion workflow | No | Not ready to install/use |
 
 The core extraction is partial: the shared controller owns task transitions,
 pending and uncertain state, delegation guards, and the main delegation sequence;
 the adapters still own native worker handles, persistence, and presentation.
-The experimental OpenCode
-entrypoint exposes delegate, scout, status, reset, and reconciliation tools, with example agent files.
-It has no command registration. OpenCode plugin storage retains the
-workspace owner, original task, budgets, child ID and pending turn across reloads.
-It does not provide an atomic cross-process workspace lock; concurrent plugin
-instances or locations must not use the same workspace. The package
+The experimental OpenCode entrypoint exposes delegate, scout, status, reset,
+and reconciliation tools, native commands, and example agent files. OpenCode
+plugin storage and the shared ownership registry retain the workspace owner,
+original task, budgets, child ID and pending turn across reloads. The SQLite
+workspace coordinator excludes concurrent owners across processes. The package
 still requires Pi peers and is not independently packaged for OpenCode. Passing
 mock tests and the no-model smoke test does not establish harness parity.
 Any native delegation failure leaves the run uncertain and blocks
 reset/retry, even when no child ID was received. Inspect the native session and
 working tree before any manual recovery.
+
+Command output is admitted as a described synthetic message with `resume: false`;
+the v2.2.3 model-free test verifies its contents in the session inbox without
+starting a model. Display across OpenCode clients remains to be verified. If
+`/fusion-run` prompt delivery is unconfirmed, retry the same command and task;
+Fusion retains the original message ID and blocks cleanup until delivery is
+confirmed. A new model configured after work starts applies to the next run;
+the current child's model remains in its recovery record.
 
 For a stranded shared ownership record, first stop the coordinating Fusion host,
 verify that its worker and commands have stopped, and review the working tree.
