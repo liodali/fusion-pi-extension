@@ -213,6 +213,18 @@ describe("OpenCode Fusion plugin", () => {
 		expect(buildTools).toHaveProperty("subagent");
 		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"))).resolves.toHaveProperty("content");
 	});
+	test("fusion tools refuse every non-supervisor agent, including the executor", async () => {
+		const tools = new Map<string, Tool>();
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		for (const name of ["fusion_delegate", "fusion_status", "fusion_reconcile", "fusion_reset"]) {
+			await expect(tools.get(name)!.execute(name === "fusion_delegate" ? { action: "execute", brief: "recursion" } : {}, context("one", "fusion-executor"))).rejects.toThrow("only to the fusion primary agent");
+			await expect(tools.get(name)!.execute(name === "fusion_delegate" ? { action: "execute", brief: "recursion" } : {}, context("one", "general"))).rejects.toThrow("only to the fusion primary agent");
+		}
+	});
 
 	test("reconciles only a matching native background completion and retains the child", async () => {
 		const tools = new Map<string, Tool>();

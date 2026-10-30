@@ -21,7 +21,7 @@ import fusion from "../fusion/opencode/index.ts";
 export default {
   id: "fusion-smoke",
   async setup(ctx) {
-    const result = { version: ctx.app.version, nativeFound: false, registered: false, nativeInvoked: false };
+    const result = { version: ctx.app.version, nativeFound: false, registered: false, nativeInvoked: false, recursiveRefused: false };
     try {
       const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
       if (!native || typeof native.execute !== "function") throw new Error("Native subagent executor is unavailable");
@@ -37,6 +37,13 @@ export default {
       } catch (error) {
         if (!String(error).includes("Parent session not found")) throw error;
         result.nativeInvoked = true;
+      }
+      try {
+        await delegate.execute({ action: "execute", brief: "Probe only" }, { sessionID: "ses_fusion_probe_recursion", agent: "fusion-executor", messageID: "msg_probe2", id: "call_probe2", signal: new AbortController().signal, progress: async () => {} });
+        throw new Error("Recursive worker call unexpectedly succeeded");
+      } catch (error) {
+        if (!String(error).includes("only to the fusion primary agent")) throw error;
+        result.recursiveRefused = true;
       }
     } catch (error) { result.error = String(error); }
     await writeFile(join(ctx.location.directory, "probe-result.json"), JSON.stringify(result));
@@ -75,7 +82,8 @@ export default {
 	assert.equal(result.nativeFound, true, result.error);
 	assert.equal(result.registered, true, result.error);
 	assert.equal(result.nativeInvoked, true, result.error);
-	console.log(JSON.stringify({ ...result, scope: "Fusion plugin registration + native missing-parent rejection; no model execution" }));
+	assert.equal(result.recursiveRefused, true, result.error);
+	console.log(JSON.stringify({ ...result, scope: "Fusion plugin registration + native missing-parent rejection + recursive worker refusal; no model execution" }));
 } finally {
 	if (child && child.exitCode === null) {
 		child.kill("SIGTERM");
