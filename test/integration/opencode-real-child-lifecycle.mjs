@@ -81,6 +81,17 @@ async function withServer(name, options, run) {
 			const text = await readFile(agentPath, "utf8");
 			await writeFile(agentPath, text.replace("mode: subagent", `mode: subagent\nmodel: ${provider}/not-a-real-model-xyz`));
 		}
+		if (options?.probePrimaryAgent) {
+			await writeFile(join(project, ".opencode/agents/probe-primary.md"), [
+				"---",
+				"description: Drives a raw backgrounded subagent for probing",
+				"mode: primary",
+				"---",
+				"",
+				"Launch the requested subagent and report the launch result.",
+				"",
+			].join("\n"));
+		}
 		await writeFile(join(project, ".opencode/plugins/fusion.ts"), 'export { default } from "../fusion/opencode/index.ts";\n');
 		await writeFile(join(project, ".opencode/plugins/observer.ts"), OBSERVER);
 		await writeFile(join(project, "fixture.txt"), "seed line\n");
@@ -120,8 +131,8 @@ async function withServer(name, options, run) {
 						await new Promise((r) => setTimeout(r, 800));
 					}
 				};
-				const newParent = async () => {
-					const created = await api("/api/session", { method: "POST", body: JSON.stringify({ agent: "fusion", model: { providerID: provider, id: modelID } }) });
+				const newParent = async (agent = "fusion") => {
+					const created = await api("/api/session", { method: "POST", body: JSON.stringify({ agent, model: { providerID: provider, id: modelID } }) });
 					assert.equal(created.status, 200, `session create failed: ${created.body.slice(0, 300)}`);
 					const info = created.json();
 					return info.id ?? info.data?.id;
@@ -243,6 +254,46 @@ await withServer("error", { bogusExecutorModel: true }, async ({ project, api, r
 	assert.ok(children.length <= 1, "Error path resubmitted children");
 	assert.equal(reportExists, false, "A failed child still produced the report");
 	if (synthetic) assert.equal(synthetic.metadata?.state, "error", "Error notification did not carry error");
+});
+
+// Scenario D: a genuinely backgrounded subagent job delivers the synthetic
+// completion notification; its metadata and text envelope must match the
+// adapter's notification matcher exactly.
+await withServer("notification", { probePrimaryAgent: true }, async ({ api, readBus, waitFor, newParent, prompt }) => {
+	const parent = await newParent("probe-primary");
+	await prompt(parent, "Use the subagent tool exactly once with agent \"general\", description \"bg probe\", the prompt \"Read fixture.txt and reply with exactly its first line\", and background set to true. Then reply with exactly: launched");
+	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "general")?.data?.sessionID, 60000, "background child session");
+	const synthetic = await waitFor(async () => {
+		const messages = await api(`/api/session/${parent}/message`);
+		const list = messages.json().data ?? messages.json();
+		return (Array.isArray(list) ? list : []).find((m) => m.type === "synthetic" && m.metadata?.source === "subagent" && m.metadata?.childID === child);
+	}, 180000, "synthetic notification for the backgrounded child");
+	const envelope = { description: synthetic.description, metadata: synthetic.metadata, textStart: String(synthetic.text).slice(0, 80), textEnd: String(synthetic.text).slice(-40) };
+	const evidence = { scenario: "notification", child, notificationState: synthetic.metadata?.state, envelope };
+	results.push(evidence);
+	console.log(JSON.stringify(evidence));
+	assert.equal(synthetic.metadata?.state, "completed", "Background notification did not complete");
+	assert.ok(String(synthetic.text).startsWith(`<subagent sessionID="${child}" state="completed" description="bg probe">`), "Notification text envelope does not match the adapter's matcher");
+	assert.ok(String(synthetic.text).endsWith("</subagent>"), "Notification text envelope is not closed");
+});
+
+// Scenario E: a backgrounded fusion-executor child - the notification metadata
+// must carry exactly the identity fields the adapter's matcher requires.
+await withServer("executor-notification", { probePrimaryAgent: true }, async ({ api, readBus, waitFor, newParent, prompt }) => {
+	const parent = await newParent("probe-primary");
+	await prompt(parent, "Use the subagent tool exactly once with agent \"fusion-executor\", description \"exec probe\", the prompt \"Read fixture.txt and reply with exactly its first line\", and background set to true. Then reply with exactly: launched");
+	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "fusion-executor")?.data?.sessionID, 60000, "background executor child session");
+	const synthetic = await waitFor(async () => {
+		const messages = await api(`/api/session/${parent}/message`);
+		const list = messages.json().data ?? messages.json();
+		return (Array.isArray(list) ? list : []).find((m) => m.type === "synthetic" && m.metadata?.source === "subagent" && m.metadata?.childID === child);
+	}, 180000, "synthetic notification for the backgrounded executor");
+	const evidence = { scenario: "executor-notification", child, notificationState: synthetic.metadata?.state, agentField: synthetic.metadata?.agent, description: synthetic.description, textStart: String(synthetic.text).slice(0, 90) };
+	results.push(evidence);
+	console.log(JSON.stringify(evidence));
+	assert.equal(synthetic.metadata?.state, "completed", "Executor background notification did not complete");
+	assert.equal(synthetic.metadata?.agent, "fusion-executor", "Notification agent field does not match the adapter's matcher");
+	assert.ok(String(synthetic.text).startsWith(`<subagent sessionID="${child}" state="completed" description="exec probe">`), "Notification text envelope does not match the adapter's matcher");
 });
 
 console.log(JSON.stringify({ verdict: "pass", scenarios: results.map((r) => r.scenario) }));
