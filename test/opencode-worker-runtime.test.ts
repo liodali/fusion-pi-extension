@@ -77,7 +77,7 @@ test("background reconciliation matches the pending request and never resubmits"
 
 test("validates reopened ownership and rejects unsupported operations", async () => {
 	const f = fixture(async () => ({}));
-	await expect(f.runtime.create(owner, { role: "scout", maxToolCalls: 2 })).rejects.toThrow("scout");
+	await expect(f.runtime.create(owner, { role: "scout", maxToolCalls: 0 })).rejects.toThrow("maxToolCalls");
 	const worker = await f.runtime.open({ owner, runtime: "native-subagent", id: "child" }, config);
 	Object.assign(f.context, { sessionID: "wrong" });
 	const request = { runId: "r", requestId: "q", worker, prompt: "work" };
@@ -485,4 +485,117 @@ test("a decreasing cumulative reading leaves turn usage unknown", async () => {
 	expect(second.usage).toBeUndefined();
 	await f.runtime.settle(request, async () => {});
 	await f.runtime.release(worker);
+});
+
+test("scouts run on their own disposable agent and never leave uncertain locks", async () => {
+	const agents: string[] = [];
+	const f = fixture(async (input) => {
+		agents.push(input.agent);
+		return { output: { sessionID: `scout-${agents.length}`, status: "completed", output: "answer with path:line citations" } };
+	});
+	const scout = await f.runtime.create(owner, { role: "scout", maxToolCalls: 2 });
+	const cap = f.runtime.scoutCap(scout, 2);
+	const result = await f.runtime.submit({ runId: "r", requestId: "s1", worker: scout, prompt: "questions" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(agents).toEqual(["fusion-scout"]);
+	expect(result).toMatchObject({ role: "scout", status: "completed", capped: false, requestId: "s1" });
+	// A disposable scout settles nothing: it is releasable and the runtime stays healthy.
+	await f.runtime.release(scout);
+	await f.runtime.shutdown();
+	expect(cap.count).toBe(0);
+});
+
+test("the scout cap reports capping from pre-execution refusals", async () => {
+	const f = fixture(async () => ({ output: { sessionID: "scout", status: "completed", output: "partial answer" } }));
+	const scout = await f.runtime.create(owner, { role: "scout", maxToolCalls: 2 });
+	const cap = f.runtime.scoutCap(scout, 2);
+	expect(cap.consume()).toBe("allow");
+	expect(cap.consume()).toBe("allow");
+	expect(cap.consume()).toBe("refuse");
+	expect(cap.consume()).toBe("refuse");
+	expect(cap.consume()).toBe("refuse");
+	expect(cap.consume()).toBe("terminate");
+	expect(cap.refused).toBe(true);
+	const result = await f.runtime.submit({ runId: "r", requestId: "s", worker: scout, prompt: "questions" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(result).toMatchObject({ role: "scout", capped: true });
+	// Double arming and executor handles are refused.
+	expect(() => f.runtime.scoutCap(scout, 2)).toThrow("already has a tool-call cap");
+	const executor = await f.runtime.create(owner, config);
+	expect(() => f.runtime.scoutCap(executor, 2)).toThrow("Only scout workers");
+	await f.runtime.release(scout);
+	await f.runtime.release(executor);
+});
+
+test("a cancelled scout is a known terminal result and leaves the runtime usable", async () => {
+	const controller = new AbortController();
+	let gate!: () => void;
+	const wait = new Promise<void>((resolve) => { gate = resolve; });
+	const f = fixture(async (input, ctx) => {
+		if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: "done" } };
+		await wait;
+		expect(ctx.signal.aborted).toBe(true);
+		throw new Error("aborted subagent");
+	});
+	const executor = await f.runtime.create(owner, config);
+	const scout = await f.runtime.create(owner, { role: "scout", maxToolCalls: 5 });
+	const cap = f.runtime.scoutCap(scout, 5);
+	const turn = f.runtime.submit({ runId: "r", requestId: "s", worker: scout, prompt: "slow questions" }, { signal: controller.signal, onEvent: () => {}, onReference: async () => {} });
+	controller.abort();
+	gate();
+	const result = await turn;
+	expect(result).toMatchObject({ role: "scout", status: "cancelled", capped: false });
+	// No uncertainty: the disposable scout releases cleanly and executor work continues.
+	await f.runtime.release(scout);
+	const executorResult = await f.runtime.submit({ runId: "r", requestId: "e", worker: executor, prompt: "real work" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(executorResult).toMatchObject({ role: "executor", status: "completed" });
+	await f.runtime.settle({ runId: "r", requestId: "e", worker: executor, prompt: "real work" }, async () => {});
+	await f.runtime.release(executor);
+	await f.runtime.shutdown();
+	expect(cap.count).toBe(0);
+});
+
+test("a failed scout submission stays releasable without poisoning the runtime", async () => {
+	const f = fixture(async (input) => {
+		if (input.agent === "fusion-scout") throw new Error("scout native failure");
+		return { output: { sessionID: "child", status: "completed", output: "done" } };
+	});
+	const scout = await f.runtime.create(owner, { role: "scout", maxToolCalls: 3 });
+	f.runtime.scoutCap(scout, 3);
+	await expect(f.runtime.submit({ runId: "r", requestId: "s", worker: scout, prompt: "questions" }, { onEvent: () => {}, onReference: async () => {} })).rejects.toThrow("scout native failure");
+	await f.runtime.release(scout);
+	const executor = await f.runtime.create(owner, config);
+	await f.runtime.submit({ runId: "r", requestId: "e", worker: executor, prompt: "work" }, { onEvent: () => {}, onReference: async () => {} });
+	await f.runtime.settle({ runId: "r", requestId: "e", worker: executor, prompt: "work" }, async () => {});
+	await f.runtime.release(executor);
+	await f.runtime.shutdown();
+});
+
+test("scout usage stays separate from executor accounting and uses its own child", async () => {
+	const children: string[] = [];
+	const sinks = new Set<(event: { id?: string; type: string; data?: Record<string, unknown> }) => void>();
+	const push = (event: { id?: string; type: string; data?: Record<string, unknown> }) => { for (const sink of sinks) sink(event); };
+	const runtime = createOpenCodeWorkerRuntime({
+		execute: async (input, ctx) => {
+			children.push(input.agent);
+			await ctx.progress({ sessionID: `${input.agent}-child`, status: "running" });
+			push({ id: `u-${input.agent}`, type: "session.usage.updated", data: { sessionID: `${input.agent}-child`, cost: 1, tokens: { input: 50, output: 25, reasoning: 0, cache: { read: 0, write: 0 } } } });
+			return { output: { sessionID: `${input.agent}-child`, status: "completed", output: "done" } };
+		},
+		contextFor: () => ({ sessionID: "parent", signal: new AbortController().signal, progress: async (_update: Record<string, unknown>) => {} }),
+		validateReference: async () => {},
+		bus: { add: (sink) => { sinks.add(sink); return () => { sinks.delete(sink); }; } },
+	});
+	const executor = await runtime.create(owner, config);
+	const scout = await runtime.create(owner, { role: "scout", maxToolCalls: 5 });
+	runtime.scoutCap(scout, 5);
+	const options = { onEvent: () => {}, onReference: async () => {} };
+	const executorResult = await runtime.submit({ runId: "r", requestId: "e", worker: executor, prompt: "work" }, options);
+	await runtime.settle({ runId: "r", requestId: "e", worker: executor, prompt: "work" }, async () => {});
+	const scoutResult = await runtime.submit({ runId: "r", requestId: "s", worker: scout, prompt: "questions" }, options);
+	// Each role reads its own child's cumulative readings; neither invents the other's tokens.
+	expect(executorResult.usage).toEqual({ inputTokens: 50, outputTokens: 25, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, cost: 1 });
+	expect(scoutResult.usage).toEqual({ inputTokens: 50, outputTokens: 25, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, cost: 1 });
+	expect(children).toEqual(["fusion-executor", "fusion-scout"]);
+	await runtime.release(executor);
+	await runtime.release(scout);
+	await runtime.shutdown();
 });

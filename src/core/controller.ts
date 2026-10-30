@@ -253,7 +253,12 @@ export class FusionController {
 		if (!this.state.delegating || this.activeAction !== "execute" || this.performing || this.submissionStarted || this.outcomeUnknown) {
 			throw new Error("An initial Fusion delegation must be acquired before starting execution.");
 		}
+		// The first execute starts the run for adapters without a separate run
+		// control. Scouting that preceded it belongs to the same session run, so
+		// its invocation budget survives; an explicit start() still resets it.
+		const scouted = this.state.scoutCalls;
 		this.initializeRun(task);
+		this.state.scoutCalls = scouted;
 		this.prepareExecution(brief);
 	}
 

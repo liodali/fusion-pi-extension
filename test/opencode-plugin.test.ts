@@ -9,7 +9,7 @@ import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
 import { readRunManifest } from "../src/core/manifest.ts";
 
 type Context = { sessionID: string; agent: string; signal: AbortSignal; progress: (update: Record<string, unknown>) => Promise<void> };
-type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string }> };
+type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string; metadata?: Record<string, unknown> }> };
 const context = (sessionID: string, agent = "fusion"): Context => ({ sessionID, agent, signal: new AbortController().signal, progress: async () => {} });
 
 function memoryStorage() {
@@ -225,6 +225,157 @@ describe("OpenCode Fusion plugin", () => {
 			await expect(tools.get(name)!.execute(name === "fusion_delegate" ? { action: "execute", brief: "recursion" } : {}, context("one", "general"))).rejects.toThrow("only to the fusion primary agent");
 		}
 	});
+
+	test("fusion_scout runs a disposable read-only scout through the shared invocation budget", async () => {
+		const tools = new Map<string, Tool>();
+		let scoutCalls = 0;
+		let executorCalls = 0;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				if (input.agent !== "fusion-scout") { executorCalls++; return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } }; }
+				scoutCalls++;
+				return { output: { sessionID: `scout-${scoutCalls}`, status: "completed", output: `1. fixture.txt:1 has the answer ${scoutCalls}` } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const scout = tools.get("fusion_scout")!;
+		const delegate = tools.get("fusion_delegate")!;
+		await expect(scout.execute({}, context("one"))).rejects.toThrow("Invalid Fusion scout input");
+		await expect(scout.execute({ questions: [] }, context("one"))).rejects.toThrow("Invalid Fusion scout input");
+		await expect(scout.execute({ questions: ["a", "b", "c", "d", "e", "f"] }, context("one"))).rejects.toThrow("Invalid Fusion scout input");
+		await expect(scout.execute({ questions: ["q"] }, context("one", "fusion-executor"))).rejects.toThrow("only to the fusion primary agent");
+		expect(scoutCalls).toBe(0);
+		// Scouting before any delegation lazily creates the session's run.
+		const first = await scout.execute({ questions: ["where is the answer?"] }, context("one"));
+		expect(first.content).toContain("1. fixture.txt:1 has the answer 1");
+		expect(first.content).toContain("Scout usage:");
+		expect(first.metadata).toMatchObject({ childSessionID: "scout-1", status: "completed", capped: false });
+		expect(executorCalls).toBe(0);
+		for (let i = 2; i <= 4; i++) await scout.execute({ questions: ["more"] }, context("one"));
+		expect(scoutCalls).toBe(4);
+		// The fifth call is refused by the shared budget before any native work.
+		const fifth = await scout.execute({ questions: ["again?"] }, context("one"));
+		expect(fifth.content).toContain("Scout limit reached");
+		expect(scoutCalls).toBe(4);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.scoutCalls).toBe(4);
+		// The same session's run still accepts a delegation after scouting.
+		await delegate.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(executorCalls).toBe(1);
+		// ... and the budget stays shared across the whole run.
+		expect((await scout.execute({ questions: ["more"] }, context("one"))).content).toContain("Scout limit reached");
+		expect(scoutCalls).toBe(4);
+	});
+
+	test("scout tool calls are capped synchronously before execution and allowlisted", async () => {
+		const tools = new Map<string, Tool>();
+		let before!: (event: { tool: string; agent: string; sessionID?: string }) => void;
+		const interrupted: string[] = [];
+		let release!: () => void, seen!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const entered = new Promise<void>((resolve) => { seen = resolve; });
+		let scoutRuns = 0;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {}, interrupt: async ({ sessionID }) => { interrupted.push(sessionID); } }, tool: {
+			hook: async (_name, callback) => { before = callback; },
+			list: async () => [{ id: "subagent", execute: async (input, ctx) => {
+				if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				scoutRuns++;
+				if (scoutRuns === 1) { await ctx.progress({ sessionID: "scout-1" }); seen(); await gate; }
+				return { output: { sessionID: `scout-${scoutRuns}`, status: "completed", output: "answer" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const scout = tools.get("fusion_scout")!;
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		const pending = scout.execute({ questions: ["q"] }, context("one"));
+		await entered;
+		// While the scout is in flight, its child's tool calls pass through this hook.
+		expect(() => before({ agent: "build", tool: "edit", sessionID: "scout-1" })).not.toThrow();
+		expect(() => before({ agent: "fusion-executor", tool: "edit", sessionID: "scout-1" })).not.toThrow();
+		// Non-allowlisted tools are denied before their effects, without consuming the cap.
+		expect(() => before({ agent: "fusion-scout", tool: "edit", sessionID: "scout-1" })).toThrow("denied before execution");
+		expect(() => before({ agent: "fusion-scout", tool: "shell", sessionID: "scout-1" })).toThrow("denied before execution");
+		expect(() => before({ agent: "fusion-scout", tool: "subagent", sessionID: "scout-1" })).toThrow("denied before execution");
+		expect(() => before({ agent: "fusion-scout", tool: "webfetch", sessionID: "scout-1" })).toThrow("denied before execution");
+		// Calls from other sessions never touch this scout's cap.
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "someone-else" })).not.toThrow();
+		// Exactly 20 read/search/list calls run; the 21st is refused before execution.
+		for (let i = 0; i < 20; i++) expect(() => before({ agent: "fusion-scout", tool: i % 2 ? "grep" : "read", sessionID: "scout-1" })).not.toThrow();
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-1" })).toThrow("Tool call limit reached");
+		// Refused attempts count too: the terminate window interrupts the child.
+		expect(() => before({ agent: "fusion-scout", tool: "glob", sessionID: "scout-1" })).toThrow("Tool call limit reached");
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-1" })).toThrow("Tool call limit reached");
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-1" })).toThrow("Tool call limit reached");
+		expect(interrupted).toEqual(["scout-1"]);
+		release();
+		const result = await pending;
+		expect(result.content).toContain("Scout stopped after 20 tool calls; partial answer:");
+		expect(result.metadata).toMatchObject({ capped: true, childSessionID: "scout-1" });
+		// The guard is disarmed after the turn: scout-agent events pass untouched.
+		expect(() => before({ agent: "fusion-scout", tool: "edit", sessionID: "scout-1" })).not.toThrow();
+	});
+
+	test("a cancelled scout is reported and leaves executor work unaffected", async () => {
+		const tools = new Map<string, Tool>();
+		let release!: () => void, seen!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const entered = new Promise<void>((resolve) => { seen = resolve; });
+		const calls: string[] = [];
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				calls.push(input.agent);
+				if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				seen();
+				await gate;
+				throw new Error("cancelled native call");
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const scout = tools.get("fusion_scout")!;
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		const controller = new AbortController();
+		const pending = scout.execute({ questions: ["q"] }, { ...context("one"), signal: controller.signal });
+		await entered;
+		controller.abort();
+		release();
+		const result = await pending;
+		expect(result.content).toContain(`stopped with status "cancelled"`);
+		expect(result.metadata).toMatchObject({ status: "cancelled" });
+		// The cancelled scout neither locked the run nor touched the executor child.
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).resolves.toHaveProperty("content");
+		expect(calls).toEqual(["fusion-executor", "fusion-scout", "fusion-executor"]);
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+	});
+
+	test("scouts are serialized and their release never blocks reset", async () => {
+		const tools = new Map<string, Tool>();
+		let release!: () => void, seen!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const entered = new Promise<void>((resolve) => { seen = resolve; });
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				seen();
+				await gate;
+				return { output: { sessionID: "scout", status: "completed", output: "answer" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const scout = tools.get("fusion_scout")!;
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		const pending = scout.execute({ questions: ["q"] }, context("one"));
+		await entered;
+		await expect(scout.execute({ questions: ["q"] }, context("one"))).rejects.toThrow("already running");
+		release();
+		const result = await pending;
+		expect(result.content).toContain("answer");
+		// The disposable scout released its handle, so reset is not blocked.
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).resolves.toHaveProperty("content", "Fusion run reset.");
+	});
+
 
 	test("reconciles only a matching native background completion and retains the child", async () => {
 		const tools = new Map<string, Tool>();

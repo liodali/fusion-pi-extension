@@ -1,8 +1,19 @@
 import type { ExecutorEvent, WorkerConfig, WorkerHandle, WorkerOwner, WorkerReference, WorkerRuntime, WorkerTurnOptions, WorkerTurnRequest, WorkerTurnResult, WorkerUsage } from "../core/worker.ts";
+import { scoutCapDecision } from "../core/scout.ts";
 import { createNativeExecutor, OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 
 const RUNTIME = "native-subagent";
+const SCOUT_AGENT = "fusion-scout";
 type Native<C extends NativeToolContext> = ReturnType<typeof createNativeExecutor<C>>;
+/** Synchronous pre-execution tool-call cap state for one scout handle. */
+type ScoutCapState = { max: number; count: number; refused: boolean };
+export interface ScoutCap {
+	/** Called once per scout child tool call, before that call executes. */
+	consume(): "allow" | "refuse" | "terminate";
+	/** True once at least one attempt was refused. */
+	readonly refused: boolean;
+	readonly count: number;
+}
 type Handle<C extends NativeToolContext> = WorkerHandle & {
 	native: Native<C>;
 	active: boolean;
@@ -12,6 +23,8 @@ type Handle<C extends NativeToolContext> = WorkerHandle & {
 	uncertain?: { runId: string; requestId: string };
 	unsettled?: WorkerTurnResult;
 	publish?: (id: string) => Promise<void>;
+	role: "executor" | "scout";
+	scoutCap?: ScoutCapState;
 };
 
 /** One raw host bus event, as pinned from OpenCode v2.2.2 (`GET /api/event` and the plugin `ctx.event.subscribe` stream). */
@@ -35,6 +48,13 @@ export interface OpenCodeWorkerRuntime extends WorkerRuntime {
 	reconcile(request: WorkerTurnRequest, options: WorkerTurnOptions, wait: (childId: string, request: WorkerTurnRequest, signal: AbortSignal) => Promise<{ status: "completed" | "error" | "cancelled"; text: string }>, persistSettlement: (result: WorkerTurnResult) => Promise<void>): Promise<WorkerTurnResult>;
 	/** Feed one raw host bus event into this runtime's owned-child routing. */
 	ingestBusEvent(event: OpenCodeBusEvent): void;
+	/**
+	 * Arm the synchronous pre-execution tool-call cap for a scout handle. The
+	 * adapter's execute.before hook consumes it before each scout child tool
+	 * call; the turn result reports `capped` from the same state. Throws for
+	 * executor handles or double arming.
+	 */
+	scoutCap(worker: WorkerHandle, maxToolCalls: number): ScoutCap;
 }
 
 /**
@@ -52,6 +72,8 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	validateReference: (reference: WorkerReference) => Promise<void>;
 	interrupt?: (childSessionID: string) => Promise<unknown>;
 	agent?: string;
+	/** Native subagent used for scout handles; defaults to "fusion-scout". */
+	scoutAgent?: string;
 	bus?: { add(sink: (event: OpenCodeBusEvent) => void): () => void };
 }): OpenCodeWorkerRuntime {
 	type ActiveTurn = { request: WorkerTurnRequest; options: WorkerTurnOptions; startedAt: number; baseline?: WorkerUsage; baselineVerified: boolean; sawUsage?: boolean; toolNames: Map<string, string> };
@@ -82,18 +104,19 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	}
 	function check(owner: WorkerOwner, config: WorkerConfig): void {
 		if (owner.harness !== "opencode" || !owner.supervisorId || !owner.workspace) throw new Error("Invalid OpenCode worker owner.");
-		if (config.role !== "executor") throw new Error("OpenCode scout is not supported.");
+		if (config.role === "scout" && (!Number.isSafeInteger(config.maxToolCalls) || config.maxToolCalls < 1)) throw new Error("OpenCode scout requires a positive maxToolCalls.");
 		if (config.model?.variant) throw new Error("OpenCode model variants are not supported by this adapter.");
 		if (config.model && (!config.model.provider || !config.model.modelId)) throw new Error("Invalid OpenCode worker model.");
 	}
 	function make(owner: WorkerOwner, config: WorkerConfig, childSessionID?: string, pending?: { runId: string; requestId: string }): Handle<C> {
 		const owned = Object.freeze({ ...owner });
 		let handle: Handle<C>;
-		const native = createNativeExecutor<C>({ parentSessionID: owned.supervisorId, agent: params.agent ?? "fusion-executor", execute: params.execute, childSessionID, pending: !!pending && !!childSessionID,
+		const agent = config.role === "scout" ? (params.scoutAgent ?? SCOUT_AGENT) : params.agent ?? "fusion-executor";
+		const native = createNativeExecutor<C>({ parentSessionID: owned.supervisorId, agent, execute: params.execute, childSessionID, pending: !!pending && !!childSessionID,
 			model: config.model ? `${config.model.provider}/${config.model.modelId}` : undefined,
 			onReference: async (id) => { assertUnowned(id, handle); if (!handle.publish) throw new Error("No active reference persistence callback."); await handle.publish(id); },
 		});
-		handle = { owner: owned, runtime: RUNTIME, get reference() { return native.childSessionID ? Object.freeze({ owner: owned, runtime: RUNTIME, id: native.childSessionID }) : undefined; }, native, active: false, createdFresh: !childSessionID, backgrounded: !!pending && !!childSessionID, uncertain: pending && { ...pending } };
+		handle = { owner: owned, runtime: RUNTIME, get reference() { return native.childSessionID ? Object.freeze({ owner: owned, runtime: RUNTIME, id: native.childSessionID }) : undefined; }, native, active: false, createdFresh: !childSessionID, backgrounded: !!pending && !!childSessionID, uncertain: pending && { ...pending }, role: config.role };
 		handles.add(handle);
 		return handle;
 	}
@@ -102,8 +125,10 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		if (original.sessionID !== request.worker.owner.supervisorId) throw new Error("OpenCode tool context belongs to a different supervisor.");
 		return options.signal ? { ...original, signal: AbortSignal.any([original.signal, options.signal]) } : original;
 	}
-	function result(request: WorkerTurnRequest, text: string): WorkerTurnResult {
-		return { runId: request.runId, requestId: request.requestId, worker: request.worker, role: "executor", status: "completed", text };
+	function result(request: WorkerTurnRequest, text: string, role: "executor" | "scout", capped = false): WorkerTurnResult {
+		return role === "scout"
+			? { runId: request.runId, requestId: request.requestId, worker: request.worker, role, status: "completed", text, capped }
+			: { runId: request.runId, requestId: request.requestId, worker: request.worker, role, status: "completed", text };
 	}
 	/** The delta of cumulative readings; any regression means the accounting model
 	 * broke (e.g. a host-side reset), so the turn's usage stays unknown. */
@@ -281,10 +306,21 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 				// only a verified baseline (or a provably fresh child) makes the
 				// cumulative reading attributable; anything else stays unknown.
 				const usage = registeredTurn?.sawUsage && registeredTurn.baselineVerified ? usageDelta(usageByChild.get(output.sessionID), registeredTurn.baseline) : undefined;
-				const completed = Object.freeze({ ...result(request, output.output), ...(usage ? { usage } : {}) });
-				handle.unsettled = completed;
+				const completed = Object.freeze({ ...result(request, output.output, handle.role, !!handle.scoutCap?.refused), ...(usage ? { usage } : {}) });
+				if (handle.role === "executor") handle.unsettled = completed;
 				return completed;
-			} catch (error) { handle.uncertain = { runId: request.runId, requestId: request.requestId }; handle.backgrounded = handle.native.backgroundPending; handle.native.markPending(); throw error; }
+			} catch (error) {
+				// Scouts are read-only and disposable: their outcome is never a
+				// duplicate-work hazard, so cancellation is a known terminal result and
+				// other failures leave the handle releasable instead of uncertain. A
+				// host that backgrounded the scout anyway keeps the child running; its
+				// notification matches no executor settlement and can be ignored.
+				if (handle.role === "scout") {
+					if (ctx.signal.aborted) return Object.freeze({ ...result(request, "", "scout"), status: "cancelled" as const, text: "", capped: false });
+					throw error;
+				}
+				handle.uncertain = { runId: request.runId, requestId: request.requestId }; handle.backgrounded = handle.native.backgroundPending; handle.native.markPending(); throw error;
+			}
 			finally { handle.active = false; handle.publish = undefined; if (registeredChild) activeTurns.delete(registeredChild); }
 		},
 		async reattach() { throw new Error("OpenCode active-turn reattachment is not supported; reconcile proven background completion instead."); },
@@ -311,7 +347,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 				handle.native.markReferencePublished();
 				let terminal: { status: "completed" | "error" | "cancelled"; text: string } | undefined;
 				const output = await handle.native.settleBackground(ctx, async (child, signal) => { terminal = await wait(child, request, signal); if (!terminal || !["completed", "error", "cancelled"].includes(terminal.status) || typeof terminal.text !== "string") throw new Error("Invalid OpenCode completion proof."); return terminal.text; });
-				const settled: WorkerTurnResult = { ...result(request, output.output), role: "executor", status: terminal!.status };
+				const settled: WorkerTurnResult = { ...result(request, output.output, handle.role), role: "executor", status: terminal!.status };
 				try { await persistSettlement(settled); } catch (error) { handle.native.markPending(); throw error; }
 				handle.uncertain = undefined;
 				handle.backgrounded = false;
@@ -327,5 +363,23 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		async release(worker) { const handle = valid(worker); if (handle.active || handle.uncertain || handle.unsettled) throw new Error("Cannot release an active, uncertain or unsettled OpenCode worker."); handles.delete(handle); },
 		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); unregisterBus?.(); closed = true; handles.clear(); deliveredIds.clear(); },
 		ingestBusEvent,
+		scoutCap(worker, maxToolCalls) {
+			const handle = valid(worker);
+			if (handle.role !== "scout") throw new Error("Only scout workers accept a tool-call cap.");
+			if (handle.scoutCap) throw new Error("This scout already has a tool-call cap.");
+			if (!Number.isSafeInteger(maxToolCalls) || maxToolCalls < 1) throw new Error("Scout cap must be a positive integer.");
+			const state: ScoutCapState = { max: maxToolCalls, count: 0, refused: false };
+			handle.scoutCap = state;
+			return {
+				consume: () => {
+					state.count += 1;
+					const decision = scoutCapDecision(state.count, state.max);
+					if (decision !== "allow") state.refused = true;
+					return decision;
+				},
+				get refused() { return state.refused; },
+				get count() { return state.count; },
+			};
+		},
 	};
 }

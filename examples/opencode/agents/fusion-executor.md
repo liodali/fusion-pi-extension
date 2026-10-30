@@ -8,6 +8,9 @@ permissions:
   - action: fusion_delegate
     resource: "*"
     effect: deny
+  - action: fusion_scout
+    resource: "*"
+    effect: deny
   - action: fusion_status
     resource: "*"
     effect: deny

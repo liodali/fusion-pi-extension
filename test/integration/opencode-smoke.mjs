@@ -29,7 +29,7 @@ export default {
       await fusion.setup(ctx);
       const registered = await ctx.tool.list();
       const delegate = registered.find((tool) => tool.id === "fusion_delegate");
-      result.registered = !!delegate && ["fusion_status", "fusion_reset", "fusion_reconcile"].every((id) => registered.some((tool) => tool.id === id));
+      result.registered = !!delegate && ["fusion_status", "fusion_reset", "fusion_reconcile", "fusion_scout"].every((id) => registered.some((tool) => tool.id === id));
       if (!result.registered) throw new Error("Fusion tools did not register");
       try {
         await delegate.execute({ action: "execute", brief: "Probe only" }, { sessionID: "ses_fusion_probe_missing", agent: "fusion", messageID: "msg_probe", id: "call_probe", signal: new AbortController().signal, progress: async () => {} });

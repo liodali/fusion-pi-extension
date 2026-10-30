@@ -1,27 +1,48 @@
 # OpenCode readiness and testing
 
+Current working-tree checkpoint: M1–M5 are complete at their acceptance levels
+(see the [implementation plan](./multi-harness-implementation-plan.md) for the
+per-milestone evidence). The notes below describe the validated baseline and
+the opt-in fixtures that maintain it. A two-process
+restart fixture uses a simulated subagent result and notification. A separate
+model-backed probe verifies recovery of a real notification already present before
+restart; completion after an in-flight restart remains unverified.
+
+The opt-in `FUSION_OPENCODE_MODEL=opencode-go/glm-5.3-flash bun run
+test:opencode-restart-live` probe forces a real native background child. In the
+earlier runs the edit occurred and the pending child was restored without another
+submission, but the matching native completion notification was absent after an
+in-flight restart, leaving reconciliation blocked. A later run waited for the
+real notification before restarting and successfully reconciled without another
+submission. Do not use file contents or child identity alone as settlement evidence.
+The child context lacked the request description and ended with a tool-call entry
+and an error entry. OpenCode's [open restart issue](https://github.com/anomalyco/opencode/issues/36349)
+describes a related parent completion gap; we have not established that it caused
+this specific probe result.
+
 Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 
 ## Current state
 
 | Area | Implemented | Verified |
 |---|---|---|
-| Shared lifecycle and delegation sequencing | In progress; both adapters call the same controller | Shared port tests, Pi entrypoint and OpenCode plugin regression tests |
-| Neutral worker contracts and Pi runtime isolation | Contracts and Pi session adapter extracted; runtime adoption remains | Dependency-free shared import test, Pi regressions, and type checking |
+| Shared lifecycle and delegation sequencing | Both entrypoints call the worker-backed controller | Shared port and acceptance tests, Pi entrypoint and OpenCode plugin regression tests |
+| Neutral worker contracts and Pi runtime isolation | Pi worker runtime wraps session and Durable backends | Dependency-free shared import test, fake-backend runtime tests, Pi regressions, and type checking |
 | Pi-only Durable directory | Yes | Existing regression tests; no new live durable run |
-| Native OpenCode executor wrapper | Prototype | Unit tests, including foreground-to-background handling |
-| Direct-delegation guard and background reconciliation | Versioned plugin-storage record and fail-closed recovery | Mock tests including reload; real enforcement and notifications not yet tested with a child |
+| Native OpenCode executor wrapper | Worker runtime adapter is wired into the entrypoint | Unit tests and isolated v2.2.0 GLM-5.3-Flash execute/revise/final-fix/reset workflow |
+| Direct-delegation guard and background reconciliation | Versioned plugin-storage record and fail-closed recovery | Mock tests and a real child notification retained before restart; in-flight restart remains unverified |
 | OpenCode plugin setup and native subagent registry | Experimental entrypoint | Isolated v2.2.0 registration and missing-parent smoke test |
 | Shared Git workspace evidence | Pi and OpenCode use the same snapshot/diff code | Real temporary Git worktree tests; OpenCode requires full review |
 | Actual executor child, revisions, and final fix | Experimental host wiring | Live v2.2.0 run with `opencode-go/glm-5.3-flash`, same child and expected final file |
+| Restricted scout (M5) | `fusion_scout` tool, `fusion-scout` agent, shared budget and formatter, pre-execution allowlist and tool cap | Unit tests; live v2.2.3 run with `opencode-go/glm-5.3-flash`: citations, untouched tree, 4-call budget refusal with no extra child, mid-scout interrupt with clean reset |
 | Complete OpenCode Fusion workflow | No | Not ready to install/use |
 
 The core extraction is partial: the shared controller owns task transitions,
 pending and uncertain state, delegation guards, and the main delegation sequence;
 the adapters still own native worker handles, persistence, and presentation.
 The experimental OpenCode
-entrypoint exposes delegate, status, reset, and reconciliation tools, with example agent files.
-It has no scout or command registration. OpenCode plugin storage retains the
+entrypoint exposes delegate, scout, status, reset, and reconciliation tools, with example agent files.
+It has no command registration. OpenCode plugin storage retains the
 workspace owner, original task, budgets, child ID and pending turn across reloads.
 It does not provide an atomic cross-process workspace lock; concurrent plugin
 instances or locations must not use the same workspace. The package
@@ -30,12 +51,22 @@ mock tests and the no-model smoke test does not establish harness parity.
 Any native delegation failure leaves the run uncertain and blocks
 reset/retry, even when no child ID was received. Inspect the native session and
 working tree before any manual recovery.
+
+For a stranded shared ownership record, first stop the coordinating Fusion host,
+verify that its worker and commands have stopped, and review the working tree.
+Use `fusion_status` or Pi's `/fusion-status` to obtain the run and pending request
+IDs. An operator can then run `bun src/workspace/resolve.ts <workspace> <run-id>
+<request-id|--no-request-id> --confirm-stopped`. This records the decision before
+releasing ownership; it does not stop a worker. The command refuses to resolve a
+different request or an owner with a live coordinator. The default registry is
+`~/.local/state/fusion/ownership`; if `FUSION_OWNERSHIP_DIR` is set, every harness
+using that workspace must use the same value.
 When OpenCode backgrounds a foreground delegation, wait for its completion
 notification and call `fusion_reconcile`. Fusion matches the child and unique
 turn description against the native notification before returning its report.
 Missing or mismatched notifications leave the run locked; errors with unknown
-submission state still require manual inspection. Reconciliation is not tested
-against a real child or a real OpenCode restart. If the pending child ID or its
+submission state still require manual inspection. A real child notification present before restart was reconciled after restart.
+If the pending child ID or its
 matching completion notification is unavailable, automatic recovery remains blocked.
 OpenCode's report compares Git status before and after the delegation, including
 hashes for pre-existing dirty files within the configured limit. It does not yet
@@ -96,6 +127,27 @@ supervisor called reset. The initial attempt used an expired legacy key; the
 successful run used the active v2 credential. This does not verify background
 reconciliation, cancellation, actual restart, or cross-process locking.
 
+The opt-in live scout fixture runs three scenarios against a real server and
+model (read-only citations with a byte-identical tree, the four-call budget
+refusal, and mid-scout supervisor interruption). Filter scenarios with
+`FUSION_SCOUT_ONLY=A,B,C`:
+
+```sh
+FUSION_OPENCODE_MODEL=provider/model bun run test:opencode-scout
+```
+
+On 2026-10-30 the scout fixture passed with OpenCode v2.2.3 and
+`opencode-go/glm-5.3-flash`: scenario A returned `notes.md:3`-style citations
+and usage readings from one disposable scout child with the working tree
+byte-identical; scenario B answered four calls, refused the fifth with the
+shared budget message and created exactly four scout children (parallel
+duplicate calls were refused by the serialization guard without consuming the
+budget); scenario C interrupted the supervisor mid-scout, observed
+`session.execution.interrupted` on the scout child, and completed a scripted
+reset with no lock. The 20-call tool cap was not exceeded live; its refusal
+and terminate paths are unit-pinned, and the guard itself runs on every scout
+tool call.
+
 To inspect the provider's model catalog in the same isolated setup without making
 a model request, set `FUSION_OPENCODE_LIST_MODELS=1` alongside the model variable.
 
@@ -144,6 +196,7 @@ Do not run editing agents against this development worktree for validation.
 | Initial execution | Child has expected parent, agent, model/variant and cwd; changes a fixture file; returns a parsable Fusion report |
 | Revision and final fix | Same child ID for all turns; separate briefs reach it; expected final diff; controller rejects budget overrun |
 | Scout restrictions | Read/search succeeds; edit, shell and recursive delegation are denied; tool cap stops the next call before execution |
+|                   | Covered 2026-10-30 by `test:opencode-scout` (v2.2.3, `opencode-go/glm-5.3-flash`) plus unit-pinned denial paths; the 20-call cap was not exceeded live |
 | Abort | Stop during a slow tool; child stops; no later edits; next delegation follows an explicit recovery decision |
 | Foreground becomes background | No revision or acceptance review while child runs; completion returns the report; failed waiting keeps delegation blocked |
 | Permissions | Parent deny remains effective in child; denied subagent launch is propagated without bypassing approval |

@@ -1,6 +1,6 @@
 import { FusionController } from "./core/controller.ts";
 import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
-import { piModelConfig } from "./pi/worker-translation.ts";
+import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
@@ -33,7 +33,6 @@ import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspace
 import {
 	MAX_SCOUT_TOOL_CALLS,
 	RENDER_THROTTLE_MS,
-	SCOUT_ANSWER_MAX_CHARS,
 	TOOL_STREAM_TAIL_LINES,
 	TRANSCRIPT_TAIL_LINES,
 } from "./limits.ts";
@@ -88,6 +87,7 @@ import {
 } from "./thinking.ts";
 import { createThrottle } from "./throttle.ts";
 import { normalizeTaskSize } from "./core/task-size.ts";
+import { formatScoutResponse } from "./core/scout.ts";
 import {
 	addUsage,
 	aggregateAssistantUsage,
@@ -1372,45 +1372,23 @@ export default function (pi: ExtensionAPI) {
 				const output = result;
 				const usage = result.usage;
 				state.scoutUsage = addUsage(state.scoutUsage, usage);
+				// Shared response policy: capping, truncation, status line, and usage.
+				// The adapter keeps its transcript, details, and rendering behavior.
+				const status = result.stopReason === "error" ? "error" : result.stopReason === "aborted" ? "cancelled" : "completed";
+				const { text, error } = formatScoutResponse({ status, text: output.text, errorMessage: output.errorMessage, capped, usage: piWorkerUsage(usage) });
 				if (capped && output.text.trim()) {
-					const partial =
-						output.text.trim().length <= SCOUT_ANSWER_MAX_CHARS
-							? output.text.trim()
-							: `${output.text.trim().slice(0, SCOUT_ANSWER_MAX_CHARS - 1)}…`;
 					appendScoutProgress(
 						`[capped] Scout stopped after ${MAX_SCOUT_TOOL_CALLS} tool calls.`,
 					);
-					renderThrottle.flush();
-					return respond(
-						`Scout stopped after ${MAX_SCOUT_TOOL_CALLS} tool calls; partial answer:\n${partial}\n\nScout usage: ${formatUsageSummary(usage)}`,
-						undefined,
-						usage,
-					);
-				}
-				if (output.stopReason === "error" || output.stopReason === "aborted") {
-					const reason = output.errorMessage ? `: ${output.errorMessage}` : "";
+				} else if (status === "error" || status === "cancelled") {
 					appendScoutProgress(
-						`[failed] Scout stopped with status "${output.stopReason}"${reason}.`,
+						`[failed] Scout stopped with status "${output.stopReason}"${output.errorMessage ? `: ${output.errorMessage}` : ""}.`,
 					);
-					renderThrottle.flush();
-					return respond(
-						`Fusion scout stopped with status "${output.stopReason}"${reason}.\n\nScout usage: ${formatUsageSummary(usage)}`,
-						output.errorMessage ?? output.stopReason,
-						usage,
-					);
+				} else {
+					appendScoutProgress("[done] Scout answered.");
 				}
-				const answer = (output.text || "The scout returned no answer.").trim();
-				const truncated =
-					answer.length <= SCOUT_ANSWER_MAX_CHARS
-						? answer
-						: `${answer.slice(0, SCOUT_ANSWER_MAX_CHARS - 1)}…`;
-				appendScoutProgress("[done] Scout answered.");
 				renderThrottle.flush();
-				return respond(
-					`${truncated}\n\nScout usage: ${formatUsageSummary(usage)}`,
-					undefined,
-					usage,
-				);
+				return respond(text, error, usage);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				appendScoutProgress(`[failed] ${message}`);

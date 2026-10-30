@@ -31,11 +31,4 @@ export function findArgv(input: FindInput): string[] {
 	return ["rg", "--files", "--glob", input.pattern, input.path ?? "."];
 }
 
-export function scoutCapDecision(
-	count: number,
-	max: number,
-): "allow" | "refuse" | "terminate" {
-	if (count <= max) return "allow";
-	if (count <= max + 3) return "refuse";
-	return "terminate";
-}
+export { scoutCapDecision } from "../../core/scout.ts";

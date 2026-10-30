@@ -2,14 +2,17 @@ import type { WorkerCapabilities } from "../core/worker.ts";
 
 /** Capabilities describe guarantees Fusion has verified at this boundary.
  * The static shape records the verified floor; the OpenCode runtime widens
- * `workerAbort` when the host exposes session interruption. */
+ * `workerAbort` when the host exposes session interruption and `workerEvents`
+ * when the host bus is available. */
 export const OPENCODE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.freeze({
 	transcriptReopen: true,
 	activeTurnReattach: false,
 	durableExecution: false,
 	idempotentSubmission: false,
-	readOnlyScout: false,
-	exactScoutToolLimit: false,
+	/** Scouts run as a dedicated read-only subagent with a tool allowlist. */
+	readOnlyScout: true,
+	/** The adapter refuses scout tool calls over the cap in execute.before, before effects occur. */
+	exactScoutToolLimit: true,
 	workerAbort: false,
 	/** Static floor: the runtime widens `workerEvents` when the host bus is available. */
 	workerEvents: false,

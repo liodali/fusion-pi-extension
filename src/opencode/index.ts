@@ -1,12 +1,13 @@
 import { FusionController } from "../core/controller.ts";
 import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunManifest } from "../core/manifest.ts";
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
-import { EXECUTOR_SYSTEM_PROMPT } from "../prompts.ts";
+import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt } from "../prompts.ts";
+import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse } from "../core/scout.ts";
 import { formatCompactReport } from "../report.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
-import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime } from "./worker-runtime.ts";
+import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
 import type { WorkerHandle, WorkerTurnRequest } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -19,13 +20,21 @@ interface ToolDefinition {
 	options: { codemode: false };
 	execute: (input: unknown, context: ToolContext) => Promise<{ content: string; metadata?: Record<string, unknown> }>;
 }
+/** Tool-call hook event. OpenCode v2.2.x pins `sessionID`, `messageID`, `id`, and `input`; older shapes carry only tool/agent. */
+interface ToolHookEvent {
+	tool: string;
+	agent: string;
+	/** Session that executes the tool; scout-child calls are counted by this ID. */
+	sessionID?: string;
+	input?: unknown;
+}
 interface PluginContext {
 	location: { directory: string };
 	storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<unknown>; remove(key: string): Promise<unknown> };
 	tool: {
 		list(): Promise<readonly { id: string; execute: NativeSubagentExecute<ToolContext> }[]>;
 		transform(callback: (editor: { add(tool: ToolDefinition): void }) => void): Promise<unknown>;
-		hook(name: "execute.before", callback: (event: { tool: string; agent: string }) => void): Promise<unknown>;
+		hook(name: "execute.before", callback: (event: ToolHookEvent) => void): Promise<unknown>;
 	};
 	session: {
 		context(input: { sessionID: string }): Promise<readonly unknown[]>;
@@ -39,6 +48,11 @@ interface PluginContext {
 		subscribe(options?: { types?: string[]; signal?: AbortSignal }): AsyncIterable<{ id?: string; type: string; data?: Record<string, unknown> }>;
 	};
 }
+
+/** Dedicated disposable read-only scout subagent. */
+const SCOUT_AGENT = "fusion-scout";
+/** Read/search/list operations the scout may execute; everything else is refused before its effects occur. OpenCode v2 tool names. */
+const SCOUT_TOOLS = new Set(["read", "grep", "glob"]);
 
 interface Run {
 	controller: FusionController;
@@ -107,6 +121,34 @@ export default {
 			newRunId: () => randomUUID(),
 			newRequestId: (action: "execute" | "revise" | "final_fix" | "resume") => `Fusion ${action} ${randomUUID()}`,
 		};
+		// Armed while one fusion_scout turn is in flight. The host fires this hook
+		// synchronously before every tool execution (pinned in OpenCode v2.2.3:
+		// events carry the executing session), so refusing here denies the call
+		// before its effects occur — the exact-cap requirement for scouts.
+		let scoutGuard: { cap: ScoutCap; terminate: () => void; childSessionID?: string } | undefined;
+		let scoutInFlight = false;
+		await ctx.tool.hook("execute.before", (event) => {
+			if (event.agent === "fusion" && event.tool === "subagent") throw new Error("Use fusion_delegate to start Fusion executor work.");
+			if (!scoutGuard || event.agent !== SCOUT_AGENT) return;
+			if (typeof event.sessionID === "string" && event.sessionID) {
+				// Bind to the first scout child seen; calls from any other session are
+				// not this scout's work and never touch its cap.
+				scoutGuard.childSessionID ??= event.sessionID;
+				if (event.sessionID !== scoutGuard.childSessionID) return;
+			}
+			if (!SCOUT_TOOLS.has(event.tool)) throw new Error(`Fusion scout may only use read, grep, and glob; "${event.tool}" is denied before execution.`);
+			const decision = scoutGuard.cap.consume();
+			if (decision === "allow") return;
+			if (decision === "terminate") scoutGuard.terminate();
+			throw new Error("Tool call limit reached. Answer now with what you have.");
+		});
+		await ctx.session.hook("context", (event) => {
+			if (event.agent === "fusion") delete event.tools.subagent;
+			// Defense in depth: hide every non-allowlisted tool from the scout agent
+			// when the host exposes child sessions here. The execute.before guard
+			// above stays the enforced boundary either way.
+			if (event.agent === SCOUT_AGENT) for (const name of Object.keys(event.tools)) if (!SCOUT_TOOLS.has(name)) delete event.tools[name];
+		});
 		const storageKey = `run/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
 		async function makeRun(sessionID: string, record?: RunManifest): Promise<Run> {
 			let toolContext: ToolContext | undefined;
@@ -171,12 +213,8 @@ export default {
 		}
 		// The native executor is called directly below; model-originated calls pass
 		// through OpenCode's tool hook and must not bypass Fusion's run guards.
-		await ctx.tool.hook("execute.before", (event) => {
-			if (event.agent === "fusion" && event.tool === "subagent") throw new Error("Use fusion_delegate to start Fusion executor work.");
-		});
-		await ctx.session.hook("context", (event) => {
-			if (event.agent === "fusion") delete event.tools.subagent;
-		});
+		// Both guards (subagent denial and scout cap) live in the single
+		// execute.before hook registered above.
 		function requireSupervisor(context: ToolContext): void {
 			if (context.agent !== "fusion") throw new Error("Fusion tools are available only to the fusion primary agent.");
 		}
@@ -287,6 +325,66 @@ export default {
 					} finally {
 						run.controller.endDelegation(action);
 					}
+				},
+			});
+			editor.add({
+				name: "fusion_scout",
+				description:
+					`Ask the Fusion scout read-only questions about this repository. Runs as an isolated disposable ${SCOUT_AGENT} subagent with read-only tools (read, grep, glob). Pass 1-5 questions; each call answers all of them with path:line citations. At most ${MAX_SCOUT_CALLS} calls per run.`,
+				input: { type: "object", properties: { questions: { type: "array", items: { type: "string", minLength: 1 }, minItems: 1, maxItems: 5 } }, required: ["questions"], additionalProperties: false },
+				options: { codemode: false },
+				async execute(input, context) {
+					requireSupervisor(context);
+					if (resetting) throw new Error("Fusion reset is in progress.");
+					if (!input || typeof input !== "object") throw new Error("Invalid Fusion scout input.");
+					const value = input as Record<string, unknown>;
+					if (!Array.isArray(value.questions) || value.questions.length < 1 || value.questions.length > 5 || !value.questions.every((question) => typeof question === "string" && !!question.trim())) throw new Error("Invalid Fusion scout input.");
+					const questions = value.questions as string[];
+					// Scouting precedes the first delegation, so it lazily creates this
+					// session's run. A scout-only run claims no workspace and makes no
+					// native call until a real delegation submits; the invocation budget
+					// is still the shared per-run controller budget.
+					const run = await runFor(context.sessionID);
+					// Set synchronously so concurrent tool calls cannot double-submit.
+					if (scoutInFlight) throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
+					scoutInFlight = true;
+					let handle: WorkerHandle | undefined;
+					const onAbort = () => scoutGuard?.terminate();
+					let response: { content: string; metadata?: Record<string, unknown> };
+					try {
+						const budgetError = run.controller.beginScout();
+						if (budgetError) return { content: budgetError };
+						// The invocation counter is advisory budget state; a failed advisory
+						// write must not block a read-only scout. Settlement writes keep
+						// their strict fault guarantees.
+						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
+						run.setContext(context);
+						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS });
+						const cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
+						scoutGuard = {
+							cap,
+							terminate: () => { void run.runtime.abort(handle!).catch(() => {}); },
+						};
+						context.signal.addEventListener("abort", onAbort, { once: true });
+						const requestId = `Fusion scout ${randomUUID()}`;
+						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
+						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async () => {} });
+						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
+						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
+						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
+					} finally {
+						context.signal.removeEventListener("abort", onAbort);
+						scoutGuard = undefined;
+						scoutInFlight = false;
+					}
+					// Dispose the disposable scout without deleting its transcript; a
+					// release refusal is surfaced without discarding the answer.
+					let releaseNote: string | undefined;
+					try { if (handle) await run.runtime.release(handle); } catch (error) { releaseNote = error instanceof Error ? error.message : String(error); }
+					return releaseNote ? { ...response, content: `${response.content}\n\n(Fusion scout could not be released: ${releaseNote})` } : response;
 				},
 			});
 			editor.add({
