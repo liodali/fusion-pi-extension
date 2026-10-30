@@ -329,7 +329,7 @@ export default {
 						const stat = await workspaceDiffStat(run.before, nodeGitExec);
 						run.before = undefined;
 						if (terminalState !== "completed") return { content: `Fusion executor ${terminalState}: ${result.text}\nReview the full working tree before deciding whether to revise.`, metadata: { childSessionID: run.handle.reference?.id, action: pending.action, status: terminalState } };
-						return { content: formatCompactReport(parsed.report, stat, parsed.prose, ["reconciled background turn; review the full working tree"]), metadata: { childSessionID: run.handle.reference?.id, action: pending.action } };
+						return { content: formatCompactReport(parsed.report, stat, parsed.prose, ["reconciled background turn; review the full working tree"]), metadata: { childSessionID: run.handle.reference?.id, action: pending.action, status: terminalState } };
 					} finally { run.reconciling = false; }
 				},
 			});

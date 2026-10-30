@@ -16,6 +16,8 @@ const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const provider = model.split("/")[0];
 const modelID = model.split("/")[1];
 const results = [];
+const ONLY = process.env.FUSION_LIFECYCLE_ONLY?.split(",").map((s) => s.trim()).filter(Boolean);
+const run = (name) => !ONLY || ONLY.includes(name);
 
 const OBSERVER = `
 import { appendFile, writeFile } from "node:fs/promises";
@@ -158,7 +160,7 @@ const LONG_BRIEF = 'Use fusion_delegate execute with this exact brief: read fixt
 
 // Scenario A: interrupt the owned child mid-turn; observe how the turn resolves
 // (foreground tool result vs backgrounded notification), then match cancelled.
-await withServer("cancelled", {}, async ({ api, readJson, readBus, waitFor, newParent, prompt }) => {
+if (run("cancelled")) await withServer("cancelled", {}, async ({ api, readJson, readBus, waitFor, newParent, prompt }) => {
 	const parent = await newParent();
 	await prompt(parent, LONG_BRIEF);
 	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "fusion-executor")?.data?.sessionID, 60000, "child session");
@@ -195,7 +197,7 @@ await withServer("cancelled", {}, async ({ api, readJson, readBus, waitFor, newP
 
 // Scenario B: interrupt the supervisor mid-turn; observe whether the child keeps
 // running (background) and how the completion is eventually delivered.
-await withServer("background", {}, async ({ api, readJson, readBus, waitFor, newParent, prompt }) => {
+if (run("background")) await withServer("background", {}, async ({ api, readJson, readBus, waitFor, newParent, prompt }) => {
 	const parent = await newParent();
 	await prompt(parent, LONG_BRIEF);
 	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "fusion-executor")?.data?.sessionID, 60000, "child session");
@@ -236,7 +238,7 @@ await withServer("background", {}, async ({ api, readJson, readBus, waitFor, new
 });
 
 // Scenario C: a deterministic child model error never fabricates a successful run.
-await withServer("error", { bogusExecutorModel: true }, async ({ project, api, readJson, readBus, newParent, prompt }) => {
+if (run("error")) await withServer("error", { bogusExecutorModel: true }, async ({ project, api, readJson, readBus, newParent, prompt }) => {
 	const parent = await newParent();
 	await prompt(parent, LONG_BRIEF);
 	// Wait for the delegation attempt to resolve (either a failed tool result or an error notification).
@@ -259,7 +261,7 @@ await withServer("error", { bogusExecutorModel: true }, async ({ project, api, r
 // Scenario D: a genuinely backgrounded subagent job delivers the synthetic
 // completion notification; its metadata and text envelope must match the
 // adapter's notification matcher exactly.
-await withServer("notification", { probePrimaryAgent: true }, async ({ api, readBus, waitFor, newParent, prompt }) => {
+if (run("notification")) await withServer("notification", { probePrimaryAgent: true }, async ({ api, readBus, waitFor, newParent, prompt }) => {
 	const parent = await newParent("probe-primary");
 	await prompt(parent, "Use the subagent tool exactly once with agent \"general\", description \"bg probe\", the prompt \"Read fixture.txt and reply with exactly its first line\", and background set to true. Then reply with exactly: launched");
 	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "general")?.data?.sessionID, 60000, "background child session");
@@ -279,7 +281,7 @@ await withServer("notification", { probePrimaryAgent: true }, async ({ api, read
 
 // Scenario E: a backgrounded fusion-executor child - the notification metadata
 // must carry exactly the identity fields the adapter's matcher requires.
-await withServer("executor-notification", { probePrimaryAgent: true }, async ({ api, readBus, waitFor, newParent, prompt }) => {
+if (run("executor-notification")) await withServer("executor-notification", { probePrimaryAgent: true }, async ({ api, readBus, waitFor, newParent, prompt }) => {
 	const parent = await newParent("probe-primary");
 	await prompt(parent, "Use the subagent tool exactly once with agent \"fusion-executor\", description \"exec probe\", the prompt \"Read fixture.txt and reply with exactly its first line\", and background set to true. Then reply with exactly: launched");
 	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "fusion-executor")?.data?.sessionID, 60000, "background executor child session");
@@ -294,6 +296,47 @@ await withServer("executor-notification", { probePrimaryAgent: true }, async ({ 
 	assert.equal(synthetic.metadata?.state, "completed", "Executor background notification did not complete");
 	assert.equal(synthetic.metadata?.agent, "fusion-executor", "Notification agent field does not match the adapter's matcher");
 	assert.ok(String(synthetic.text).startsWith(`<subagent sessionID="${child}" state="completed" description="exec probe">`), "Notification text envelope does not match the adapter's matcher");
+});
+
+// Scenario F: a fusion-owned foreground delegation backgrounds for real; the
+// host delivers the completion notification and fusion_reconcile settles it.
+if (run("reconcile")) await withServer("reconcile", {}, async ({ project, api, readJson, readBus, waitFor, newParent, prompt }) => {
+	const parent = await newParent();
+	await prompt(parent, LONG_BRIEF);
+	const child = await waitFor(async () => (await readBus()).find((e) => e.type === "session.created" && e.data?.agent === "fusion-executor")?.data?.sessionID, 60000, "child session");
+	await waitFor(async () => (await readBus()).some((e) => e.type === "session.text.delta" && e.data?.sessionID === child), 60000, "child streaming");
+	const backgrounded = await api(`/api/session/${parent}/background`, { method: "POST", body: "{}" });
+	assert.ok(backgrounded.status === 200 || backgrounded.status === 204, `backgrounding failed (${backgrounded.status}): ${backgrounded.body.slice(0, 200)}`);
+	// The child keeps working in the background; the host delivers the notification.
+	const synthetic = await waitFor(async () => {
+		const messages = await api(`/api/session/${parent}/message`);
+		const list = messages.json().data ?? messages.json();
+		return (Array.isArray(list) ? list : []).find((m) => m.type === "synthetic" && m.metadata?.source === "subagent" && m.metadata?.childID === child);
+	}, 240000, "real completion notification for the backgrounded fusion turn");
+	// The supervisor may reconcile autonomously when the notification steers it.
+	let promptedNudge = false;
+	let reconcile;
+	const autonomousStart = Date.now();
+	while (Date.now() - autonomousStart < 45000) {
+		reconcile = (await readJson("turns.json", [])).find((t) => t.tool === "fusion_reconcile" && t.status === "completed");
+		if (reconcile) break;
+		await new Promise((r) => setTimeout(r, 2000));
+	}
+	if (!reconcile) {
+		promptedNudge = true;
+		await prompt(parent, "The executor's completion notification has arrived. Call fusion_reconcile now.");
+		reconcile = await waitFor(async () => (await readJson("turns.json", [])).find((t) => t.tool === "fusion_reconcile" && t.status === "completed"), 90000, "fusion_reconcile");
+	}
+	const children = (await readBus()).filter((e) => e.type === "session.created" && e.data?.agent === "fusion-executor");
+	let reportBytes = 0;
+	try { reportBytes = (await readFile(join(project, "report.txt"), "utf8")).length; } catch {}
+	const evidence = { scenario: "reconcile", child, notificationState: synthetic.metadata?.state, reconcileStatus: reconcile.terminalStatus, autonomousReconcile: !promptedNudge, childSessions: children.length, reportBytes };
+	results.push(evidence);
+	console.log(JSON.stringify(evidence));
+	assert.equal(children.length, 1, "Backgrounded fusion work was resubmitted as another child");
+	assert.equal(synthetic.metadata?.state, "completed", "Backgrounded fusion turn did not complete");
+	assert.equal(reconcile.terminalStatus, "completed", "Reconcile did not settle the backgrounded turn as completed");
+	assert.ok(reportBytes > 0, "The backgrounded child never produced its report");
 });
 
 console.log(JSON.stringify({ verdict: "pass", scenarios: results.map((r) => r.scenario) }));
