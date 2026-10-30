@@ -61,9 +61,10 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	const activeTurns = new Map<string, ActiveTurn>();
 	/** Last cumulative per-session reading (`session.usage.updated` is monotonic per session). */
 	const usageByChild = new Map<string, WorkerUsage>();
-	/** Server timestamp and native ids of accepted readings; replays must not regress or re-prove usage. */
+	/** Server timestamp of the accepted reading per child; replayed older readings must not regress it. */
 	const usageCreated = new Map<string, number>();
-	const usageEventIds = new Map<string, Set<string>>();
+	/** Native event ids already routed per child; a redelivery is a replay even without a timestamp. */
+	const deliveredIds = new Map<string, Set<string>>();
 	/** Child sessions that already started a turn in this runtime; only their first turn may treat a missing baseline as zero history. */
 	const startedTurns = new Set<string>();
 	const referenceKey = (id: string) => id;
@@ -181,8 +182,8 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		if (type === "session.usage.updated") {
 			const usage = parseUsage(data);
 			if (usage) {
-				let seen = usageEventIds.get(childID);
-				if (!seen) { seen = new Set(); usageEventIds.set(childID, seen); }
+				let seen = deliveredIds.get(childID);
+				if (!seen) { seen = new Set(); deliveredIds.set(childID, seen); }
 				const duplicate = typeof event.id === "string" && seen.has(event.id);
 				const lastCreated = usageCreated.get(childID);
 				const stale = created !== undefined && lastCreated !== undefined && created < lastCreated;
@@ -198,6 +199,14 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		if (!turn || priorTurn) return;
 		const mapped = mapExecutorEvent(type, data, turn);
 		if (!mapped) return;
+		let seen = deliveredIds.get(childID);
+		if (!seen) { seen = new Set(); deliveredIds.set(childID, seen); }
+		if (typeof event.id === "string") {
+			// A native id already routed for this child is a replay of past work,
+			// even when the event carries no timestamp the turn can compare against.
+			if (seen.has(event.id)) return;
+			seen.add(event.id);
+		}
 		turn.options.onEvent({
 			runId: turn.request.runId,
 			requestId: turn.request.requestId,
@@ -316,7 +325,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			await params.interrupt(handle.reference.id);
 		},
 		async release(worker) { const handle = valid(worker); if (handle.active || handle.uncertain || handle.unsettled) throw new Error("Cannot release an active, uncertain or unsettled OpenCode worker."); handles.delete(handle); },
-		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); unregisterBus?.(); closed = true; handles.clear(); },
+		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); unregisterBus?.(); closed = true; handles.clear(); deliveredIds.clear(); },
 		ingestBusEvent,
 	};
 }

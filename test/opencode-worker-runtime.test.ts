@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createOpenCodeWorkerRuntime } from "../src/opencode/worker-runtime.ts";
+import type { WorkerEvent } from "../src/core/worker.ts";
 import type { NativeSubagentExecute, NativeToolContext } from "../src/opencode/native-executor.ts";
 
 type Context = NativeToolContext & { id: string; messageID: string };
@@ -415,6 +416,39 @@ test("replayed usage readings cannot regress the cumulative state", async () => 
 	expect(second.usage).toMatchObject({ inputTokens: 100, cost: 2 });
 	await f.runtime.settle(request, async () => {});
 	await f.runtime.release(worker);
+});
+
+test("a replayed native id is rejected in later turns even without a timestamp", async () => {
+	const observed: string[] = [];
+	const perTurn: BusEvent[][] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		for (const event of perTurn[turn] ?? []) f.push(event);
+		turn++;
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const request = { runId: "run", requestId: "request", worker, prompt: "work" };
+	const options = { onEvent: (event: WorkerEvent) => { if (event.event.type === "text_delta") observed.push(event.event.delta); }, onReference: async () => {} };
+	perTurn.push([{ id: "e1", type: "session.text.delta", data: { sessionID: "child", delta: "first-turn delivery" } }]);
+	await f.runtime.submit(request, options);
+	await f.runtime.settle(request, async () => {});
+	// The id was routed during the first turn; a redelivery must not join the next request.
+	perTurn.push([
+		{ id: "e1", type: "session.text.delta", data: { sessionID: "child", delta: "replayed" } },
+		{ id: "e2", type: "session.text.delta", data: { sessionID: "child", delta: "fresh" } },
+	]);
+	await f.runtime.submit(request, options);
+	await f.runtime.settle(request, async () => {});
+	await f.runtime.release(worker);
+	// Reopening the child keeps the replay memory: past ids stay rejected.
+	const reopened = await f.runtime.open({ owner, runtime: "native-subagent", id: "child" }, config);
+	perTurn.push([{ id: "e1", type: "session.text.delta", data: { sessionID: "child", delta: "replayed after reopen" } }]);
+	await f.runtime.submit({ ...request, worker: reopened }, options);
+	await f.runtime.settle({ ...request, worker: reopened }, async () => {});
+	expect(observed).toEqual(["first-turn delivery", "fresh"]);
+	await f.runtime.release(reopened);
 });
 
 test("capabilities stay per-instance: streaming only with the host bus", async () => {
