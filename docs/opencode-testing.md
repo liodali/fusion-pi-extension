@@ -35,6 +35,8 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | Shared Git workspace evidence | Pi and OpenCode use the same snapshot/diff code | Real temporary Git worktree tests; OpenCode requires full review |
 | Actual executor child, revisions, and final fix | Experimental host wiring | Live v2.2.0 run with `opencode-go/glm-5.3-flash`, same child and expected final file |
 | Restricted scout (M5) | `fusion_scout` tool, `fusion-scout` agent, shared budget and formatter, pre-execution allowlist and tool cap | Unit tests; live v2.2.3 run with `opencode-go/glm-5.3-flash`: citations, untouched tree, 4-call budget refusal with no extra child, mid-scout interrupt with clean reset. Review follow-up: guards persist for backgrounded scout children until their execution ends; reset during an active scout is refused before mutation |
+| Run control, status, budget stats (M6.1) | `fusion_start` retains the original task and claims the workspace; `fusion_status` shows claim/capabilities/next action; `fusion_stats` shows budgets with usage explicitly unavailable | Unit tests; model-free live v2.2.3 session start → status → stats → reset |
+| Configure and model validation (M6.2) | `fusion_configure` validates provider/model/variant against the live catalog; configured model reaches scout and executor submissions; shared price/cohort metadata reported | Unit tests; model-free live catalog + configure-unknown-refused/real-applied (v2.2.3); live scout child ran on the configured model (`opencode-go/glm-5.3-flash`), child session model observed |
 | Complete OpenCode Fusion workflow | No | Not ready to install/use |
 
 The core extraction is partial: the shared controller owns task transitions,

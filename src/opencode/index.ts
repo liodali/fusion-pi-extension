@@ -4,12 +4,14 @@ import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "
 import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt } from "../prompts.ts";
 import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse, scoutCapDecision } from "../core/scout.ts";
 import { MAX_REVISIONS } from "../limits.ts";
+import { getOutputPrice, isModelInTier, type FusionModelTier } from "../pricing.ts";
+import { RECENT_MODEL_COHORT, isRecentModel } from "../recent-models.ts";
 import { formatCompactReport } from "../report.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
-import type { WorkerHandle, WorkerTurnRequest } from "../core/worker.ts";
+import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
 
@@ -29,6 +31,20 @@ interface ToolHookEvent {
 	sessionID?: string;
 	input?: unknown;
 }
+/** The subset of the host's model catalog entry Fusion validates and reports on (pinned live on v2.2.3). */
+interface HostModel {
+	id?: string;
+	modelID?: string;
+	providerID?: string;
+	type?: string;
+	name?: string;
+	status?: string;
+	enabled?: boolean;
+	variants?: readonly { id?: string }[];
+	/** Per-tier pricing; the first entry is the base tier. */
+	cost?: readonly { output?: number }[];
+	time?: { released?: number };
+}
 interface PluginContext {
 	location: { directory: string };
 	storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<unknown>; remove(key: string): Promise<unknown> };
@@ -47,6 +63,10 @@ interface PluginContext {
 	/** Pinned in OpenCode v2.2.2: options-object subscribe returning a lazy async iterable. Absence leaves worker events unsupported. */
 	event?: {
 		subscribe(options?: { types?: string[]; signal?: AbortSignal }): AsyncIterable<{ id?: string; type: string; data?: Record<string, unknown> }>;
+	};
+	/** Pinned live on OpenCode v2.2.3: `{ location, data }` with the flat model catalog. Absence leaves Fusion on host-default models. */
+	model?: {
+		list(): Promise<{ location?: unknown; data?: readonly HostModel[] }>;
 	};
 }
 
@@ -227,7 +247,9 @@ export default {
 			const controller = new FusionController(state, services, runtime);
 			const runId = record?.runId ?? randomUUID();
 			const reference = record?.worker;
-			const config = { role: "executor" as const };
+			// A configured model reaches the executor handle at creation; the scout
+			// role reads it per call from the run record.
+			const config: WorkerConfig = { role: "executor", ...(record?.model ? { model: record.model } : {}) };
 			const handle = record?.pending ? await runtime.restorePending(workerOwner, config, { runId, requestId: record.pending.requestId }, reference) : reference ? await runtime.open(reference, config) : await runtime.create(workerOwner, config);
 			if (record?.pending) controller.setPending({ action: record.pending.action, requestId: record.pending.requestId });
 			controller.setUncertain(!!record && record.recovery !== "settled");
@@ -278,6 +300,40 @@ export default {
 		function requireSupervisor(context: ToolContext): void {
 			if (context.agent !== "fusion") throw new Error("Fusion tools are available only to the fusion primary agent.");
 		}
+		/** The flat model catalog; unavailable catalogs leave Fusion on host-default models. */
+		async function hostModels(): Promise<readonly (HostModel & { id: string; providerID: string })[]> {
+			if (typeof ctx.model?.list !== "function") throw new Error("The OpenCode model catalog is unavailable in this host; configure models through OpenCode itself instead.");
+			const response = await ctx.model.list();
+			const models = Array.isArray(response?.data) ? response.data : [];
+			return models.filter((entry): entry is HostModel & { id: string; providerID: string } => typeof entry?.id === "string" && typeof entry?.providerID === "string");
+		}
+		/** Validate an explicit provider/model/variant choice against the active catalog. */
+		async function validateCatalogModel(provider: string, modelId: string, variant?: string): Promise<{ config: WorkerModelConfig; metadata: Record<string, unknown> }> {
+			const models = await hostModels();
+			const entry = models.find((candidate) => candidate.providerID === provider && (candidate.id === modelId || candidate.modelID === modelId));
+			if (!entry) {
+				const known = [...new Set(models.map((candidate) => candidate.providerID))].sort().slice(0, 12).join(", ");
+				throw new Error(`"${provider}/${modelId}" is not in the OpenCode model catalog${known ? ` (known providers: ${known})` : ""}. Check opencode models and try again.`);
+			}
+			if (entry.enabled === false) throw new Error(`"${provider}/${modelId}" is disabled in the OpenCode catalog.`);
+			if (variant !== undefined) {
+				const variants = (entry.variants ?? []).map((candidate) => typeof candidate?.id === "string" ? candidate.id : "").filter(Boolean);
+				if (!variants.includes(variant)) throw new Error(`"${provider}/${modelId}" has no variant "${variant}"${variants.length ? ` (available: ${variants.join(", ")})` : " (no variants)"}.`);
+			}
+			const fusionModel = { id: entry.id, provider: entry.providerID, name: entry.name ?? "", cost: { output: entry.cost?.[0]?.output } };
+			const tier: FusionModelTier = isModelInTier(fusionModel, "supervisor") ? "supervisor" : "executor";
+			return {
+				config: { provider, modelId, ...(variant !== undefined ? { variant } : {}) },
+				metadata: {
+					name: entry.name,
+					status: entry.status,
+					outputPricePerM: getOutputPrice(fusionModel),
+					tier,
+					recentCohort: RECENT_MODEL_COHORT,
+					inRecentCohort: isRecentModel(fusionModel),
+				},
+			};
+		}
 		const creating = new Map<string, Promise<Run>>();
 		async function runFor(sessionID: string): Promise<Run> {
 			const existing = runs.get(sessionID);
@@ -322,6 +378,40 @@ export default {
 						if (!run.lease) Object.assign(run.controller.state, priorState);
 						throw error;
 					} finally { starting = false; }
+				},
+			});
+			editor.add({
+				name: "fusion_configure",
+				description: "Configure the Fusion executor model (used by the executor and the scout) by validating provider, model, and an optional variant against the OpenCode catalog. Applies to this run when no executor work has started; otherwise to the next run.",
+				input: { type: "object", properties: { provider: { type: "string", minLength: 1 }, model: { type: "string", minLength: 1 }, variant: { type: "string", minLength: 1 } }, required: ["provider", "model"], additionalProperties: false },
+				options: { codemode: false },
+				async execute(input, context) {
+					requireSupervisor(context);
+					if (!input || typeof input !== "object") throw new Error("Invalid Fusion configuration input.");
+					const value = input as Record<string, unknown>;
+					if (typeof value.provider !== "string" || !value.provider.trim() || typeof value.model !== "string" || !value.model.trim() || (value.variant !== undefined && (typeof value.variant !== "string" || !value.variant.trim()))) throw new Error("Invalid Fusion configuration input.");
+					const { config, metadata } = await validateCatalogModel(value.provider.trim(), value.model.trim(), typeof value.variant === "string" ? value.variant.trim() : undefined);
+					const run = await runFor(context.sessionID);
+					const active = run.runtime.status(run.handle);
+					const workStarted = run.controller.state.executed || !!run.controller.pending || run.controller.uncertain || run.reconciling || active.backgrounded || active.backgroundPending || active.unsettled;
+					run.model = config;
+					// Recreate the executor handle only while it cannot have produced
+					// work: no submission yet and no native child to orphan.
+					let applied: "now" | "next-run";
+					let appliedReason = "";
+					if (!workStarted && !run.handle.reference) {
+						await run.runtime.release(run.handle);
+						run.handle = await run.runtime.create({ harness: "opencode", supervisorId: context.sessionID, workspace }, { role: "executor", model: config });
+						applied = "now";
+					} else {
+						applied = "next-run";
+						appliedReason = workStarted ? "executor work has already started" : "the executor child already exists";
+					}
+					if (run.lease) await persist(context.sessionID, run);
+					return {
+						content: `Fusion executor model configured for ${applied === "now" ? "this run" : `the next run (${appliedReason})`}: ${config.provider}/${config.modelId}${config.variant ? ` (variant ${config.variant})` : ""}. The scout uses the same model. ${JSON.stringify(metadata)}`,
+						metadata: { model: config, applied, ...metadata },
+					};
 				},
 			});
 			editor.add({
@@ -455,7 +545,7 @@ export default {
 						// write must not block a read-only scout. Settlement writes keep
 						// their strict fault guarantees.
 						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
-						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS });
+						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS, ...(run.model ? { model: run.model } : {}) });
 						run.setContext(handle, context);
 						cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
 						activeScout = {
@@ -463,6 +553,7 @@ export default {
 						};
 						context.signal.addEventListener("abort", onAbort, { once: true });
 						const requestId = `Fusion scout ${randomUUID()}`;
+						// The scout runs on the configured executor model (Pi parity).
 						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
 						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async (reference) => {
 							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
@@ -563,7 +654,7 @@ export default {
 						: !run.controller.state.executed
 							? "Investigate the original task, then call fusion_delegate with action execute."
 							: "Review the working tree and audit the original task; reset when the run is finished.";
-					return { content: JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, pending: run.controller.pending, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction }) };
+					return { content: JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction }) };
 				},
 			});
 			editor.add({

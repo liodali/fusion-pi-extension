@@ -599,3 +599,26 @@ test("scout usage stays separate from executor accounting and uses its own child
 	await runtime.release(scout);
 	await runtime.shutdown();
 });
+
+test("configured variants format the host model reference instead of being refused", async () => {
+	const seen: (string | undefined)[] = [];
+	let calls = 0;
+	const f = fixture(async (input) => {
+		seen.push(input.model);
+		calls += 1;
+		return { output: { sessionID: `child-${calls}`, status: "completed", output: "done" } };
+	});
+	const worker = await f.runtime.create(owner, { role: "executor", model: { provider: "prov", modelId: "m", variant: "low" } });
+	await f.runtime.submit({ runId: "r", requestId: "q", worker, prompt: "work" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(seen).toEqual(["prov/m#low"]);
+	// Per-turn overrides stay refused even with a configured model.
+	await expect(f.runtime.submit({ runId: "r", requestId: "q2", worker, prompt: "work", variant: "high" }, { onEvent: () => {}, onReference: async () => {} })).rejects.toThrow("variants are not supported");
+	// A configured model without a variant formats plainly.
+	const plain = await f.runtime.create(owner, { role: "executor", model: { provider: "prov", modelId: "m" } });
+	await f.runtime.submit({ runId: "r", requestId: "q3", worker: plain, prompt: "work" }, { onEvent: () => {}, onReference: async () => {} });
+	expect(seen[1]).toBe("prov/m");
+	await f.runtime.settle({ runId: "r", requestId: "q", worker, prompt: "work" }, async () => {});
+	await f.runtime.settle({ runId: "r", requestId: "q3", worker: plain, prompt: "work" }, async () => {});
+	await f.runtime.release(worker);
+	await f.runtime.release(plain);
+});

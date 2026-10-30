@@ -31,6 +31,66 @@ async function setupTest(context: TestContext, storage = memoryStorage()) {
 }
 
 describe("OpenCode Fusion plugin", () => {
+	test("configures a catalog-validated executor model that reaches scout and executor submissions", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const nativeInputs: { agent?: string; model?: string }[] = [];
+		const catalog = { list: async () => ({ data: [
+			{ providerID: "prov", id: "executor-model", name: "Executor Model", status: "active", enabled: true, variants: [{ id: "low" }, { id: "high" }], cost: [{ input: 1, output: 3 }], time: { released: 1750000000000 } },
+			{ providerID: "prov", id: "no-variants", name: "No Variants", status: "active", enabled: true, cost: [{ output: 20 }] },
+			{ providerID: "other", id: "disabled-model", name: "Disabled", status: "active", enabled: false, cost: [] },
+		] }) };
+		await setupTest({ location: { directory: "/workspace" }, model: catalog, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
+				nativeInputs.push({ agent: input.agent, model: input.model });
+				return { output: { sessionID: input.agent === "fusion-scout" ? "scout" : "child", status: "completed", output: input.agent === "fusion-scout" ? "answer" : '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		const configure = tools.get("fusion_configure")!;
+		await expect(configure.execute({ provider: "prov", model: "missing-model" }, context("one"))).rejects.toThrow("not in the OpenCode model catalog");
+		await expect(configure.execute({ provider: "prov", model: "executor-model", variant: "turbo" }, context("one"))).rejects.toThrow('has no variant "turbo"');
+		await expect(configure.execute({ provider: "prov", model: "no-variants", variant: "low" }, context("one"))).rejects.toThrow("no variants");
+		await expect(configure.execute({ provider: "other", model: "disabled-model" }, context("one"))).rejects.toThrow("disabled");
+		await expect(configure.execute({ provider: "prov", model: "executor-model" }, context("one", "fusion-executor"))).rejects.toThrow("only to the fusion primary agent");
+		// Valid configuration: applies to this run, shared tier/cohort metadata is reported.
+		const configured = await configure.execute({ provider: "prov", model: "executor-model", variant: "low" }, context("one"));
+		expect(configured.metadata).toMatchObject({ applied: "now", model: { provider: "prov", modelId: "executor-model", variant: "low" }, tier: "executor", outputPricePerM: 3 });
+		// The scout picks up the configured model with its variant immediately.
+		const scout = await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		expect(scout.content).toContain("answer");
+		expect(nativeInputs[0]).toEqual({ agent: "fusion-scout", model: "prov/executor-model#low" });
+		// The executor delegation uses the same configured model.
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(nativeInputs[1]).toEqual({ agent: "fusion-executor", model: "prov/executor-model#low" });
+		// The configuration persists in the shared manifest.
+		const persisted = await storage.get(`run/${createHash("sha256").update("/workspace").digest("hex")}`) as { model?: { provider?: string; modelId?: string; variant?: string } };
+		expect(persisted.model).toEqual({ provider: "prov", modelId: "executor-model", variant: "low" });
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.model).toEqual({ provider: "prov", modelId: "executor-model", variant: "low" });
+		// Reconfiguration after executor work applies to the next run only.
+		const later = await configure.execute({ provider: "prov", model: "no-variants" }, context("one"));
+		expect(later.metadata).toMatchObject({ applied: "next-run" });
+		await tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"));
+		expect(nativeInputs[2]).toEqual({ agent: "fusion-executor", model: "prov/executor-model#low" });
+	});
+
+	test("configure without a host catalog refuses honestly and fusion tools stay on host defaults", async () => {
+		const tools = new Map<string, Tool>();
+		let modelSeen = false;
+		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
+				modelSeen = input.model !== undefined && input.model !== null;
+				return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		await expect(tools.get("fusion_configure")!.execute({ provider: "prov", model: "m" }, context("one"))).rejects.toThrow("model catalog is unavailable");
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		// Without configuration no model override reaches the native call.
+		expect(modelSeen).toBe(false);
+	});
+
 	test("persists the original request before delegation and retains it through the final fix after reload", async () => {
 		const storage = memoryStorage();
 		const prompts: string[] = [];

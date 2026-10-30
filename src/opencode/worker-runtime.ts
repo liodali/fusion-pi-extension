@@ -1,4 +1,4 @@
-import type { ExecutorEvent, WorkerConfig, WorkerHandle, WorkerOwner, WorkerReference, WorkerRuntime, WorkerTurnOptions, WorkerTurnRequest, WorkerTurnResult, WorkerUsage } from "../core/worker.ts";
+import type { ExecutorEvent, WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerOwner, WorkerReference, WorkerRuntime, WorkerTurnOptions, WorkerTurnRequest, WorkerTurnResult, WorkerUsage } from "../core/worker.ts";
 import { scoutCapDecision } from "../core/scout.ts";
 import { createNativeExecutor, OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 
@@ -105,15 +105,21 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	function check(owner: WorkerOwner, config: WorkerConfig): void {
 		if (owner.harness !== "opencode" || !owner.supervisorId || !owner.workspace) throw new Error("Invalid OpenCode worker owner.");
 		if (config.role === "scout" && (!Number.isSafeInteger(config.maxToolCalls) || config.maxToolCalls < 1)) throw new Error("OpenCode scout requires a positive maxToolCalls.");
-		if (config.model?.variant) throw new Error("OpenCode model variants are not supported by this adapter.");
+		// Variants are accepted only after the adapter validated them against the
+		// host catalog (fusion_configure); per-turn overrides stay unsupported.
 		if (config.model && (!config.model.provider || !config.model.modelId)) throw new Error("Invalid OpenCode worker model.");
+	}
+	/** The host's model reference format: "provider/model" or "provider/model#variant". */
+	function modelString(model: WorkerModelConfig | undefined): string | undefined {
+		if (!model) return undefined;
+		return `${model.provider}/${model.modelId}${model.variant ? `#${model.variant}` : ""}`;
 	}
 	function make(owner: WorkerOwner, config: WorkerConfig, childSessionID?: string, pending?: { runId: string; requestId: string }): Handle<C> {
 		const owned = Object.freeze({ ...owner });
 		let handle: Handle<C>;
 		const agent = config.role === "scout" ? (params.scoutAgent ?? SCOUT_AGENT) : params.agent ?? "fusion-executor";
 		const native = createNativeExecutor<C>({ parentSessionID: owned.supervisorId, agent, execute: params.execute, childSessionID, pending: !!pending && !!childSessionID,
-			model: config.model ? `${config.model.provider}/${config.model.modelId}` : undefined,
+			model: modelString(config.model),
 			onReference: async (id) => { assertUnowned(id, handle); if (!handle.publish) throw new Error("No active reference persistence callback."); await handle.publish(id); },
 		});
 		handle = { owner: owned, runtime: RUNTIME, get reference() { return native.childSessionID ? Object.freeze({ owner: owned, runtime: RUNTIME, id: native.childSessionID }) : undefined; }, native, active: false, createdFresh: !childSessionID, backgrounded: !!pending && !!childSessionID, uncertain: pending && { ...pending }, role: config.role };

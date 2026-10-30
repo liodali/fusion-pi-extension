@@ -29,10 +29,10 @@ export default { id: "fusion-scout-observer", async setup(ctx) {
 	const ac = new AbortController();
 	const turns = [];
 	await ctx.tool.hook("execute.after", async (event) => {
-		if (!["fusion_scout", "fusion_delegate", "fusion_reset", "fusion_status"].includes(event.tool)) return;
+		if (!["fusion_scout", "fusion_delegate", "fusion_reset", "fusion_status", "fusion_configure"].includes(event.tool)) return;
 		const raw = event.result?.output ?? event.result?.content;
 		const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map((part) => (part && typeof part === "object" && typeof part.text === "string" ? part.text : "")).join("") : JSON.stringify(raw ?? "");
-		turns.push({ tool: event.tool, status: event.status, error: String(event.error ?? ""), childSessionID: event.result?.metadata?.childSessionID, capped: event.result?.metadata?.capped, toolStatus: event.result?.metadata?.status, text });
+		turns.push({ tool: event.tool, status: event.status, error: String(event.error ?? ""), childSessionID: event.result?.metadata?.childSessionID, capped: event.result?.metadata?.capped, toolStatus: event.result?.metadata?.status, meta: event.result?.metadata, text });
 		try { await writeFile(turnsPath, JSON.stringify(turns)); } catch {}
 	});
 	const iter = ctx.event.subscribe({ signal: ac.signal })[Symbol.asyncIterator]();
@@ -250,7 +250,36 @@ async function scenarioC({ project, api, readJson, readBus, waitFor, newParent, 
 	return { scoutChild, scoutInterrupted: true, resetCompleted: reset.status === "completed", turns: turns.map((t) => t.tool) };
 }
 
+async function scenarioD({ api, readJson, readBus, waitFor, newParent, promptParent, notes }) {
+	const parent = await newParent();
+	await new Promise((r) => setTimeout(r, 3000));
+	// Configure the executor model through the catalog-validated control, then
+	// scout: the scout child must run on the configured model.
+	await promptParent(parent, `Call fusion_configure with provider "${provider}" and model "${modelID}". Then call fusion_scout once with the single question "What is in notes.md?". Then call fusion_reset. Do not read any files yourself.`);
+	await waitFor(async () => {
+		const turns = await readJson("turns.json", []);
+		return turns.some((t) => t.tool === "fusion_reset");
+	}, 240000, "configure, scout, and reset");
+	const turns = await readJson("turns.json", []);
+	const configure = turns.find((t) => t.tool === "fusion_configure");
+	assert.ok(configure, "No fusion_configure turn recorded");
+	assert.equal(configure.status, "completed", "The configure turn failed");
+	assert.equal(configure.meta?.applied, "now", `Configure did not apply to this run: ${configure.text.slice(0, 200)}`);
+	assert.equal(configure.meta?.model?.providerID ?? configure.meta?.model?.provider, provider, "Configure recorded the wrong provider");
+	const scout = turns.find((t) => t.tool === "fusion_scout");
+	assert.ok(scout && scout.status === "completed" && scout.childSessionID, "The scout after configure did not complete");
+	const childInfo = await api(`/api/session/${scout.childSessionID}`);
+	const childBody = childInfo.json();
+	const childModel = childBody.model ?? childBody.data?.model;
+	assert.ok(childModel, `The child session does not expose its model: ${JSON.stringify(childBody).slice(0, 300)}`);
+	assert.equal(childModel.providerID ?? childModel.provider, provider, "The scout child ran on the wrong provider");
+	assert.equal(childModel.id ?? childModel.modelID, modelID, "The scout child ran on the wrong model");
+	assert.ok(turns.some((t) => t.tool === "fusion_reset" && t.status === "completed"), "The post-configure reset failed");
+	return { configure: configure.meta, childModel, scoutText: scout.text.slice(0, 120) };
+}
+
 if (run("A")) await withServer("a", scenarioA);
 if (run("B")) await withServer("b", scenarioB);
 if (run("C")) await withServer("c", scenarioC);
+if (run("D")) await withServer("d", scenarioD);
 console.log(JSON.stringify(results, null, 2));

@@ -21,7 +21,7 @@ import fusion from "../fusion/opencode/index.ts";
 export default {
   id: "fusion-smoke",
   async setup(ctx) {
-    const result = { version: ctx.app.version, nativeFound: false, registered: false, runStarted: false, nativeInvoked: false, recursiveRefused: false };
+    const result = { version: ctx.app.version, nativeFound: false, registered: false, catalogModels: 0, catalogProviders: 0, configureValidated: false, configureApplied: false, runStarted: false, nativeInvoked: false, recursiveRefused: false };
     try {
       const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
       if (!native || typeof native.execute !== "function") throw new Error("Native subagent executor is unavailable");
@@ -29,8 +29,15 @@ export default {
       await fusion.setup(ctx);
       const registered = await ctx.tool.list();
       const delegate = registered.find((tool) => tool.id === "fusion_delegate");
-      result.registered = !!delegate && ["fusion_start", "fusion_status", "fusion_stats", "fusion_reset", "fusion_reconcile", "fusion_scout"].every((id) => registered.some((tool) => tool.id === id));
+      result.registered = !!delegate && ["fusion_start", "fusion_status", "fusion_stats", "fusion_configure", "fusion_reset", "fusion_reconcile", "fusion_scout"].every((id) => registered.some((tool) => tool.id === id));
       if (!result.registered) throw new Error("Fusion tools did not register");
+      // Pin the host model catalog surface Fusion configures against (no model call).
+      const catalog = await ctx.model.list();
+      const models = Array.isArray(catalog?.data) ? catalog.data : [];
+      const usable = models.filter((m) => m && typeof m.providerID === "string" && typeof m.id === "string");
+      result.catalogModels = usable.length;
+      result.catalogProviders = [...new Set(usable.map((m) => m.providerID))].length;
+      if (!(usable.length > 0)) throw new Error("The host model catalog was empty or malformed");
       const parent = await ctx.session.create({});
       const toolContext = { sessionID: parent.id, agent: "fusion", messageID: "msg_start_probe", id: "call_start_probe", signal: new AbortController().signal, progress: async () => {} };
       await registered.find((tool) => tool.id === "fusion_start").execute({ task: "Original smoke task" }, toolContext);
@@ -38,6 +45,20 @@ export default {
       if (state.originalTask !== "Original smoke task" || state.owner.supervisorId !== parent.id || !state.workspaceClaimed) throw new Error("Fusion start did not retain the task and owner");
       const stats = JSON.parse((await registered.find((tool) => tool.id === "fusion_stats").execute({}, toolContext)).content);
       if (stats.revisions.used !== 0 || stats.usage.available !== false) throw new Error("Fusion stats did not report the initial budget and unavailable usage");
+      // Configure validation runs against the real catalog, without calling a model.
+      const configureTool = registered.find((tool) => tool.id === "fusion_configure");
+      try {
+        await configureTool.execute({ provider: "prov", model: "not-in-catalog" }, toolContext);
+        throw new Error("Configure accepted a model outside the catalog");
+      } catch (error) {
+        if (!String(error).includes("not in the OpenCode model catalog")) throw error;
+        result.configureValidated = true;
+      }
+      const configured = await configureTool.execute({ provider: usable[0].providerID, model: usable[0].id }, toolContext);
+      if (configured.metadata?.applied !== "now" || configured.metadata?.model?.modelId !== usable[0].id) throw new Error("Configure did not apply the catalog model to this run");
+      result.configureApplied = true;
+      const stateAfterConfigure = JSON.parse((await registered.find((tool) => tool.id === "fusion_status").execute({}, toolContext)).content);
+      if (stateAfterConfigure.model?.modelId !== usable[0].id) throw new Error("Configured model did not reach status");
       await registered.find((tool) => tool.id === "fusion_reset").execute({}, toolContext);
       result.runStarted = true;
       try {
@@ -90,6 +111,9 @@ export default {
 	assert.ok(result, "Plugin setup did not produce a probe result");
 	assert.equal(result.nativeFound, true, result.error);
 	assert.equal(result.registered, true, result.error);
+	assert.ok(result.catalogModels > 0 && result.catalogProviders > 0, `Host model catalog was empty (models: ${result.catalogModels})`);
+	assert.equal(result.configureValidated, true, result.error);
+	assert.equal(result.configureApplied, true, result.error);
 	assert.equal(result.runStarted, true, result.error);
 	assert.equal(result.nativeInvoked, true, result.error);
 	assert.equal(result.recursiveRefused, true, result.error);
