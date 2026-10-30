@@ -48,7 +48,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	validateReference: (reference: WorkerReference) => Promise<void>;
 	interrupt?: (childSessionID: string) => Promise<unknown>;
 	agent?: string;
-	bus?: { add(sink: (event: OpenCodeBusEvent) => void): void };
+	bus?: { add(sink: (event: OpenCodeBusEvent) => void): () => void };
 }): OpenCodeWorkerRuntime {
 	type ActiveTurn = { request: WorkerTurnRequest; options: WorkerTurnOptions; baseline?: WorkerUsage; sawUsage?: boolean; toolNames: Map<string, string> };
 	const handles = new Set<Handle<C>>();
@@ -95,12 +95,13 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	function result(request: WorkerTurnRequest, text: string): WorkerTurnResult {
 		return { runId: request.runId, requestId: request.requestId, worker: request.worker, role: "executor", status: "completed", text };
 	}
-	/** `session.usage.updated` readings are cumulative per session; a turn reports its own delta. */
+	/** The delta of cumulative readings; any regression means the accounting model
+	 * broke (e.g. a host-side reset), so the turn's usage stays unknown. */
 	function usageDelta(final: WorkerUsage | undefined, baseline: WorkerUsage | undefined): WorkerUsage | undefined {
 		if (!final) return undefined;
 		if (!baseline) return final;
 		const subtract = (a: number | undefined, b: number | undefined) => (a === undefined || b === undefined ? undefined : a - b);
-		return {
+		const delta = {
 			inputTokens: subtract(final.inputTokens, baseline.inputTokens),
 			outputTokens: subtract(final.outputTokens, baseline.outputTokens),
 			cacheReadTokens: subtract(final.cacheReadTokens, baseline.cacheReadTokens),
@@ -108,6 +109,8 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			reasoningTokens: subtract(final.reasoningTokens, baseline.reasoningTokens),
 			cost: subtract(final.cost, baseline.cost),
 		};
+		const negative = [delta.inputTokens, delta.outputTokens, delta.cacheReadTokens, delta.cacheWriteTokens, delta.reasoningTokens, delta.cost].some((value) => value !== undefined && value < 0);
+		return negative ? undefined : delta;
 	}
 	function parseUsage(data: Record<string, unknown>): WorkerUsage | undefined {
 		const tokens = data.tokens && typeof data.tokens === "object" ? data.tokens as Record<string, unknown> : undefined;
@@ -180,7 +183,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			event: mapped,
 		});
 	}
-	if (params.bus) params.bus.add(ingestBusEvent);
+	const unregisterBus = params.bus?.add(ingestBusEvent);
 	return {
 		capabilities: { ...OPENCODE_CAPABILITIES, workerAbort: !!params.interrupt, workerEvents: !!params.bus },
 		async create(owner, config) { if (closed) throw new Error("OpenCode runtime is shut down."); check(owner, config); return make(owner, config); },
@@ -282,7 +285,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			await params.interrupt(handle.reference.id);
 		},
 		async release(worker) { const handle = valid(worker); if (handle.active || handle.uncertain || handle.unsettled) throw new Error("Cannot release an active, uncertain or unsettled OpenCode worker."); handles.delete(handle); },
-		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); closed = true; handles.clear(); },
+		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); unregisterBus?.(); closed = true; handles.clear(); },
 		ingestBusEvent,
 	};
 }

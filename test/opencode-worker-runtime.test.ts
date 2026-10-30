@@ -69,6 +69,8 @@ test("background reconciliation matches the pending request and never resubmits"
 	await expect(f.runtime.reconcile(request, options, async () => { throw new Error("no proof"); }, async () => {})).rejects.toThrow("no proof");
 	const result = await f.runtime.reconcile(request, options, async (child, pending) => { expect(child).toBe("child"); expect(pending.requestId).toBe("q"); return { status: "completed", text: "report" }; }, async () => {});
 	expect(result.text).toBe("report"); expect(submissions).toBe(1);
+	// Reconciliation after an interrupted turn cannot attribute usage to it.
+	expect(result.usage).toBeUndefined();
 	await f.runtime.release(worker);
 });
 
@@ -205,9 +207,9 @@ type BusEvent = { id?: string; type: string; data?: Record<string, unknown> };
 function busFixture(execute: NativeSubagentExecute<Context>) {
 	const forwarded: unknown[] = [];
 	const context: Context = { sessionID: "parent", id: "call", messageID: "message", signal: new AbortController().signal, progress: async (update) => { forwarded.push(update); } };
-	let sink: ((event: BusEvent) => void) | undefined;
-	const runtime = createOpenCodeWorkerRuntime({ execute, contextFor: () => context, validateReference: async () => {}, bus: { add: (registered) => { sink = registered; } } });
-	return { runtime, context, forwarded, push: (event: BusEvent) => sink?.(event) };
+	const sinks = new Set<(event: BusEvent) => void>();
+	const runtime = createOpenCodeWorkerRuntime({ execute, contextFor: () => context, validateReference: async () => {}, bus: { add: (registered) => { sinks.add(registered); return () => { sinks.delete(registered); }; } } });
+	return { runtime, context, forwarded, sinks, push: (event: BusEvent) => { for (const sink of sinks) sink(event); } };
 }
 
 test("owned-child bus events map to worker events with native identity and ownership", async () => {
@@ -319,7 +321,34 @@ test("capabilities stay per-instance: streaming only with the host bus", async (
 	const plain = fixture(async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }));
 	expect(plain.runtime.capabilities.workerEvents).toBe(false);
 	let sink: ((event: BusEvent) => void) | undefined;
-	const streaming = createOpenCodeWorkerRuntime({ execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }), contextFor: () => plain.context, validateReference: async () => {}, bus: { add: (registered) => { sink = registered; } } });
+	const streaming = createOpenCodeWorkerRuntime({ execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }), contextFor: () => plain.context, validateReference: async () => {}, bus: { add: (registered) => { sink = registered; return () => { sink = undefined; }; } } });
 	expect(streaming.capabilities.workerEvents).toBe(true);
 	expect(typeof sink).toBe("function");
+	await streaming.shutdown();
+	expect(sink).toBeUndefined();
+});
+
+test("a decreasing cumulative reading leaves turn usage unknown", async () => {
+	const readings: BusEvent[] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		const event = readings[turn];
+		turn++;
+		if (event) f.push(event);
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const request = { runId: "run", requestId: "request", worker, prompt: "work" };
+	const options = { onEvent: () => {}, onReference: async () => {} };
+	readings.push({ id: "u1", type: "session.usage.updated", data: { sessionID: "child", cost: 5, tokens: { input: 160, output: 80, reasoning: 30, cache: { read: 19, write: 4 } } } });
+	const first = await f.runtime.submit(request, options);
+	expect(first.usage?.inputTokens).toBe(160);
+	await f.runtime.settle(request, async () => {});
+	// A later reading below the baseline would otherwise produce negative accounting.
+	readings.push({ id: "u2", type: "session.usage.updated", data: { sessionID: "child", cost: 1, tokens: { input: 40, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } } });
+	const second = await f.runtime.submit(request, options);
+	expect(second.usage).toBeUndefined();
+	await f.runtime.settle(request, async () => {});
+	await f.runtime.release(worker);
 });

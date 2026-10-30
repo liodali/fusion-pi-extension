@@ -115,7 +115,7 @@ export default {
 				execute: native!.execute,
 				contextFor: () => { if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
 				interrupt: typeof ctx.session.interrupt === "function" ? ((childSessionID: string) => Promise.resolve(ctx.session.interrupt!({ sessionID: childSessionID }))) : undefined,
-				bus: typeof ctx.event?.subscribe === "function" ? { add: (sink) => { busSinks.add(sink); } } : undefined,
+				bus: busHost ? { add: (sink) => { busSinks.add(sink); return () => { busSinks.delete(sink); }; } } : undefined,
 				validateReference: async (reference) => {
 					const [parent, child] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.get({ sessionID: reference.id })]);
 					if (parent.id !== sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace || child.id !== reference.id || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("OpenCode child ownership or workspace does not match.");
