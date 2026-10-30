@@ -31,6 +31,74 @@ async function setupTest(context: TestContext, storage = memoryStorage()) {
 }
 
 describe("OpenCode Fusion plugin", () => {
+	test("persists the original request before delegation and retains it through the final fix after reload", async () => {
+		const storage = memoryStorage();
+		const prompts: string[] = [];
+		const makeContext = (tools: Map<string, Tool>): TestContext => ({
+			location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
+					prompts.push(input.prompt);
+					return { output: { sessionID: "child-1", status: "completed", output: "done" } };
+				} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		});
+		const first = new Map<string, Tool>();
+		await setupTest(makeContext(first), storage);
+		await expect(first.get("fusion_start")!.execute({ task: "Original acceptance requirements" }, context("other-agent", "ordinary"))).rejects.toThrow("only to the fusion primary agent");
+		await first.get("fusion_start")!.execute({ task: "Original acceptance requirements" }, context("one"));
+		const restored = new Map<string, Tool>();
+		await setupTest(makeContext(restored), storage);
+		const status = JSON.parse((await restored.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.originalTask).toBe("Original acceptance requirements");
+		expect(status.nextAction).toContain("action execute");
+		expect(status.capabilities.activeTurnReattach).toBe(false);
+		await expect(restored.get("fusion_delegate")!.execute({ action: "execute", brief: "Implement", originalTask: "replacement" }, context("one"))).rejects.toThrow("cannot be replaced");
+		await restored.get("fusion_delegate")!.execute({ action: "execute", brief: "Implement" }, context("one"));
+		await restored.get("fusion_delegate")!.execute({ action: "final_fix", brief: "Fix remaining gaps" }, context("one"));
+		expect(prompts[1]).toContain("Original acceptance requirements");
+		const stats = JSON.parse((await restored.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats).toMatchObject({ executed: true, revisions: { used: 0, limit: 3 }, scoutCalls: { used: 0, limit: 4 }, finalFixUsed: true, lastResult: { status: "completed" }, usage: { available: false } });
+		await expect(restored.get("fusion_stats")!.execute({}, context("one", "ordinary"))).rejects.toThrow("only to the fusion primary agent");
+		await expect(restored.get("fusion_start")!.execute({ task: "Another task" }, context("one"))).rejects.toThrow("reset the existing Fusion run");
+		await restored.get("fusion_reset")!.execute({}, context("one"));
+		await restored.get("fusion_start")!.execute({ task: "Another task" }, context("one"));
+	});
+
+	test("blocks new work and reset while a run start is being persisted", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let release!: () => void;
+		let entered!: () => void;
+		const enteredWrite = new Promise<void>((resolve) => { entered = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const storage = { ...backing, set: async (key: string, value: unknown) => { entered(); await gate; await backing.set(key, value); } };
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { throw new Error("unexpected submission"); } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		const start = tools.get("fusion_start")!.execute({ task: "Original task" }, context("one"));
+		await enteredWrite;
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("run is starting");
+		await expect(tools.get("fusion_scout")!.execute({ questions: ["where?"] }, context("one"))).rejects.toThrow("run is starting");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("run is starting");
+		release();
+		await start;
+	});
+
+	test("rejects a run start for a session outside the workspace without claiming ownership", async () => {
+		const tools = new Map<string, Tool>();
+		await setupTest({ location: { directory: "/workspace" }, session: {
+			context: async () => [], hook: async () => {}, get: async ({ sessionID }) => ({ id: sessionID, location: { directory: "/other" } }),
+		}, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { throw new Error("unexpected submission"); } }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		await expect(tools.get("fusion_start")!.execute({ task: "task" }, context("one"))).rejects.toThrow("session or workspace does not match");
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.runActive).toBe(false);
+		expect(status.originalTask).toBeUndefined();
+	});
+
 	test("reset holds workspace ownership until storage removal finishes", async () => {
 		const tools = new Map<string, Tool>();
 		const backing = memoryStorage();
@@ -386,11 +454,14 @@ describe("OpenCode Fusion plugin", () => {
 		for (let i = 0; i < 20; i++) expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).not.toThrow();
 		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).toThrow("Tool call limit reached");
 		expect(() => before({ agent: "fusion-scout", tool: "shell", sessionID: "scout-bg" })).toThrow("denied before execution");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("still running");
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).executed).toBe(true);
 		// The child's execution ends: the guard is released, and a later scout-agent
 		// session starts with a fresh cap.
 		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-bg" } });
 		busWake?.();
 		await new Promise((resolve) => setTimeout(resolve, 25));
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).resolves.toHaveProperty("content", "Fusion run reset.");
 		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).not.toThrow();
 		// Prohibited tools stay denied regardless of guard state.
 		expect(() => before({ agent: "fusion-scout", tool: "edit", sessionID: "scout-bg" })).toThrow("denied before execution");
@@ -779,4 +850,55 @@ test("shared settlement failure preserves the exact result and blocks another su
 		expect(calls).toBe(1);
 		await tools.get("fusion_reset")!.execute({}, context("one"));
 	} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("scout guard capacity refuses new children without resetting live caps", async () => {
+	const tools = new Map<string, Tool>();
+	let before!: (event: { agent: string; tool: string; sessionID: string }) => void;
+	await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async (_name, callback) => { before = callback; },
+		list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "scout-bg", status: "running", output: "" } }) }],
+		transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} });
+	await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+	const read = (sessionID: string) => before({ agent: "fusion-scout", tool: "read", sessionID });
+	for (let i = 0; i < 20; i++) read("scout-bg");
+	expect(() => read("scout-bg")).toThrow("Tool call limit reached");
+	for (let i = 0; i < 7; i++) read(`other-${i}`);
+	for (let i = 7; i < 10; i++) expect(() => read(`other-${i}`)).toThrow("tracking is full");
+	expect(() => read("scout-bg")).toThrow("Tool call limit reached");
+	await expect(tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("two"))).rejects.toThrow("tracking is full");
+});
+
+test("concurrent scouting preserves the pending executor's native call context", async () => {
+	const tools = new Map<string, Tool>();
+	let resume!: () => void, entered!: () => void;
+	const gate = new Promise<void>((resolve) => { resume = resolve; });
+	const ready = new Promise<void>((resolve) => { entered = resolve; });
+	const storage = memoryStorage();
+	let block = true;
+	const faulty = { ...storage, set: async (key: string, value: unknown) => {
+		if (block && (value as { pending?: unknown }).pending) { block = false; entered(); await gate; }
+		await storage.set(key, value);
+	} };
+	const nativeCalls: { agent: string; callID: string }[] = [];
+	await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
+		hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, ctx) => {
+			nativeCalls.push({ agent: input.agent, callID: (ctx as Context & { id: string }).id });
+			return { output: { sessionID: input.agent === "fusion-scout" ? "scout-child" : "child", status: "completed", output: "done" } };
+		} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+	} }, faulty);
+	const executorContext = { ...context("one"), id: "executor-call" };
+	const scoutContext = { ...context("one"), id: "scout-call" };
+	const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, executorContext);
+	try {
+		await ready;
+		await tools.get("fusion_scout")!.execute({ questions: ["q"] }, scoutContext);
+	} finally { resume(); }
+	await pending;
+	expect(nativeCalls).toEqual([
+		{ agent: "fusion-scout", callID: "scout-call" },
+		{ agent: "fusion-executor", callID: "executor-call" },
+	]);
+	await tools.get("fusion_reset")!.execute({}, context("one"));
 });

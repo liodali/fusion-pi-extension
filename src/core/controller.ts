@@ -228,9 +228,17 @@ export class FusionController {
 		return error;
 	}
 
-	start(task: string): void {
+	start(task: string, options?: { preserveScoutCalls?: boolean }): void {
 		if (this.state.delegating || this.pendingTurn || this.outcomeUnknown) throw new Error("Cannot start a Fusion run while an executor turn is unsettled.");
+		this.beginRun(task, options);
+	}
+
+	private beginRun(task: string, options?: { preserveScoutCalls?: boolean }): void {
+		// Scouting that preceded the run start belongs to the same session run, so
+		// its invocation budget can survive initialization; a plain start resets it.
+		const scouted = options?.preserveScoutCalls ? this.state.scoutCalls : 0;
 		this.initializeRun(task);
+		if (options?.preserveScoutCalls) this.state.scoutCalls = scouted;
 	}
 
 	private initializeRun(task: string): void {
@@ -254,11 +262,8 @@ export class FusionController {
 			throw new Error("An initial Fusion delegation must be acquired before starting execution.");
 		}
 		// The first execute starts the run for adapters without a separate run
-		// control. Scouting that preceded it belongs to the same session run, so
-		// its invocation budget survives; an explicit start() still resets it.
-		const scouted = this.state.scoutCalls;
-		this.initializeRun(task);
-		this.state.scoutCalls = scouted;
+		// control; scouting that preceded it is part of the same run.
+		this.beginRun(task, { preserveScoutCalls: true });
 		this.prepareExecution(brief);
 	}
 

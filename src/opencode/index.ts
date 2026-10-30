@@ -3,6 +3,7 @@ import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunMani
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
 import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt } from "../prompts.ts";
 import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse, scoutCapDecision } from "../core/scout.ts";
+import { MAX_REVISIONS } from "../limits.ts";
 import { formatCompactReport } from "../report.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
@@ -63,7 +64,7 @@ interface Run {
 	lastResult?: RunManifest["lastResult"];
 	model?: RunManifest["model"];
 	adapterData?: RunManifest["adapterData"];
-	setContext(context: ToolContext): void;
+	setContext(worker: WorkerHandle, context: ToolContext): void;
 	reconciling?: boolean;
 	before?: WorkspaceSnapshot;
 }
@@ -97,6 +98,7 @@ export default {
 		const runs = new Map<string, Run>();
 		let owner: string | undefined;
 		let resetting = false;
+		let starting = false;
 		// One subscription fans every raw bus event out to each runtime's owned-child
 		// routing (one async iterable cannot be consumed twice). When the host does
 		// not expose the pinned subscribe surface, streaming stays unsupported.
@@ -130,6 +132,7 @@ export default {
 		// effects occur — the exact-cap requirement for scouts.
 		type ScoutGuardEntry = { cap: ScoutCap; terminate: () => void; release?: () => void };
 		const scoutGuards = new Map<string, ScoutGuardEntry>();
+		const hasBackgroundScout = () => [...scoutGuards.values()].some((entry) => !!entry.release);
 		let activeScout: { entry: ScoutGuardEntry; childSessionID?: string } | undefined;
 		let scoutInFlight = false;
 		const SCOUT_TERMINAL_EVENTS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]);
@@ -147,16 +150,14 @@ export default {
 				get count() { return count; },
 			};
 		}
+		const MAX_TRACKED_SCOUTS = 8;
 		function trackScoutGuard(childSessionID: string, entry: ScoutGuardEntry): void {
-			scoutGuards.set(childSessionID, entry);
-			// Tracked guards are removed when their child's execution ends; the bound
-			// only exists so a host that never delivers a terminal event cannot leak
-			// entries unboundedly.
-			while (scoutGuards.size > 8) {
-				const oldest = scoutGuards.keys().next().value;
-				if (oldest === undefined || oldest === childSessionID) break;
-				scoutGuards.delete(oldest);
+			if (!scoutGuards.has(childSessionID) && scoutGuards.size >= MAX_TRACKED_SCOUTS) {
+				throw new Error("Fusion scout tracking is full; wait for an existing scout to stop.");
 			}
+			// A live child's cap must survive until its terminal event. Refuse new
+			// entries at capacity instead of evicting enforcement for existing work.
+			scoutGuards.set(childSessionID, entry);
 		}
 		// A scout child that is tracked but never backgrounded (or left behind by a
 		// previous plugin instance) releases its guard and handle when its
@@ -180,6 +181,10 @@ export default {
 				}
 				// A fusion-scout child this instance never armed must not run
 				// unguarded either: give it a fresh cap and track it.
+				// Reserve a slot for the active scout until its child is published.
+				if (activeScout && !scoutGuards.has(activeScout.childSessionID ?? "") && scoutGuards.size >= MAX_TRACKED_SCOUTS - 1) {
+					throw new Error("Fusion scout tracking is full; wait for an existing scout to stop.");
+				}
 				const fresh: ScoutGuardEntry = { cap: freshScoutCap(), terminate: () => {} };
 				trackScoutGuard(event.sessionID, fresh);
 				return fresh;
@@ -206,11 +211,11 @@ export default {
 		});
 		const storageKey = `run/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
 		async function makeRun(sessionID: string, record?: RunManifest): Promise<Run> {
-			let toolContext: ToolContext | undefined;
+			const toolContexts = new WeakMap<WorkerHandle, ToolContext>();
 			const workerOwner = { harness: "opencode", supervisorId: sessionID, workspace };
 			const runtime = createOpenCodeWorkerRuntime<ToolContext>({
 				execute: native!.execute,
-				contextFor: () => { if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
+				contextFor: (request) => { const toolContext = toolContexts.get(request.worker); if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
 				interrupt: typeof ctx.session.interrupt === "function" ? ((childSessionID: string) => Promise.resolve(ctx.session.interrupt!({ sessionID: childSessionID }))) : undefined,
 				bus: busHost ? { add: (sink) => { busSinks.add(sink); return () => { busSinks.delete(sink); }; } } : undefined,
 				validateReference: async (reference) => {
@@ -226,7 +231,7 @@ export default {
 			const handle = record?.pending ? await runtime.restorePending(workerOwner, config, { runId, requestId: record.pending.requestId }, reference) : reference ? await runtime.open(reference, config) : await runtime.create(workerOwner, config);
 			if (record?.pending) controller.setPending({ action: record.pending.action, requestId: record.pending.requestId });
 			controller.setUncertain(!!record && record.recovery !== "settled");
-			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model: record?.model, adapterData: record?.adapterData, setContext(context) { toolContext = context; } };
+			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model: record?.model, adapterData: record?.adapterData, setContext(worker, context) { toolContexts.set(worker, context); } };
 		}
 		const store = createManifestStore({
 			read: () => ctx.storage.get(storageKey), write: async (value) => { await ctx.storage.set(storageKey, value); }, remove: async () => { await ctx.storage.remove(storageKey); },
@@ -287,27 +292,61 @@ export default {
 
 		await ctx.tool.transform((editor) => {
 			editor.add({
+				name: "fusion_start",
+				description: "Start a Fusion run with the user's original request before scouting or delegation. Finish and reset the previous run first.",
+				input: { type: "object", properties: { task: { type: "string", minLength: 1 } }, required: ["task"], additionalProperties: false },
+				options: { codemode: false },
+				async execute(input, context) {
+					requireSupervisor(context);
+					if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+					if (!input || typeof input !== "object" || typeof (input as Record<string, unknown>).task !== "string" || !(input as { task: string }).task.trim()) throw new Error("Fusion requires a non-empty original task.");
+					const run = await runFor(context.sessionID);
+					if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
+					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before starting a run.");
+					if (run.controller.state.runActive || run.controller.state.executed || run.controller.pending || run.controller.uncertain || run.reconciling) throw new Error("Finish and reset the existing Fusion run before starting another.");
+					starting = true;
+					const priorState = structuredClone(run.controller.state);
+					try {
+						const parent = await ctx.session.get({ sessionID: context.sessionID });
+						if (parent.id !== context.sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace) throw new Error("OpenCode supervisor session or workspace does not match.");
+						// Scouting that preceded the run start is part of the same run.
+						run.controller.start((input as { task: string }).task, { preserveScoutCalls: true });
+						if (!run.lease) run.lease = await registry.claim(manifest(run));
+						owner = context.sessionID;
+						await persist(context.sessionID, run);
+						return { content: "Fusion run started. Investigate the original request, then use fusion_scout and fusion_delegate as needed.", metadata: { runId: run.runId } };
+					} catch (error) {
+						// A successful claim is authoritative even if the secondary store fails.
+						// Keep that run available for reset rather than releasing ownership silently.
+						if (!run.lease) Object.assign(run.controller.state, priorState);
+						throw error;
+					} finally { starting = false; }
+				},
+			});
+			editor.add({
 				name: "fusion_delegate",
 				description: "Delegate a decided implementation brief to the Fusion executor. Use execute once, then up to three revise calls and one final_fix after the acceptance audit. Review the actual working tree after each call.",
 				input: { type: "object", properties: { action: { type: "string", enum: ["execute", "revise", "final_fix"] }, brief: { type: "string", minLength: 1 }, originalTask: { type: "string" } }, required: ["action", "brief"], additionalProperties: false },
 				options: { codemode: false },
 				async execute(input, context) {
 					requireSupervisor(context);
-					if (resetting) throw new Error("Fusion reset is in progress.");
+					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
 					if (!input || typeof input !== "object") throw new Error("Invalid Fusion delegation input.");
 					const value = input as Record<string, unknown>;
 					if ((value.action !== "execute" && value.action !== "revise" && value.action !== "final_fix") || typeof value.brief !== "string" || !value.brief.trim() || (value.originalTask !== undefined && typeof value.originalTask !== "string")) throw new Error("Invalid Fusion delegation input.");
 					const action = value.action;
 					const run = await runFor(context.sessionID);
-					if (resetting) throw new Error("Fusion reset is in progress.");
+					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
 					if (run.reconciling) throw new Error("Fusion reconciliation is already in progress.");
 					if (run.controller.uncertain) throw new Error("The executor's last turn has an unknown outcome. Review the child session and working tree before recovery; automatic retry is disabled.");
 					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
+					if (action === "execute" && run.controller.state.originalTask && typeof value.originalTask === "string" && value.originalTask !== run.controller.state.originalTask) throw new Error("The original task was already recorded by fusion_start and cannot be replaced.");
 					const error = run.controller.beginDelegation(action, OPENCODE_CAPABILITIES, value.brief);
 					if (error) throw new Error(error);
-					run.setContext(context);
+					run.setContext(run.handle, context);
 					if (action === "execute") {
-						run.controller.startExecution(typeof value.originalTask === "string" && value.originalTask.trim() ? value.originalTask : value.brief, value.brief);
+						run.controller.startExecution(run.controller.state.originalTask ?? (typeof value.originalTask === "string" && value.originalTask.trim() ? value.originalTask : value.brief), value.brief);
 					}
 					run.controller.setPhase(action === "execute" ? "executing" : action === "revise" ? "revising" : "finalizing");
 					const promptText = run.controller.delegationPrompt(action, value.brief);
@@ -390,7 +429,7 @@ export default {
 				options: { codemode: false },
 				async execute(input, context) {
 					requireSupervisor(context);
-					if (resetting) throw new Error("Fusion reset is in progress.");
+					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
 					if (!input || typeof input !== "object") throw new Error("Invalid Fusion scout input.");
 					const value = input as Record<string, unknown>;
 					if (!Array.isArray(value.questions) || value.questions.length < 1 || value.questions.length > 5 || !value.questions.every((question) => typeof question === "string" && !!question.trim())) throw new Error("Invalid Fusion scout input.");
@@ -400,8 +439,10 @@ export default {
 					// native call until a real delegation submits; the invocation budget
 					// is still the shared per-run controller budget.
 					const run = await runFor(context.sessionID);
+					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
 					// Set synchronously so concurrent tool calls cannot double-submit.
 					if (scoutInFlight) throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
+					if (scoutGuards.size >= MAX_TRACKED_SCOUTS) throw new Error("Fusion scout tracking is full; wait for an existing scout to stop.");
 					scoutInFlight = true;
 					let handle: WorkerHandle | undefined;
 					let cap: ScoutCap | undefined;
@@ -414,8 +455,8 @@ export default {
 						// write must not block a read-only scout. Settlement writes keep
 						// their strict fault guarantees.
 						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
-						run.setContext(context);
 						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS });
+						run.setContext(handle, context);
 						cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
 						activeScout = {
 							entry: { cap, terminate: () => { void run.runtime.abort(handle!).catch(() => {}); } },
@@ -423,7 +464,11 @@ export default {
 						context.signal.addEventListener("abort", onAbort, { once: true });
 						const requestId = `Fusion scout ${randomUUID()}`;
 						const request: WorkerTurnRequest = { runId: run.runId, requestId, worker: handle, prompt: buildScoutPrompt(questions) };
-						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async () => {} });
+						const result = await run.runtime.submit(request, { signal: context.signal, onEvent: () => {}, onReference: async (reference) => {
+							if (!activeScout) throw new Error("Fusion scout guard is unavailable.");
+							activeScout.childSessionID = reference.id;
+							trackScoutGuard(reference.id, activeScout.entry);
+						} });
 						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
 						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
@@ -450,6 +495,7 @@ export default {
 							release: () => { void run.runtime.release(handle!).catch(() => {}); },
 						});
 					} else if (handle) {
+						if (childID) scoutGuards.delete(childID);
 						try { await run.runtime.release(handle); } catch (error) { releaseNote = error instanceof Error ? error.message : String(error); }
 					}
 					return releaseNote ? { ...response, content: `${response.content}\n\n(Fusion scout could not be released: ${releaseNote})` } : response;
@@ -466,7 +512,7 @@ export default {
 					const pending = run.controller.pending;
 					run.reconciling = true;
 					try {
-						run.setContext(context);
+						run.setContext(run.handle, context);
 						const request: WorkerTurnRequest = { runId: run.runId, requestId: pending.requestId, worker: run.handle, prompt: "" };
 						const persistResult = async (result: import("../core/worker.ts").WorkerTurnResult) => {
 							await run.controller.persistSettlement(result.status, async () => {
@@ -514,19 +560,35 @@ export default {
 						? status.backgroundPending || status.unsettled
 							? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
 							: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
-						: "Review the working tree or reset when the run is finished.";
-					return { content: JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, pending: run.controller.pending, childSessionID: run.handle.reference?.id, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction }) };
+						: !run.controller.state.executed
+							? "Investigate the original task, then call fusion_delegate with action execute."
+							: "Review the working tree and audit the original task; reset when the run is finished.";
+					return { content: JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, pending: run.controller.pending, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction }) };
+				},
+			});
+			editor.add({
+				name: "fusion_stats", description: "Show the current Fusion run's review and scout budgets. Token and cost totals are unavailable.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
+				async execute(_input, context) {
+					requireSupervisor(context);
+					const run = runs.get(context.sessionID);
+					if (!run) return { content: "No Fusion run in this session." };
+					return { content: JSON.stringify({ runId: run.runId, executed: run.controller.state.executed,
+						revisions: { used: run.controller.state.revisions, limit: MAX_REVISIONS },
+						scoutCalls: { used: run.controller.state.scoutCalls, limit: MAX_SCOUT_CALLS },
+						finalFixUsed: run.controller.state.finalFixUsed,
+						lastResult: run.lastResult ? { requestId: run.lastResult.requestId, status: run.lastResult.status } : undefined,
+						usage: { available: false, reason: "Aggregate token and cost totals are not yet collected by the OpenCode plugin." } }) };
 				},
 			});
 			editor.add({
 				name: "fusion_reset", description: "Finish a settled Fusion run and release its workspace for another session.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
-					if (resetting) throw new Error("Fusion reset is in progress.");
+					if (resetting || starting) throw new Error("Fusion reset is in progress or a run is starting.");
 					// Refuse before any mutation: dismantling storage, ownership, or the
 					// executor underneath an in-flight scout leaves the run partially
 					// reset and unrecoverable by retry.
-					if (scoutInFlight) throw new Error("A Fusion scout is still running; wait for it to answer before resetting.");
+					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before resetting.");
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
 					const error = run.controller.resetError(false, run.reconciling);

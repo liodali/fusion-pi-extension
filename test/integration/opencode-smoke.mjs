@@ -21,7 +21,7 @@ import fusion from "../fusion/opencode/index.ts";
 export default {
   id: "fusion-smoke",
   async setup(ctx) {
-    const result = { version: ctx.app.version, nativeFound: false, registered: false, nativeInvoked: false, recursiveRefused: false };
+    const result = { version: ctx.app.version, nativeFound: false, registered: false, runStarted: false, nativeInvoked: false, recursiveRefused: false };
     try {
       const native = (await ctx.tool.list()).find((tool) => tool.id === "subagent");
       if (!native || typeof native.execute !== "function") throw new Error("Native subagent executor is unavailable");
@@ -29,8 +29,17 @@ export default {
       await fusion.setup(ctx);
       const registered = await ctx.tool.list();
       const delegate = registered.find((tool) => tool.id === "fusion_delegate");
-      result.registered = !!delegate && ["fusion_status", "fusion_reset", "fusion_reconcile", "fusion_scout"].every((id) => registered.some((tool) => tool.id === id));
+      result.registered = !!delegate && ["fusion_start", "fusion_status", "fusion_stats", "fusion_reset", "fusion_reconcile", "fusion_scout"].every((id) => registered.some((tool) => tool.id === id));
       if (!result.registered) throw new Error("Fusion tools did not register");
+      const parent = await ctx.session.create({});
+      const toolContext = { sessionID: parent.id, agent: "fusion", messageID: "msg_start_probe", id: "call_start_probe", signal: new AbortController().signal, progress: async () => {} };
+      await registered.find((tool) => tool.id === "fusion_start").execute({ task: "Original smoke task" }, toolContext);
+      const state = JSON.parse((await registered.find((tool) => tool.id === "fusion_status").execute({}, toolContext)).content);
+      if (state.originalTask !== "Original smoke task" || state.owner.supervisorId !== parent.id || !state.workspaceClaimed) throw new Error("Fusion start did not retain the task and owner");
+      const stats = JSON.parse((await registered.find((tool) => tool.id === "fusion_stats").execute({}, toolContext)).content);
+      if (stats.revisions.used !== 0 || stats.usage.available !== false) throw new Error("Fusion stats did not report the initial budget and unavailable usage");
+      await registered.find((tool) => tool.id === "fusion_reset").execute({}, toolContext);
+      result.runStarted = true;
       try {
         await delegate.execute({ action: "execute", brief: "Probe only" }, { sessionID: "ses_fusion_probe_missing", agent: "fusion", messageID: "msg_probe", id: "call_probe", signal: new AbortController().signal, progress: async () => {} });
         throw new Error("Missing-parent call unexpectedly succeeded");
@@ -81,9 +90,10 @@ export default {
 	assert.ok(result, "Plugin setup did not produce a probe result");
 	assert.equal(result.nativeFound, true, result.error);
 	assert.equal(result.registered, true, result.error);
+	assert.equal(result.runStarted, true, result.error);
 	assert.equal(result.nativeInvoked, true, result.error);
 	assert.equal(result.recursiveRefused, true, result.error);
-	console.log(JSON.stringify({ ...result, scope: "Fusion plugin registration + native missing-parent rejection + recursive worker refusal; no model execution" }));
+	console.log(JSON.stringify({ ...result, scope: "Fusion registration, run start/status/reset, native missing-parent rejection and recursive worker refusal; no model execution" }));
 } finally {
 	if (child && child.exitCode === null) {
 		child.kill("SIGTERM");

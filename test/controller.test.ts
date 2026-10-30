@@ -23,6 +23,27 @@ test("controller applies delegation budgets and releases the in-flight guard", (
 	expect(controller.beginScout()).toContain("Scout limit");
 });
 
+test("run start resets budgets; only the scout budget can be preserved across it", () => {
+	const state = { runActive: false, phase: "idle" as const, settleNudges: 0, delegating: false, executed: false, revisions: 0, finalFixUsed: false, resumePending: false, scoutCalls: 0 };
+	const controller = new FusionController(state);
+	controller.start("first task");
+	const plain = controller.state;
+	expect(plain.task).toBe("first task");
+	expect(plain.originalTask).toBe("first task");
+	expect(plain.runActive).toBe(true);
+	expect(plain.phase).toBe("planning");
+	// Scouting precedes the run start in the OpenCode flow: the invocation
+	// budget is the same run's budget and survives the start.
+	for (let i = 0; i < 2; i++) expect(controller.beginScout()).toBeUndefined();
+	controller.start("second task", { preserveScoutCalls: true });
+	expect(controller.state.scoutCalls).toBe(2);
+	expect(controller.state.task).toBe("second task");
+	expect(controller.state.originalTask).toBe("second task");
+	// A plain start is a new run and clears the budget.
+	controller.start("third task");
+	expect(controller.state.scoutCalls).toBe(0);
+});
+
 test("reopening a transcript does not imply reattaching an interrupted turn", () => {
 	const state = { runActive: false, phase: "idle" as const, settleNudges: 0, delegating: false, executed: true, revisions: 0, finalFixUsed: false, resumePending: true, scoutCalls: 0 };
 	const controller = new FusionController(state);
