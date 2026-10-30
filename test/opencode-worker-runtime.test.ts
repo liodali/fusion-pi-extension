@@ -203,7 +203,7 @@ test("foreground settlement failure blocks reuse until the same result is persis
 	await f.runtime.shutdown();
 });
 
-type BusEvent = { id?: string; type: string; data?: Record<string, unknown> };
+type BusEvent = { id?: string; created?: number; type: string; data?: Record<string, unknown> };
 function busFixture(execute: NativeSubagentExecute<Context>) {
 	const forwarded: unknown[] = [];
 	const context: Context = { sessionID: "parent", id: "call", messageID: "message", signal: new AbortController().signal, progress: async (update) => { forwarded.push(update); } };
@@ -315,6 +315,106 @@ test("events without an owned active turn never restart or leak into later turns
 	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
 	await f.runtime.release(worker);
 	await f.runtime.shutdown();
+});
+
+test("a reopened child reports unknown usage until a verified baseline exists", async () => {
+	const readings: Omit<BusEvent, "created">[] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		const event = readings[turn];
+		turn++;
+		if (event) f.push({ ...event, created: Date.now() });
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	});
+	// Reopen a pre-existing child: its cumulative reading may contain unobserved history.
+	const worker = await f.runtime.open({ owner, runtime: "native-subagent", id: "child" }, config);
+	const request = { runId: "run", requestId: "request", worker, prompt: "work" };
+	const options = { onEvent: () => {}, onReference: async () => {} };
+	readings.push({ id: "u1", type: "session.usage.updated", data: { sessionID: "child", cost: 9, tokens: { input: 900, output: 90, reasoning: 9, cache: { read: 9, write: 9 } } } });
+	const first = await f.runtime.submit(request, options);
+	expect(first.usage).toBeUndefined();
+	await f.runtime.settle(request, async () => {});
+	// The next turn owns a verified baseline: the reading observed during the reopen turn.
+	readings.push({ id: "u2", type: "session.usage.updated", data: { sessionID: "child", cost: 11, tokens: { input: 1000, output: 120, reasoning: 19, cache: { read: 13, write: 11 } } } });
+	const second = await f.runtime.submit(request, options);
+	expect(second.usage).toEqual({ inputTokens: 100, outputTokens: 30, cacheReadTokens: 4, cacheWriteTokens: 2, reasoningTokens: 10, cost: 2 });
+	await f.runtime.settle(request, async () => {});
+	await f.runtime.release(worker);
+});
+
+test("delayed accounting on a later fresh turn stays unknown", async () => {
+	const perTurn: Omit<BusEvent, "created">[][] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		for (const event of perTurn[turn] ?? []) f.push({ ...event, created: Date.now() });
+		turn++;
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const request = { runId: "run", requestId: "request", worker, prompt: "work" };
+	const options = { onEvent: () => {}, onReference: async () => {} };
+	// Turn 1 measures nothing; turn 2's first reading includes turn 1's tokens and cannot be attributed.
+	perTurn.push([]);
+	await f.runtime.submit(request, options);
+	await f.runtime.settle(request, async () => {});
+	perTurn.push([{ id: "u1", type: "session.usage.updated", data: { sessionID: "child", cost: 5, tokens: { input: 150, output: 60, reasoning: 0, cache: { read: 0, write: 0 } } } }]);
+	const second = await f.runtime.submit(request, options);
+	expect(second.usage).toBeUndefined();
+	await f.runtime.settle(request, async () => {});
+	// Turn 3 has a verified baseline from turn 2's reading.
+	perTurn.push([{ id: "u2", type: "session.usage.updated", data: { sessionID: "child", cost: 7, tokens: { input: 200, output: 90, reasoning: 10, cache: { read: 5, write: 0 } } } }]);
+	const third = await f.runtime.submit(request, options);
+	expect(third.usage).toEqual({ inputTokens: 50, outputTokens: 30, cacheReadTokens: 5, cacheWriteTokens: 0, reasoningTokens: 10, cost: 2 });
+	await f.runtime.settle(request, async () => {});
+	await f.runtime.release(worker);
+});
+
+test("prior-turn replays are rejected by creation time", async () => {
+	const observed: unknown[] = [];
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		f.push({ id: "old", created: Date.now() - 60000, type: "session.text.delta", data: { sessionID: "child", delta: "stale replay" } });
+		f.push({ id: "now", created: Date.now(), type: "session.text.delta", data: { sessionID: "child", delta: "current" } });
+		f.push({ id: "undated", type: "session.text.delta", data: { sessionID: "child", delta: "unverifiable" } });
+		return { output: { sessionID: "child", status: "completed", output: "done" } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	await f.runtime.submit({ runId: "run", requestId: "request", worker, prompt: "work" }, { onEvent: (event) => { observed.push((event as { event: { type: string; delta?: string } }).event.delta); }, onReference: async () => {} });
+	expect(observed).toEqual(["current", "unverifiable"]);
+	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
+	await f.runtime.release(worker);
+});
+
+test("replayed usage readings cannot regress the cumulative state", async () => {
+	const turns: { event: Omit<BusEvent, "created">; ageMs?: number }[][] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		for (const { event, ageMs } of turns[turn] ?? []) f.push({ ...event, created: Date.now() - (ageMs ?? 0) });
+		turn++;
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const request = { runId: "run", requestId: "request", worker, prompt: "work" };
+	const options = { onEvent: () => {}, onReference: async () => {} };
+	// Turn 1 sees a newer reading and then an older replay; the replay must not overwrite it.
+	turns.push([
+		{ event: { id: "u1", type: "session.usage.updated", data: { sessionID: "child", cost: 4, tokens: { input: 400, output: 40, reasoning: 4, cache: { read: 4, write: 4 } } } } },
+		{ event: { id: "u0", type: "session.usage.updated", data: { sessionID: "child", cost: 1, tokens: { input: 100, output: 10, reasoning: 1, cache: { read: 1, write: 1 } } } }, ageMs: 60000 },
+	]);
+	const first = await f.runtime.submit(request, options);
+	expect(first.usage).toMatchObject({ inputTokens: 400, cost: 4 });
+	await f.runtime.settle(request, async () => {});
+	// The verified baseline for the next turn is the newest reading, not the replay.
+	turns.push([
+		{ event: { id: "u2", type: "session.usage.updated", data: { sessionID: "child", cost: 6, tokens: { input: 500, output: 60, reasoning: 6, cache: { read: 6, write: 6 } } } } },
+	]);
+	const second = await f.runtime.submit(request, options);
+	expect(second.usage).toMatchObject({ inputTokens: 100, cost: 2 });
+	await f.runtime.settle(request, async () => {});
+	await f.runtime.release(worker);
 });
 
 test("capabilities stay per-instance: streaming only with the host bus", async () => {

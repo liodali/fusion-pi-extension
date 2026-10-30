@@ -6,6 +6,8 @@ type Native<C extends NativeToolContext> = ReturnType<typeof createNativeExecuto
 type Handle<C extends NativeToolContext> = WorkerHandle & {
 	native: Native<C>;
 	active: boolean;
+	/** True when this runtime spawned the child; opened references may carry unobserved history. */
+	createdFresh: boolean;
 	backgrounded: boolean;
 	uncertain?: { runId: string; requestId: string };
 	unsettled?: WorkerTurnResult;
@@ -16,6 +18,8 @@ type Handle<C extends NativeToolContext> = WorkerHandle & {
 export interface OpenCodeBusEvent {
 	/** Stable native identity (`evt_...`); the controller deduplicates repeats. */
 	id?: string;
+	/** Server timestamp (epoch ms); events created before the active turn started are prior-turn replays. */
+	created?: number;
 	type: string;
 	/** Event payload; `sessionID` routes every session-scoped event. */
 	data?: Record<string, unknown>;
@@ -50,13 +54,18 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	agent?: string;
 	bus?: { add(sink: (event: OpenCodeBusEvent) => void): () => void };
 }): OpenCodeWorkerRuntime {
-	type ActiveTurn = { request: WorkerTurnRequest; options: WorkerTurnOptions; baseline?: WorkerUsage; sawUsage?: boolean; toolNames: Map<string, string> };
+	type ActiveTurn = { request: WorkerTurnRequest; options: WorkerTurnOptions; startedAt: number; baseline?: WorkerUsage; baselineVerified: boolean; sawUsage?: boolean; toolNames: Map<string, string> };
 	const handles = new Set<Handle<C>>();
 	const openingReferences = new Set<string>();
 	/** Active turns keyed by owned child session; events for other sessions are ignored. */
 	const activeTurns = new Map<string, ActiveTurn>();
 	/** Last cumulative per-session reading (`session.usage.updated` is monotonic per session). */
 	const usageByChild = new Map<string, WorkerUsage>();
+	/** Server timestamp and native ids of accepted readings; replays must not regress or re-prove usage. */
+	const usageCreated = new Map<string, number>();
+	const usageEventIds = new Map<string, Set<string>>();
+	/** Child sessions that already started a turn in this runtime; only their first turn may treat a missing baseline as zero history. */
+	const startedTurns = new Set<string>();
 	const referenceKey = (id: string) => id;
 	function assertUnowned(id: string, except?: Handle<C>): void {
 		if (openingReferences.has(referenceKey(id)) || [...handles].some((handle) => handle !== except && handle.reference?.id === id)) {
@@ -83,7 +92,7 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			model: config.model ? `${config.model.provider}/${config.model.modelId}` : undefined,
 			onReference: async (id) => { assertUnowned(id, handle); if (!handle.publish) throw new Error("No active reference persistence callback."); await handle.publish(id); },
 		});
-		handle = { owner: owned, runtime: RUNTIME, get reference() { return native.childSessionID ? Object.freeze({ owner: owned, runtime: RUNTIME, id: native.childSessionID }) : undefined; }, native, active: false, backgrounded: !!pending && !!childSessionID, uncertain: pending && { ...pending } };
+		handle = { owner: owned, runtime: RUNTIME, get reference() { return native.childSessionID ? Object.freeze({ owner: owned, runtime: RUNTIME, id: native.childSessionID }) : undefined; }, native, active: false, createdFresh: !childSessionID, backgrounded: !!pending && !!childSessionID, uncertain: pending && { ...pending } };
 		handles.add(handle);
 		return handle;
 	}
@@ -164,15 +173,29 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type || !data || typeof data.sessionID !== "string") return;
 		const childID = data.sessionID;
+		const created = typeof event.created === "number" ? event.created : undefined;
+		const turn = activeTurns.get(childID);
+		// Events created before this turn started belong to a previous turn; a replay
+		// delivered under the active request would misattribute prior-turn work.
+		const priorTurn = created !== undefined && turn !== undefined && created < turn.startedAt;
 		if (type === "session.usage.updated") {
 			const usage = parseUsage(data);
-			if (usage) usageByChild.set(childID, usage);
-			const turn = activeTurns.get(childID);
-			if (turn && usage) turn.sawUsage = true;
+			if (usage) {
+				let seen = usageEventIds.get(childID);
+				if (!seen) { seen = new Set(); usageEventIds.set(childID, seen); }
+				const duplicate = typeof event.id === "string" && seen.has(event.id);
+				const lastCreated = usageCreated.get(childID);
+				const stale = created !== undefined && lastCreated !== undefined && created < lastCreated;
+				if (!duplicate && !stale) {
+					if (typeof event.id === "string") seen.add(event.id);
+					usageByChild.set(childID, usage);
+					if (created !== undefined) usageCreated.set(childID, created);
+					if (turn && !priorTurn) turn.sawUsage = true;
+				}
+			}
 			return;
 		}
-		const turn = activeTurns.get(childID);
-		if (!turn) return;
+		if (!turn || priorTurn) return;
 		const mapped = mapExecutorEvent(type, data, turn);
 		if (!mapped) return;
 		turn.options.onEvent({
@@ -225,12 +248,19 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			if (handle.active || handle.uncertain || handle.unsettled) throw new Error("OpenCode worker is active or its outcome is uncertain or unsettled.");
 			const ctx = context(request, options);
 			if (ctx.signal.aborted) throw new Error("OpenCode worker turn was cancelled before submission.");
+			const startedAt = Date.now();
 			handle.active = true;
 			let registeredChild: string | undefined;
 			let registeredTurn: ActiveTurn | undefined;
 			const register = (childID: string) => {
 				registeredChild = childID;
-				registeredTurn = { request, options, baseline: usageByChild.get(childID), toolNames: new Map() };
+				// A missing baseline only proves zero history when this runtime spawned
+				// the child and no earlier turn ran here; reopened references may carry
+				// unobserved usage, so their first turn reports unknown instead.
+				const firstTurn = !startedTurns.has(childID);
+				startedTurns.add(childID);
+				const baseline = usageByChild.get(childID);
+				registeredTurn = { request, options, startedAt, baseline, baselineVerified: baseline !== undefined || (firstTurn && handle.createdFresh), toolNames: new Map() };
 				activeTurns.set(childID, registeredTurn);
 			};
 			const existingChild = handle.reference?.id;
@@ -238,9 +268,10 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			handle.publish = async (id) => { if (!registeredChild) register(id); await options.onReference({ owner: handle.owner, runtime: RUNTIME, id }); };
 			try {
 				const output = await handle.native.prompt(request.prompt, request.requestId, ctx);
-				// Only a reading observed during this turn proves this turn's usage;
-				// a stale cumulative value would otherwise turn into invented zeros.
-				const usage = registeredTurn?.sawUsage ? usageDelta(usageByChild.get(output.sessionID), registeredTurn.baseline) : undefined;
+				// Only a reading observed during this turn proves this turn's usage, and
+				// only a verified baseline (or a provably fresh child) makes the
+				// cumulative reading attributable; anything else stays unknown.
+				const usage = registeredTurn?.sawUsage && registeredTurn.baselineVerified ? usageDelta(usageByChild.get(output.sessionID), registeredTurn.baseline) : undefined;
 				const completed = Object.freeze({ ...result(request, output.output), ...(usage ? { usage } : {}) });
 				handle.unsettled = completed;
 				return completed;
