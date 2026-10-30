@@ -102,6 +102,32 @@ export default {
 	assert.ok(url && password, "OpenCode did not announce readiness within 30s");
 	const response = await fetch(`${url}/api/location`, { headers: { authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}` }, signal: AbortSignal.timeout(10000) });
 	assert.equal(response.status, 200, `Location activation failed (${response.status})`);
+	// Native command surface: the plugin registers user-facing commands (model-free).
+	const authHeader2 = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+	let fusionCommands;
+	{
+		const deadline2 = Date.now() + 30000;
+		while (Date.now() < deadline2) {
+			try {
+				const commandList = await fetch(`${url}/api/command`, { headers: { authorization: authHeader2 }, signal: AbortSignal.timeout(10000) });
+				const commandBody = await commandList.json();
+				const names = (commandBody.data ?? []).map((entry) => entry.name);
+				fusionCommands = names.filter((name) => typeof name === "string" && name.startsWith("fusion-"));
+				if (fusionCommands.length >= 5) break;
+			} catch {}
+			await delay(100);
+		}
+	}
+	assert.ok(fusionCommands && fusionCommands.length >= 5, `Fusion commands did not register: ${JSON.stringify(fusionCommands)}`);
+	console.error("fusion commands:", fusionCommands.join(", "));
+	// The command API can drive registered commands in a session (fusion-status is model-free).
+	const commandSession = await fetch(`${url}/api/session`, { method: "POST", headers: { authorization: authHeader2, "content-type": "application/json" }, body: JSON.stringify({}) });
+	assert.equal(commandSession.status, 200, `Command-probe session create failed (${commandSession.status})`);
+	const commandSessionText = await commandSession.text();
+	const commandSessionBody = JSON.parse(commandSessionText);
+	const commandSessionID = commandSessionBody.id ?? commandSessionBody.data?.id;
+	const commandInvoked = await fetch(`${url}/api/session/${commandSessionID}/command`, { method: "POST", headers: { authorization: authHeader2, "content-type": "application/json" }, body: JSON.stringify({ name: "fusion-status", text: "" }) });
+	assert.ok(commandInvoked.status >= 200 && commandInvoked.status < 300, `fusion-status command invocation failed (${commandInvoked.status})`);
 	let result;
 	while (Date.now() < deadline) {
 		try { result = JSON.parse(await readFile(join(project, "probe-result.json"), "utf8")); break; }

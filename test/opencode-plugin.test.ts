@@ -7,9 +7,11 @@ import plugin from "../src/opencode/index.ts";
 import { nodeGitExec } from "../src/workspace/node-git.ts";
 import { openWorkspaceRegistry } from "../src/workspace/ownership.ts";
 import { readRunManifest } from "../src/core/manifest.ts";
+import { OPENCODE_CAPABILITIES } from "../src/opencode/native-executor.ts";
 
 type Context = { sessionID: string; agent: string; signal: AbortSignal; progress: (update: Record<string, unknown>) => Promise<void> };
 type Tool = { name: string; execute: (input: unknown, context: Context) => Promise<{ content: string; metadata?: Record<string, unknown> }> };
+type CommandDefinition = { name: string; description: string; execute: (args: { sessionID: string; prompt?: { text?: string } }) => unknown };
 const context = (sessionID: string, agent = "fusion"): Context => ({ sessionID, agent, signal: new AbortController().signal, progress: async () => {} });
 
 function memoryStorage() {
@@ -31,10 +33,171 @@ async function setupTest(context: TestContext, storage = memoryStorage()) {
 }
 
 describe("OpenCode Fusion plugin", () => {
+	test("registers native commands and /fusion starts a run and injects the supervisor prompt", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const commands: CommandDefinition[] = [];
+		const prompts: { sessionID: string; text?: string }[] = [];
+		const pushPrompt = (input: unknown) => { const value = input as { sessionID: string; text?: string }; prompts.push(value); };
+		await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {}, prompt: async (input: unknown) => { pushPrompt(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { const editor = { add: (command: CommandDefinition) => { commands.push(command); } }; await callback(editor); } },
+			tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-status", "fusion-stats", "fusion-clean"]);
+		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
+		expect(prompts).toHaveLength(1);
+		expect(prompts[0].sessionID).toBe("one");
+		expect(prompts[0].text).toContain("Build the thing");
+		expect(prompts[0].text).toContain("Fusion supervisor");
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.originalTask).toBe("Build the thing");
+		expect(status.runActive).toBe(true);
+		expect(status.workspaceClaimed).toBe(true);
+		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "Another" } })).rejects.toThrow("Finish and reset");
+		// /fusion-status command reports the same payload as the tool.
+		const commandStatus = JSON.parse(String(await commands[2].execute({ sessionID: "one" })));
+		expect(commandStatus.originalTask).toBe("Build the thing");
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+		// After reset the run is gone: /fusion can start the next one.
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Next run" } });
+		expect(prompts).toHaveLength(2);
+	});
+
+	test("/fusion refuses honestly when the host cannot inject prompts", async () => {
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: tmpdir() },
+			session: { context: async () => [], hook: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { const editor = { add: (command: CommandDefinition) => { commands.push(command); } }; await callback(editor); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async () => {} },
+		});
+		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "task" } })).rejects.toThrow("cannot inject the run prompt");
+	});
+
+	test("persistent mode gates fusion tools per session until a run is active", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		let commandTransform!: (editor: { add: (command: CommandDefinition) => void }) => Promise<void>;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		let commands: CommandDefinition[] = [];
+		const reportBlock = '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```';
+		const base = () => ({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, prompt: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => Promise<void>) => { commandTransform = callback; } },
+			tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: reportBlock } }) }],
+				transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		});
+		await setupTest(base() as TestContext, storage);
+		await commandTransform({ add: (command) => { commands.push(command); } });
+		const fusionTools = () => { const record: Record<string, unknown> = { fusion_start: {}, fusion_delegate: {}, fusion_scout: {}, fusion_reconcile: {}, fusion_reset: {}, fusion_configure: {}, fusion_status: {}, fusion_stats: {}, read: {} }; contextHook({ agent: "fusion", tools: record, sessionID: "one" }); return record; };
+		// Mode off by default: a session without an active run loses mutation tools.
+		let record = fusionTools();
+		expect(record).not.toHaveProperty("fusion_start");
+		expect(record).not.toHaveProperty("fusion_delegate");
+		expect(record).toHaveProperty("fusion_status");
+		expect(record).toHaveProperty("fusion_stats");
+		expect(record).toHaveProperty("read");
+		// Non-fusion agents are never touched.
+		const buildRecord: Record<string, unknown> = { fusion_delegate: {}, read: {} };
+		contextHook({ agent: "build", tools: buildRecord, sessionID: "one" });
+		expect(buildRecord).toHaveProperty("fusion_delegate");
+		// /fusion starts the run: tools become visible for that session.
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Build it" } });
+		record = fusionTools();
+		expect(record).toHaveProperty("fusion_delegate");
+		// Mode on: visible even without an active run; the toggle persists.
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+		record = fusionTools();
+		expect(record).toHaveProperty("fusion_start");
+		// Reload: the persisted mode survives, and the new instance's toggle owns it now.
+		await setupTest(base() as TestContext, storage);
+		const commandsAfterReload: CommandDefinition[] = [];
+		await commandTransform({ add: (command) => { commandsAfterReload.push(command); } });
+		record = fusionTools();
+		expect(record).toHaveProperty("fusion_start");
+		// Mode off again hides them.
+		await commandsAfterReload[1].execute({ sessionID: "one", prompt: { text: "off" } });
+		record = fusionTools();
+		expect(record).not.toHaveProperty("fusion_start");
+	});
+
+	test("fusion-clean refuses an unsettled foreign record", async () => {
+		const root = await mkdtemp(join(tmpdir(), "fusion-plugin-clean-"));
+		const storage = memoryStorage();
+		const tools = new Map<string, Tool>();
+		let failNative = false;
+		const makeContext = (capture: CommandDefinition[]) => ({
+			location: { directory: root },
+			session: { context: async () => [], hook: async () => {}, prompt: async () => {}, get: async ({ sessionID: id }: { sessionID: string }) => ({ id, location: { directory: root } }) },
+			command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => unknown) => { await callback({ add: (command) => capture.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { if (failNative) throw new Error("connection lost"); return { output: { sessionID: "child", status: "completed", output: "done" } }; } }], transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		let host: { close(): void } | undefined;
+		try {
+			// Instance A owns the run as session "A"; a failed delegation leaves the record pending.
+			const commandsA: CommandDefinition[] = [];
+			host = await setupTest(makeContext(commandsA) as TestContext, storage);
+			await commandsA[0].execute({ sessionID: "A", prompt: { text: "Task" } });
+			failNative = true;
+			await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("A"))).rejects.toThrow("connection lost");
+			// Instance B adopts the pending record; clean from B's own session refuses it.
+			host.close(); host = undefined;
+			failNative = false;
+			const commandsB: CommandDefinition[] = [];
+			let cleanB: ((args: { sessionID: string }) => unknown) | undefined;
+			host = await setupTest({ ...makeContext(commandsB), command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => unknown) => { await callback({ add: (command) => { commandsB.push(command); if (command.name === "fusion-clean") cleanB = command.execute; } }); } } } as TestContext, storage);
+			await expect(cleanB!({ sessionID: "B" })).rejects.toThrow("is pending; reconcile it or run the explicit operator resolution");
+			host.close(); host = undefined;
+		} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
+	});
+
+	test("fusion-clean releases a settled foreign record through claim-then-release", async () => {
+		const root = await mkdtemp(join(tmpdir(), "fusion-plugin-clean-settled-"));
+		const storage = memoryStorage();
+		const tools = new Map<string, Tool>();
+		const makeContext = (capture: CommandDefinition[]) => ({
+			location: { directory: root },
+			session: { context: async () => [], hook: async () => {}, prompt: async () => {}, get: async ({ sessionID: id }: { sessionID: string }) => ({ id, location: { directory: root } }) },
+			command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => unknown) => { await callback({ add: (command) => capture.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		let host: { close(): void } | undefined;
+		let runId: string | undefined;
+		try {
+			const commandsA: CommandDefinition[] = [];
+			host = await setupTest(makeContext(commandsA) as TestContext, storage);
+			// fusion_start persists a settled record (no executor work yet).
+			await commandsA[0].execute({ sessionID: "A", prompt: { text: "Task" } });
+			const ownedStatus = JSON.parse((await tools.get("fusion_status")!.execute({}, context("B"))).content);
+			expect(ownedStatus.recovery).toBe("settled");
+			runId = ownedStatus.runId;
+			// Instance B adopts the settled record; clean from B's own session releases it.
+			host.close(); host = undefined;
+			const commandsB: CommandDefinition[] = [];
+			let cleanB: ((args: { sessionID: string }) => unknown) | undefined;
+			host = await setupTest({ ...makeContext(commandsB), command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => unknown) => { await callback({ add: (command) => { commandsB.push(command); if (command.name === "fusion-clean") cleanB = command.execute; } }); } } } as TestContext, storage);
+			expect(await cleanB!({ sessionID: "B" })).toBe("Released settled Fusion ownership for this workspace.");
+			// The record is released: another session sees no Fusion run here.
+			expect(await tools.get("fusion_status")!.execute({}, context("B"))).toHaveProperty("content", "No Fusion run in this session.");
+			expect(runId).toBeString();
+		} finally { host?.close(); await rm(root, { recursive: true, force: true }); }
+	});
+
 	test("configures a catalog-validated executor model that reaches scout and executor submissions", async () => {
 		const tools = new Map<string, Tool>();
 		const storage = memoryStorage();
 		const nativeInputs: { agent?: string; model?: string }[] = [];
+		const executorReport = '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```';
 		const catalog = { list: async () => ({ data: [
 			{ providerID: "prov", id: "executor-model", name: "Executor Model", status: "active", enabled: true, variants: [{ id: "low" }, { id: "high" }], cost: [{ input: 1, output: 3 }], time: { released: 1750000000000 } },
 			{ providerID: "prov", id: "no-variants", name: "No Variants", status: "active", enabled: true, cost: [{ output: 20 }] },
@@ -43,7 +206,7 @@ describe("OpenCode Fusion plugin", () => {
 		await setupTest({ location: { directory: "/workspace" }, model: catalog, session: { context: async () => [], hook: async () => {} }, tool: {
 			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
 				nativeInputs.push({ agent: input.agent, model: input.model });
-				return { output: { sessionID: input.agent === "fusion-scout" ? "scout" : "child", status: "completed", output: input.agent === "fusion-scout" ? "answer" : '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				return { output: { sessionID: input.agent === "fusion-scout" ? "scout" : "child", status: "completed", output: input.agent === "fusion-scout" ? "answer" : executorReport } };
 			} }],
 			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 		} }, storage);
@@ -78,10 +241,11 @@ describe("OpenCode Fusion plugin", () => {
 	test("configure without a host catalog refuses honestly and fusion tools stay on host defaults", async () => {
 		const tools = new Map<string, Tool>();
 		let modelSeen = false;
+		const reportBlock = '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```';
 		await setupTest({ location: { directory: tmpdir() }, session: { context: async () => [], hook: async () => {} }, tool: {
 			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
 				modelSeen = input.model !== undefined && input.model !== null;
-				return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				return { output: { sessionID: "child", status: "completed", output: reportBlock } };
 			} }],
 			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 		} });

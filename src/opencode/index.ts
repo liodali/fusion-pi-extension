@@ -1,7 +1,7 @@
 import { FusionController } from "../core/controller.ts";
 import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunManifest } from "../core/manifest.ts";
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
-import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt } from "../prompts.ts";
+import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt, buildSupervisorPrompt } from "../prompts.ts";
 import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse, scoutCapDecision } from "../core/scout.ts";
 import { MAX_REVISIONS } from "../limits.ts";
 import { getOutputPrice, isModelInTier, type FusionModelTier } from "../pricing.ts";
@@ -45,6 +45,15 @@ interface HostModel {
 	cost?: readonly { output?: number }[];
 	time?: { released?: number };
 }
+/** A plugin-registered native command; `execute` performs the action, its return value is presentation-only. */
+interface CommandDefinition {
+	name: string;
+	description: string;
+	execute: (args: { sessionID: string; prompt?: { text?: string }; delivery?: string }) => unknown;
+}
+interface CommandEditor {
+	add(command: CommandDefinition): unknown;
+}
 interface PluginContext {
 	location: { directory: string };
 	storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<unknown>; remove(key: string): Promise<unknown> };
@@ -56,9 +65,11 @@ interface PluginContext {
 	session: {
 		context(input: { sessionID: string }): Promise<readonly unknown[]>;
 		get(input: { sessionID: string }): Promise<{ id: string; parentID?: string; location?: { directory?: string } }>;
-		hook(name: "context", callback: (event: { agent: string; tools: Record<string, unknown> }) => void): Promise<unknown>;
+		hook(name: "context", callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void): Promise<unknown>;
 		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
 		interrupt?(input: { sessionID: string }): Promise<unknown>;
+		/** Present in OpenCode v2 hosts; absence leaves /fusion unable to inject the supervisor prompt. */
+		prompt?(input: { sessionID: string; text?: string }): Promise<unknown>;
 	};
 	/** Pinned in OpenCode v2.2.2: options-object subscribe returning a lazy async iterable. Absence leaves worker events unsupported. */
 	event?: {
@@ -68,12 +79,19 @@ interface PluginContext {
 	model?: {
 		list(): Promise<{ location?: unknown; data?: readonly HostModel[] }>;
 	};
+	/** Pinned live on OpenCode v2.2.3: transform registers commands (`{name, description, execute}`); execute receives `{ sessionID, prompt: { text }, delivery }` and its return value is presentation-only. Absence leaves Fusion without user-facing commands. */
+	command?: {
+		list(): Promise<{ location?: unknown; data?: readonly { name?: string; description?: string }[] }>;
+		transform(callback: (editor: CommandEditor) => unknown): Promise<unknown>;
+	};
 }
 
 /** Dedicated disposable read-only scout subagent. */
 const SCOUT_AGENT = "fusion-scout";
 /** Read/search/list operations the scout may execute; everything else is refused before its effects occur. OpenCode v2 tool names. */
 const SCOUT_TOOLS = new Set(["read", "grep", "glob"]);
+/** Fusion tools hidden from the fusion agent when persistent mode is off and its session has no active run. Read-only reporting tools stay visible. */
+const FUSION_GATED_TOOLS = ["fusion_start", "fusion_delegate", "fusion_scout", "fusion_reconcile", "fusion_reset", "fusion_configure"];
 
 interface Run {
 	controller: FusionController;
@@ -119,6 +137,14 @@ export default {
 		let owner: string | undefined;
 		let resetting = false;
 		let starting = false;
+		// Persistent mode (default off, persisted per location): when off, gated
+		// Fusion tools are visible to a fusion session only while a run is active;
+		// /fusion starts runs, so the user keeps explicit control.
+		let fusionMode = (await ctx.storage.get("fusion-mode")) === true;
+		const setFusionMode = async (enabled: boolean): Promise<void> => {
+			fusionMode = enabled;
+			await ctx.storage.set("fusion-mode", enabled);
+		};
 		// One subscription fans every raw bus event out to each runtime's owned-child
 		// routing (one async iterable cannot be consumed twice). When the host does
 		// not expose the pinned subscribe surface, streaming stays unsupported.
@@ -228,6 +254,15 @@ export default {
 			// when the host exposes child sessions here. The execute.before guard
 			// above stays the enforced boundary either way.
 			if (event.agent === SCOUT_AGENT) for (const name of Object.keys(event.tools)) if (!SCOUT_TOOLS.has(name)) delete event.tools[name];
+			// Persistent-mode gating (mode off is the default): mutation tools are
+			// visible to the fusion agent only while its session runs a run. The
+			// event fires per turn, so toggling applies from the next turn. The
+			// host refuses calls to tools absent from this record, so hiding here
+			// is enforced availability, not guidance.
+			if (event.agent === "fusion" && !fusionMode) {
+				const sessionID = typeof event.sessionID === "string" ? event.sessionID : undefined;
+				if (!runs.get(sessionID ?? "")?.controller.state.runActive) for (const name of FUSION_GATED_TOOLS) delete event.tools[name];
+			}
 		});
 		const storageKey = `run/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
 		async function makeRun(sessionID: string, record?: RunManifest): Promise<Run> {
@@ -345,6 +380,94 @@ export default {
 			}
 			try { return await pending; } finally { if (creating.get(sessionID) === pending) creating.delete(sessionID); }
 		}
+		/** Shared run-start control behind fusion_start and the /fusion command. */
+		async function startRun(sessionID: string, task: string): Promise<Run> {
+			if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+			if (owner && owner !== sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
+			if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before starting a run.");
+			const run = await runFor(sessionID);
+			if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+			if (run.controller.state.runActive || run.controller.state.executed || run.controller.pending || run.controller.uncertain || run.reconciling) throw new Error("Finish and reset the existing Fusion run before starting another.");
+			starting = true;
+			const priorState = structuredClone(run.controller.state);
+			try {
+				const parent = await ctx.session.get({ sessionID });
+				if (parent.id !== sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace) throw new Error("OpenCode supervisor session or workspace does not match.");
+				// Scouting that preceded the run start is part of the same run.
+				run.controller.start(task, { preserveScoutCalls: true });
+				if (!run.lease) run.lease = await registry.claim(manifest(run));
+				owner = sessionID;
+				await persist(sessionID, run);
+				return run;
+			} catch (error) {
+				// A successful claim is authoritative even if the secondary store fails.
+				// Keep that run available for reset rather than releasing ownership silently.
+				if (!run.lease) Object.assign(run.controller.state, priorState);
+				throw error;
+			} finally { starting = false; }
+		}
+		/** Release settled Fusion resources for a session, or a settled workspace record left by another one. */
+		async function cleanWorkspace(sessionID: string): Promise<string> {
+			if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
+			const run = runs.get(sessionID);
+			if (run) {
+				const error = run.controller.resetError(false, run.reconciling);
+				if (error) throw new Error(`${error} Clean releases settled resources only.`);
+				if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before cleaning.");
+				resetting = true;
+				try {
+					await store.removeSettled(run.runId);
+					await run.lease?.release();
+					await run.runtime.release(run.handle);
+					await run.runtime.shutdown();
+					runs.delete(sessionID);
+					if (owner === sessionID) owner = undefined;
+					return "Released Fusion resources for this session.";
+				} finally { resetting = false; }
+			}
+			const owned = await registry.inspect(workspace);
+			if (!owned) return "No Fusion resources to clean in this workspace.";
+			if (owned.manifest.recovery !== "settled") throw new Error(`The workspace Fusion record is ${owned.manifest.recovery}; reconcile it or run the explicit operator resolution before cleaning.`);
+			// An adopted run's held lease is the same record: release through it
+			// rather than claiming the workspace a second time in this process.
+			const holder = [...runs.values()].find((candidate) => candidate.lease && candidate.lease.manifest.runId === owned.manifest.runId);
+			if (holder?.lease) {
+				await holder.lease.release();
+				holder.lease = undefined;
+				return "Released settled Fusion ownership for this workspace.";
+			}
+			// Claim-then-release archives the settled record without touching any transcript.
+			const lease = await registry.claim(owned.manifest, owned.token);
+			await lease.release();
+			return "Released settled Fusion ownership for this workspace.";
+		}
+		async function statusContent(sessionID: string): Promise<string> {
+			const run = runs.get(sessionID);
+			if (!run) {
+				const owned = await registry.inspect(workspace);
+				if (!owned) return "No Fusion run in this session.";
+				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, nextAction: "Reconcile in the owning harness or explicitly resolve ownership after inspecting the worker and workspace." });
+			}
+			const status = run.runtime.status(run.handle);
+			const nextAction = run.controller.uncertain
+				? status.backgroundPending || status.unsettled
+					? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
+					: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
+				: !run.controller.state.executed
+					? "Investigate the original task, then call fusion_delegate with action execute."
+					: "Review the working tree and audit the original task; reset when the run is finished.";
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
+		}
+		function statsContent(sessionID: string): string {
+			const run = runs.get(sessionID);
+			if (!run) return "No Fusion run in this session.";
+			return JSON.stringify({ runId: run.runId, executed: run.controller.state.executed,
+				revisions: { used: run.controller.state.revisions, limit: MAX_REVISIONS },
+				scoutCalls: { used: run.controller.state.scoutCalls, limit: MAX_SCOUT_CALLS },
+				finalFixUsed: run.controller.state.finalFixUsed,
+				lastResult: run.lastResult ? { requestId: run.lastResult.requestId, status: run.lastResult.status } : undefined,
+				usage: { available: false, reason: "Aggregate token and cost totals are not yet collected by the OpenCode plugin." } });
+		}
 
 		await ctx.tool.transform((editor) => {
 			editor.add({
@@ -354,30 +477,9 @@ export default {
 				options: { codemode: false },
 				async execute(input, context) {
 					requireSupervisor(context);
-					if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
 					if (!input || typeof input !== "object" || typeof (input as Record<string, unknown>).task !== "string" || !(input as { task: string }).task.trim()) throw new Error("Fusion requires a non-empty original task.");
-					const run = await runFor(context.sessionID);
-					if (resetting || starting) throw new Error("A Fusion run transition is in progress.");
-					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
-					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before starting a run.");
-					if (run.controller.state.runActive || run.controller.state.executed || run.controller.pending || run.controller.uncertain || run.reconciling) throw new Error("Finish and reset the existing Fusion run before starting another.");
-					starting = true;
-					const priorState = structuredClone(run.controller.state);
-					try {
-						const parent = await ctx.session.get({ sessionID: context.sessionID });
-						if (parent.id !== context.sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace) throw new Error("OpenCode supervisor session or workspace does not match.");
-						// Scouting that preceded the run start is part of the same run.
-						run.controller.start((input as { task: string }).task, { preserveScoutCalls: true });
-						if (!run.lease) run.lease = await registry.claim(manifest(run));
-						owner = context.sessionID;
-						await persist(context.sessionID, run);
-						return { content: "Fusion run started. Investigate the original request, then use fusion_scout and fusion_delegate as needed.", metadata: { runId: run.runId } };
-					} catch (error) {
-						// A successful claim is authoritative even if the secondary store fails.
-						// Keep that run available for reset rather than releasing ownership silently.
-						if (!run.lease) Object.assign(run.controller.state, priorState);
-						throw error;
-					} finally { starting = false; }
+					const run = await startRun(context.sessionID, (input as { task: string }).task.trim());
+					return { content: "Fusion run started. Investigate the original request, then use fusion_scout and fusion_delegate as needed.", metadata: { runId: run.runId } };
 				},
 			});
 			editor.add({
@@ -640,35 +742,14 @@ export default {
 				name: "fusion_status", description: "Show the current Fusion run state.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
-					const run = runs.get(context.sessionID);
-					if (!run) {
-						const owned = await registry.inspect(workspace);
-						if (!owned) return { content: "No Fusion run in this session." };
-						return { content: JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, nextAction: "Reconcile in the owning harness or explicitly resolve ownership after inspecting the worker and workspace." }) };
-					}
-					const status = run.runtime.status(run.handle);
-					const nextAction = run.controller.uncertain
-						? status.backgroundPending || status.unsettled
-							? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
-							: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
-						: !run.controller.state.executed
-							? "Investigate the original task, then call fusion_delegate with action execute."
-							: "Review the working tree and audit the original task; reset when the run is finished.";
-					return { content: JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction }) };
+					return { content: await statusContent(context.sessionID) };
 				},
 			});
 			editor.add({
 				name: "fusion_stats", description: "Show the current Fusion run's review and scout budgets. Token and cost totals are unavailable.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
-					const run = runs.get(context.sessionID);
-					if (!run) return { content: "No Fusion run in this session." };
-					return { content: JSON.stringify({ runId: run.runId, executed: run.controller.state.executed,
-						revisions: { used: run.controller.state.revisions, limit: MAX_REVISIONS },
-						scoutCalls: { used: run.controller.state.scoutCalls, limit: MAX_SCOUT_CALLS },
-						finalFixUsed: run.controller.state.finalFixUsed,
-						lastResult: run.lastResult ? { requestId: run.lastResult.requestId, status: run.lastResult.status } : undefined,
-						usage: { available: false, reason: "Aggregate token and cost totals are not yet collected by the OpenCode plugin." } }) };
+					return { content: statsContent(context.sessionID) };
 				},
 			});
 			editor.add({
@@ -695,6 +776,52 @@ export default {
 						return { content: "Fusion run reset." };
 					} finally { resetting = false; }
 				},
+			});
+		});
+		// User-facing controls over the native command surface (pinned live on
+		// v2.2.3: `execute` receives { sessionID, prompt: { text } } and its return
+		// value is presentation-only, so commands perform actions; the run's task
+		// prompt is injected through session.prompt).
+		await ctx.command?.transform?.((editor) => {
+			editor.add({
+				name: "fusion-run",
+				description: "Start a Fusion run with the given task [task]",
+				execute: async (args) => {
+					const task = args.prompt?.text?.trim();
+					if (!task) throw new Error("Provide a task: /fusion-run <task>");
+					if (typeof ctx.session.prompt !== "function") throw new Error("This host cannot inject the run prompt; tell the fusion agent the task directly instead.");
+					const run = await startRun(args.sessionID, task);
+					const label = run.model ? `${run.model.provider}/${run.model.modelId}${run.model.variant ? `#${run.model.variant}` : ""}` : "the host-configured model";
+					await ctx.session.prompt({ sessionID: args.sessionID, text: buildSupervisorPrompt(task, label) });
+					return `Fusion run started (${label}).`;
+				},
+			});
+			editor.add({
+				name: "fusion-mode",
+				description: "Toggle Fusion persistent mode [on|off]",
+				execute: async (args) => {
+					const arg = args.prompt?.text?.trim().toLowerCase();
+					const enabled = arg === "on" ? true : arg === "off" ? false : !fusionMode;
+					await setFusionMode(enabled);
+					return enabled
+						? "Fusion persistent mode enabled: fusion tools stay available to the fusion agent between runs."
+						: "Fusion persistent mode disabled: fusion tools require an active run (/fusion starts one).";
+				},
+			});
+			editor.add({
+				name: "fusion-status",
+				description: "Show the current Fusion run state",
+				execute: async (args) => await statusContent(args.sessionID),
+			});
+			editor.add({
+				name: "fusion-stats",
+				description: "Show the current Fusion run's budgets",
+				execute: async (args) => statsContent(args.sessionID),
+			});
+			editor.add({
+				name: "fusion-clean",
+				description: "Release settled Fusion resources for this workspace",
+				execute: async (args) => await cleanWorkspace(args.sessionID),
 			});
 		});
 		// Embedding hosts may call this on unload. Process exit also releases SQLite locks.
