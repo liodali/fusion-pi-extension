@@ -34,7 +34,7 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | OpenCode plugin setup and native subagent registry | Experimental entrypoint | Isolated v2.2.0 registration and missing-parent smoke test |
 | Shared Git workspace evidence | Pi and OpenCode use the same snapshot/diff code | Real temporary Git worktree tests; OpenCode requires full review |
 | Actual executor child, revisions, and final fix | Experimental host wiring | Live v2.2.0 run with `opencode-go/glm-5.3-flash`, same child and expected final file |
-| Restricted scout (M5) | `fusion_scout` tool, `fusion-scout` agent, shared budget and formatter, pre-execution allowlist and tool cap | Unit tests; live v2.2.3 run with `opencode-go/glm-5.3-flash`: citations, untouched tree, 4-call budget refusal with no extra child, mid-scout interrupt with clean reset |
+| Restricted scout (M5) | `fusion_scout` tool, `fusion-scout` agent, shared budget and formatter, pre-execution allowlist and tool cap | Unit tests; live v2.2.3 run with `opencode-go/glm-5.3-flash`: citations, untouched tree, 4-call budget refusal with no extra child, mid-scout interrupt with clean reset. Review follow-up: guards persist for backgrounded scout children until their execution ends; reset during an active scout is refused before mutation |
 | Complete OpenCode Fusion workflow | No | Not ready to install/use |
 
 The core extraction is partial: the shared controller owns task transitions,

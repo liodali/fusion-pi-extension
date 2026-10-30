@@ -2,7 +2,7 @@ import { FusionController } from "../core/controller.ts";
 import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunManifest } from "../core/manifest.ts";
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
 import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt } from "../prompts.ts";
-import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse } from "../core/scout.ts";
+import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse, scoutCapDecision } from "../core/scout.ts";
 import { formatCompactReport } from "../report.ts";
 import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspaceEvidenceRefs } from "../workspace/evidence.ts";
 import { nodeGitExec } from "../workspace/node-git.ts";
@@ -121,25 +121,80 @@ export default {
 			newRunId: () => randomUUID(),
 			newRequestId: (action: "execute" | "revise" | "final_fix" | "resume") => `Fusion ${action} ${randomUUID()}`,
 		};
-		// Armed while one fusion_scout turn is in flight. The host fires this hook
-		// synchronously before every tool execution (pinned in OpenCode v2.2.3:
-		// events carry the executing session), so refusing here denies the call
-		// before its effects occur — the exact-cap requirement for scouts.
-		let scoutGuard: { cap: ScoutCap; terminate: () => void; childSessionID?: string } | undefined;
+		// Scout enforcement outlives the fusion_scout tool call: the host may
+		// background a scout, and its child keeps running after the call returns.
+		// Guards are tracked per child session and stay armed until that child's
+		// execution is observed to end. The host fires the hook synchronously
+		// before every tool execution (pinned in OpenCode v2.2.3: events carry
+		// the executing session), so refusing here denies the call before its
+		// effects occur — the exact-cap requirement for scouts.
+		type ScoutGuardEntry = { cap: ScoutCap; terminate: () => void; release?: () => void };
+		const scoutGuards = new Map<string, ScoutGuardEntry>();
+		let activeScout: { entry: ScoutGuardEntry; childSessionID?: string } | undefined;
 		let scoutInFlight = false;
+		const SCOUT_TERMINAL_EVENTS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]);
+		function freshScoutCap(): ScoutCap {
+			let count = 0;
+			let refused = false;
+			return {
+				consume: () => {
+					count += 1;
+					const decision = scoutCapDecision(count, MAX_SCOUT_TOOL_CALLS);
+					if (decision !== "allow") refused = true;
+					return decision;
+				},
+				get refused() { return refused; },
+				get count() { return count; },
+			};
+		}
+		function trackScoutGuard(childSessionID: string, entry: ScoutGuardEntry): void {
+			scoutGuards.set(childSessionID, entry);
+			// Tracked guards are removed when their child's execution ends; the bound
+			// only exists so a host that never delivers a terminal event cannot leak
+			// entries unboundedly.
+			while (scoutGuards.size > 8) {
+				const oldest = scoutGuards.keys().next().value;
+				if (oldest === undefined || oldest === childSessionID) break;
+				scoutGuards.delete(oldest);
+			}
+		}
+		// A scout child that is tracked but never backgrounded (or left behind by a
+		// previous plugin instance) releases its guard and handle when its
+		// execution reaches a terminal state.
+		const onScoutBusEvent = (event: { type: string; data?: Record<string, unknown> }): void => {
+			const data = event.data && typeof event.data === "object" ? event.data : undefined;
+			const sessionID = data && typeof data.sessionID === "string" ? data.sessionID : undefined;
+			const entry = sessionID !== undefined ? scoutGuards.get(sessionID) : undefined;
+			if (!entry || !SCOUT_TERMINAL_EVENTS.has(event.type)) return;
+			scoutGuards.delete(sessionID!);
+			entry.release?.();
+		};
+		busSinks.add(onScoutBusEvent);
+		function resolveScoutGuard(event: ToolHookEvent): ScoutGuardEntry | undefined {
+			if (typeof event.sessionID === "string" && event.sessionID) {
+				const tracked = scoutGuards.get(event.sessionID);
+				if (tracked) return tracked;
+				if (activeScout) {
+					activeScout.childSessionID ??= event.sessionID;
+					if (activeScout.childSessionID === event.sessionID) return activeScout.entry;
+				}
+				// A fusion-scout child this instance never armed must not run
+				// unguarded either: give it a fresh cap and track it.
+				const fresh: ScoutGuardEntry = { cap: freshScoutCap(), terminate: () => {} };
+				trackScoutGuard(event.sessionID, fresh);
+				return fresh;
+			}
+			return activeScout?.entry;
+		}
 		await ctx.tool.hook("execute.before", (event) => {
 			if (event.agent === "fusion" && event.tool === "subagent") throw new Error("Use fusion_delegate to start Fusion executor work.");
-			if (!scoutGuard || event.agent !== SCOUT_AGENT) return;
-			if (typeof event.sessionID === "string" && event.sessionID) {
-				// Bind to the first scout child seen; calls from any other session are
-				// not this scout's work and never touch its cap.
-				scoutGuard.childSessionID ??= event.sessionID;
-				if (event.sessionID !== scoutGuard.childSessionID) return;
-			}
+			if (event.agent !== SCOUT_AGENT) return;
+			const guard = resolveScoutGuard(event);
+			if (!guard) return;
 			if (!SCOUT_TOOLS.has(event.tool)) throw new Error(`Fusion scout may only use read, grep, and glob; "${event.tool}" is denied before execution.`);
-			const decision = scoutGuard.cap.consume();
+			const decision = guard.cap.consume();
 			if (decision === "allow") return;
-			if (decision === "terminate") scoutGuard.terminate();
+			if (decision === "terminate") guard.terminate();
 			throw new Error("Tool call limit reached. Answer now with what you have.");
 		});
 		await ctx.session.hook("context", (event) => {
@@ -349,7 +404,8 @@ export default {
 					if (scoutInFlight) throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
 					scoutInFlight = true;
 					let handle: WorkerHandle | undefined;
-					const onAbort = () => scoutGuard?.terminate();
+					let cap: ScoutCap | undefined;
+					const onAbort = () => activeScout?.entry.terminate();
 					let response: { content: string; metadata?: Record<string, unknown> };
 					try {
 						const budgetError = run.controller.beginScout();
@@ -360,10 +416,9 @@ export default {
 						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
 						run.setContext(context);
 						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS });
-						const cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
-						scoutGuard = {
-							cap,
-							terminate: () => { void run.runtime.abort(handle!).catch(() => {}); },
+						cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
+						activeScout = {
+							entry: { cap, terminate: () => { void run.runtime.abort(handle!).catch(() => {}); } },
 						};
 						context.signal.addEventListener("abort", onAbort, { once: true });
 						const requestId = `Fusion scout ${randomUUID()}`;
@@ -377,13 +432,26 @@ export default {
 						response = { content: `Fusion scout failed: ${message}`, metadata: { error: message } };
 					} finally {
 						context.signal.removeEventListener("abort", onAbort);
-						scoutGuard = undefined;
+						activeScout = undefined;
 						scoutInFlight = false;
 					}
-					// Dispose the disposable scout without deleting its transcript; a
-					// release refusal is surfaced without discarding the answer.
+					// Disposition. A backgrounded scout keeps running after this call
+					// returns, so its guard stays armed — and its handle stays released-
+					// pending so terminate can still interrupt the child — until the
+					// child's execution is observed to end. Otherwise dispose now,
+					// without deleting the transcript; a release refusal is surfaced
+					// without discarding the answer.
 					let releaseNote: string | undefined;
-					try { if (handle) await run.runtime.release(handle); } catch (error) { releaseNote = error instanceof Error ? error.message : String(error); }
+					const childID = handle?.reference?.id;
+					if (handle && cap && childID && run.runtime.status(handle).backgroundPending) {
+						trackScoutGuard(childID, {
+							cap,
+							terminate: () => { void run.runtime.abort(handle!).catch(() => {}); },
+							release: () => { void run.runtime.release(handle!).catch(() => {}); },
+						});
+					} else if (handle) {
+						try { await run.runtime.release(handle); } catch (error) { releaseNote = error instanceof Error ? error.message : String(error); }
+					}
 					return releaseNote ? { ...response, content: `${response.content}\n\n(Fusion scout could not be released: ${releaseNote})` } : response;
 				},
 			});
@@ -455,6 +523,10 @@ export default {
 				async execute(_input, context) {
 					requireSupervisor(context);
 					if (resetting) throw new Error("Fusion reset is in progress.");
+					// Refuse before any mutation: dismantling storage, ownership, or the
+					// executor underneath an in-flight scout leaves the run partially
+					// reset and unrecoverable by retry.
+					if (scoutInFlight) throw new Error("A Fusion scout is still running; wait for it to answer before resetting.");
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
 					const error = run.controller.resetError(false, run.reconciling);
@@ -473,6 +545,14 @@ export default {
 			});
 		});
 		// Embedding hosts may call this on unload. Process exit also releases SQLite locks.
-		return { close() { busController.abort(); for (const run of runs.values()) run.lease?.close(); } };
+		return {
+			close() {
+				busController.abort();
+				busSinks.delete(onScoutBusEvent);
+				scoutGuards.clear();
+				activeScout = undefined;
+				for (const run of runs.values()) run.lease?.close();
+			},
+		};
 	},
 };

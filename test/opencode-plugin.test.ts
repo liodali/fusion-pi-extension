@@ -312,8 +312,10 @@ describe("OpenCode Fusion plugin", () => {
 		const result = await pending;
 		expect(result.content).toContain("Scout stopped after 20 tool calls; partial answer:");
 		expect(result.metadata).toMatchObject({ capped: true, childSessionID: "scout-1" });
-		// The guard is disarmed after the turn: scout-agent events pass untouched.
-		expect(() => before({ agent: "fusion-scout", tool: "edit", sessionID: "scout-1" })).not.toThrow();
+		// After the turn the child is no longer the active scout, but scout-agent
+		// calls are never unguarded: edits stay denied and reads get a fresh cap.
+		expect(() => before({ agent: "fusion-scout", tool: "edit", sessionID: "scout-1" })).toThrow("denied before execution");
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-1" })).not.toThrow();
 	});
 
 	test("a cancelled scout is reported and leaves executor work unaffected", async () => {
@@ -347,6 +349,82 @@ describe("OpenCode Fusion plugin", () => {
 		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).resolves.toHaveProperty("content");
 		expect(calls).toEqual(["fusion-executor", "fusion-scout", "fusion-executor"]);
 		await tools.get("fusion_reset")!.execute({}, context("one"));
+	});
+
+	test("a backgrounded scout keeps its guard until its execution is observed to end", async () => {
+		const tools = new Map<string, Tool>();
+		let before!: (event: { tool: string; agent: string; sessionID?: string }) => void;
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({
+			[Symbol.asyncIterator]() {
+				return { next: async () => {
+					for (;;) {
+						const next = busQueue.shift();
+						if (next) return { value: next, done: false as const };
+						await new Promise<void>((resolve) => { busWake = resolve; });
+						busWake = undefined;
+					}
+				} };
+			},
+		}) };
+		await setupTest({ location: { directory: tmpdir() }, event: eventHost, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async (_name, callback) => { before = callback; },
+			list: async () => [{ id: "subagent", execute: async (input, ctx) => {
+				if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				await ctx.progress({ sessionID: "scout-bg" });
+				// The host backgrounds the scout; the child keeps running.
+				return { output: { sessionID: "scout-bg", status: "running", output: "backgrounded" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} });
+		const scout = tools.get("fusion_scout")!;
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		const result = await scout.execute({ questions: ["q"] }, context("one"));
+		expect(result.content).toContain("Fusion scout failed");
+		// The call returned, but the child is still running: enforcement persists.
+		for (let i = 0; i < 20; i++) expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).not.toThrow();
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).toThrow("Tool call limit reached");
+		expect(() => before({ agent: "fusion-scout", tool: "shell", sessionID: "scout-bg" })).toThrow("denied before execution");
+		// The child's execution ends: the guard is released, and a later scout-agent
+		// session starts with a fresh cap.
+		busQueue.push({ type: "session.execution.succeeded", data: { sessionID: "scout-bg" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect(() => before({ agent: "fusion-scout", tool: "read", sessionID: "scout-bg" })).not.toThrow();
+		// Prohibited tools stay denied regardless of guard state.
+		expect(() => before({ agent: "fusion-scout", tool: "edit", sessionID: "scout-bg" })).toThrow("denied before execution");
+	});
+
+	test("reset during an active scout is refused before touching the run", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		let release!: () => void, seen!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const entered = new Promise<void>((resolve) => { seen = resolve; });
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {},
+			list: async () => [{ id: "subagent", execute: async (input) => {
+				if (input.agent !== "fusion-scout") return { output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } };
+				seen();
+				await gate;
+				return { output: { sessionID: "scout", status: "completed", output: "answer" } };
+			} }],
+			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, storage);
+		const scout = tools.get("fusion_scout")!;
+		const reset = tools.get("fusion_reset")!;
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		const key = `run/${createHash("sha256").update("/workspace").digest("hex")}`;
+		expect(await storage.get(key)).toBeDefined();
+		const pending = scout.execute({ questions: ["q"] }, context("one"));
+		await seen;
+		await expect(reset.execute({}, context("one"))).rejects.toThrow("still running");
+		// Nothing was dismantled: the record, the lease state, and the run survive.
+		expect(await storage.get(key)).toBeDefined();
+		release();
+		expect((await pending).content).toContain("answer");
+		await expect(reset.execute({}, context("one"))).resolves.toHaveProperty("content", "Fusion run reset.");
 	});
 
 	test("scouts are serialized and their release never blocks reset", async () => {
