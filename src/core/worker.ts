@@ -129,4 +129,6 @@ export interface WorkerCapabilities {
 	exactScoutToolLimit: boolean;
 	/** The runtime can interrupt a native child turn it owns; absence means unsupported. */
 	workerAbort: boolean;
+	/** The runtime streams the owned child's native activity as worker events. Absence only means no streaming, never a worse settlement. */
+	workerEvents: boolean;
 }

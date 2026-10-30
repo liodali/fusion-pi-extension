@@ -21,7 +21,7 @@ function fixture() {
 		async abort() { calls.push("abort"); }, dispose() { calls.push("release"); },
 	};
 	const backend: ExecutorBackend = {
-		kind: "durable", capabilities: { transcriptReopen: true, activeTurnReattach: true, durableExecution: true, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true },
+		kind: "durable", capabilities: { transcriptReopen: true, activeTurnReattach: true, durableExecution: true, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: true, workerAbort: true, workerEvents: true },
 		async createExecutor() { return native; }, async openExecutor(_config, ref) { calls.push(`open:${ref}`); return native; },
 		async scout(request) { calls.push(`scout:${request.maxToolCalls}:${request.thinking}`); return { text: "partial", capped: true, usage: createEmptyUsage() }; },
 		async dispose() { calls.push("shutdown"); },

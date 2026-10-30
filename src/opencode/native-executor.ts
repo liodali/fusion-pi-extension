@@ -11,6 +11,8 @@ export const OPENCODE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.freeze
 	readOnlyScout: false,
 	exactScoutToolLimit: false,
 	workerAbort: false,
+	/** Static floor: the runtime widens `workerEvents` when the host bus is available. */
+	workerEvents: false,
 });
 
 /** Narrow boundary around OpenCode v2's native `subagent` tool executor. */

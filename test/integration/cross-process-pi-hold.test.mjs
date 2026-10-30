@@ -16,7 +16,7 @@ if (root && cwd && stopFile) {
 	setDefaultTimeout(60000);
 	let prompts = 0;
 	const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-	const capabilities = { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: false, workerAbort: true };
+	const capabilities = { transcriptReopen: true, activeTurnReattach: false, durableExecution: false, idempotentSubmission: false, readOnlyScout: true, exactScoutToolLimit: false, workerAbort: true, workerEvents: true };
 	const handle = {
 		resumeRef: () => join(root, "session.jsonl"),
 		setThinking: async () => {},

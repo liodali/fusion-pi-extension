@@ -9,7 +9,7 @@ function fixture(failWrite = false) {
 	const owner = { harness: "test", supervisorId: "parent", workspace: "/work" };
 	const worker: WorkerHandle = { owner, runtime: "test", reference: { owner, runtime: "test", id: "child" } };
 	const runtime: WorkerRuntime = {
-		capabilities: { transcriptReopen: true, activeTurnReattach: true, durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false, workerAbort: true },
+		capabilities: { transcriptReopen: true, activeTurnReattach: true, durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false, workerAbort: true, workerEvents: false },
 		async create() { return worker; }, async open() { return worker; },
 		async submit(request) { log.push("submit"); return { ...request, role: "executor", status: "completed", text: "done" }; },
 		async reattach(request) { log.push("reattach"); return { ...request, role: "executor", status: "completed", text: "recovered" }; },
@@ -77,7 +77,7 @@ for (const harness of ["pi", "opencode"] as const) {
 		const owner = { harness, supervisorId: "supervisor", workspace: "/workspace" };
 		const worker: WorkerHandle = { owner, runtime: harness };
 		const runtime: WorkerRuntime = {
-			capabilities: { transcriptReopen: true, activeTurnReattach: harness === "pi", durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false, workerAbort: true },
+			capabilities: { transcriptReopen: true, activeTurnReattach: harness === "pi", durableExecution: false, idempotentSubmission: false, readOnlyScout: false, exactScoutToolLimit: false, workerAbort: true, workerEvents: false },
 			async create() { return worker; }, async open() { return worker; },
 			async submit(request) { log.push(`submit:${request.requestId}`); return { ...request, role: "executor", status: "completed", text: "report" }; },
 			async reattach() { throw new Error("unused"); }, async abort() {}, async release() {}, async shutdown() {},

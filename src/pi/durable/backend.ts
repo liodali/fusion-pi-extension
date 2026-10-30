@@ -329,5 +329,6 @@ export const PI_DURABLE_CAPABILITIES: Readonly<WorkerCapabilities> = Object.free
 	idempotentSubmission: false,
 	readOnlyScout: true,
 	workerAbort: true,
+	workerEvents: true,
 	exactScoutToolLimit: true,
 });

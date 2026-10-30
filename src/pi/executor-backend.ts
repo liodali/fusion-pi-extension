@@ -300,6 +300,7 @@ export const PI_SESSION_CAPABILITIES: Readonly<WorkerCapabilities> = Object.free
 	durableExecution: false,
 	idempotentSubmission: false,
 	workerAbort: true,
+	workerEvents: true,
 	readOnlyScout: true,
 	exactScoutToolLimit: false,
 });

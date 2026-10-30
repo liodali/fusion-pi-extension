@@ -200,3 +200,126 @@ test("foreground settlement failure blocks reuse until the same result is persis
 	await f.runtime.release(worker);
 	await f.runtime.shutdown();
 });
+
+type BusEvent = { id?: string; type: string; data?: Record<string, unknown> };
+function busFixture(execute: NativeSubagentExecute<Context>) {
+	const forwarded: unknown[] = [];
+	const context: Context = { sessionID: "parent", id: "call", messageID: "message", signal: new AbortController().signal, progress: async (update) => { forwarded.push(update); } };
+	let sink: ((event: BusEvent) => void) | undefined;
+	const runtime = createOpenCodeWorkerRuntime({ execute, contextFor: () => context, validateReference: async () => {}, bus: { add: (registered) => { sink = registered; } } });
+	return { runtime, context, forwarded, push: (event: BusEvent) => sink?.(event) };
+}
+
+test("owned-child bus events map to worker events with native identity and ownership", async () => {
+	const observed: unknown[] = [];
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		f.push({ id: "evt1", type: "session.text.started", data: { sessionID: "child", assistantMessageID: "m1" } });
+		f.push({ id: "evt2", type: "session.text.delta", data: { sessionID: "child", delta: "hello" } });
+		f.push({ id: "evt3", type: "session.reasoning.delta", data: { sessionID: "child", delta: "thinking" } });
+		f.push({ type: "session.reasoning.ended", data: { sessionID: "child", text: "private reasoning content" } });
+		f.push({ type: "session.text.ended", data: { sessionID: "child", text: "hello world" } });
+		f.push({ id: "evt4", type: "session.step.started", data: { sessionID: "child" } });
+		f.push({ id: "evt5", type: "session.text.delta", data: { sessionID: "other-child", delta: "foreign" } });
+		f.push({ id: "evt6", type: "session.text.delta" });
+		f.push({ type: "garbage" });
+		f.push({ id: "evt7", type: "session.usage.updated", data: { sessionID: "child", cost: 0, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } } });
+		return { output: { sessionID: "child", status: "completed", output: "done" } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const result = await f.runtime.submit({ runId: "run", requestId: "request", worker, prompt: "work" }, { onEvent: (event) => { observed.push(event); }, onReference: async () => {} });
+	expect(observed).toEqual([
+		{ runId: "run", requestId: "request", worker, nativeEventId: "evt1", event: { type: "text_start" } },
+		{ runId: "run", requestId: "request", worker, nativeEventId: "evt2", event: { type: "text_delta", delta: "hello" } },
+		{ runId: "run", requestId: "request", worker, nativeEventId: "evt3", event: { type: "reasoning_delta", delta: "thinking" } },
+		{ runId: "run", requestId: "request", worker, nativeEventId: undefined, event: { type: "text_end", content: "hello world" } },
+	]);
+	// Full reasoning content never surfaces, and usage is accounting, not an event.
+	expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, cost: 0 });
+	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
+	await f.runtime.release(worker);
+	await f.runtime.shutdown();
+});
+
+test("tool lifecycle maps through call identity with tracked names", async () => {
+	const observed: unknown[] = [];
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		f.push({ id: "e1", type: "session.tool.input.started", data: { sessionID: "child", id: "t1", name: "execute" } });
+		f.push({ id: "e2", type: "session.tool.called", data: { sessionID: "child", id: "t1", input: { code: "x" }, executed: false } });
+		f.push({ id: "e3", type: "session.tool.progress", data: { sessionID: "child", id: "t1", metadata: { status: "running" } } });
+		f.push({ id: "e4", type: "session.tool.success", data: { sessionID: "child", id: "t1", content: [{ type: "text", text: "ok" }], metadata: { error: true } } });
+		// A call whose input stream was never observed still ends with a name.
+		f.push({ id: "e5", type: "session.tool.called", data: { sessionID: "child", id: "t2", input: {}, executed: false } });
+		f.push({ id: "e6", type: "session.tool.success", data: { sessionID: "child", id: "t2", content: "clean", metadata: {} } });
+		return { output: { sessionID: "child", status: "completed", output: "done" } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	await f.runtime.submit({ runId: "run", requestId: "request", worker, prompt: "work" }, { onEvent: (event) => { observed.push(event.event); }, onReference: async () => {} });
+	expect(observed).toEqual([
+		{ type: "tool_start", toolCallId: "t1", toolName: "execute", args: { code: "x" } },
+		{ type: "tool_update", toolCallId: "t1", partialResult: { status: "running" } },
+		{ type: "tool_end", toolCallId: "t1", toolName: "execute", isError: true, result: [{ type: "text", text: "ok" }] },
+		{ type: "tool_start", toolCallId: "t2", toolName: "unknown", args: {} },
+		{ type: "tool_end", toolCallId: "t2", toolName: "unknown", isError: false, result: "clean" },
+	]);
+});
+
+test("turn usage is the delta of cumulative readings and stays unknown without them", async () => {
+	const push: BusEvent[] = [];
+	let turn = 0;
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		const event = push[turn];
+		turn++;
+		if (event) f.push(event);
+		return { output: { sessionID: "child", status: "completed", output: `done-${turn}` } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const request = { runId: "run", requestId: "request", worker, prompt: "work" };
+	const options = { onEvent: () => {}, onReference: async () => {} };
+	// Turn 1: accounting arrives mid-turn on a fresh child; the whole reading is this turn's.
+	push.push({ id: "u1", type: "session.usage.updated", data: { sessionID: "child", cost: 2, tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 7, write: 3 } } } });
+	const first = await f.runtime.submit(request, options);
+	expect(first.usage).toEqual({ inputTokens: 100, outputTokens: 50, cacheReadTokens: 7, cacheWriteTokens: 3, reasoningTokens: 10, cost: 2 });
+	await f.runtime.settle(request, async () => {});
+	await f.runtime.release(worker);
+	// Turn 2 reuses the child: only the growth since the last reading is this turn's.
+	const secondWorker = await f.runtime.open({ owner, runtime: "native-subagent", id: "child" }, config);
+	push.push({ id: "u2", type: "session.usage.updated", data: { sessionID: "child", cost: 5, tokens: { input: 160, output: 80, reasoning: 30, cache: { read: 19, write: 4 } } } });
+	const second = await f.runtime.submit({ ...request, worker: secondWorker }, options);
+	expect(second.usage).toEqual({ inputTokens: 60, outputTokens: 30, cacheReadTokens: 12, cacheWriteTokens: 1, reasoningTokens: 20, cost: 3 });
+	await f.runtime.settle({ ...request, worker: secondWorker }, async () => {});
+	// A later turn with no new reading stays unknown rather than repeating stale numbers.
+	const third = await f.runtime.submit({ ...request, worker: secondWorker }, options);
+	expect(third.usage).toBeUndefined();
+	await f.runtime.settle({ ...request, worker: secondWorker }, async () => {});
+	await f.runtime.release(secondWorker);
+});
+
+test("events without an owned active turn never restart or leak into later turns", async () => {
+	const f = busFixture(async (_input, ctx) => {
+		await ctx.progress({ sessionID: "child", status: "running" });
+		return { output: { sessionID: "child", status: "completed", output: "done" } };
+	});
+	const worker = await f.runtime.create(owner, config);
+	const observed: unknown[] = [];
+	await f.runtime.submit({ runId: "run", requestId: "request", worker, prompt: "work" }, { onEvent: (event) => { observed.push(event); }, onReference: async () => {} });
+	// Late events after the turn is gone are dropped, and garbage input is inert.
+	f.push({ id: "late", type: "session.text.delta", data: { sessionID: "child", delta: "late" } });
+	f.push(undefined as never);
+	f.push({ type: "session.text.delta", data: { sessionID: 42 } });
+	expect(observed).toEqual([]);
+	await f.runtime.settle({ runId: "run", requestId: "request", worker, prompt: "work" }, async () => {});
+	await f.runtime.release(worker);
+	await f.runtime.shutdown();
+});
+
+test("capabilities stay per-instance: streaming only with the host bus", async () => {
+	const plain = fixture(async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }));
+	expect(plain.runtime.capabilities.workerEvents).toBe(false);
+	let sink: ((event: BusEvent) => void) | undefined;
+	const streaming = createOpenCodeWorkerRuntime({ execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }), contextFor: () => plain.context, validateReference: async () => {}, bus: { add: (registered) => { sink = registered; } } });
+	expect(streaming.capabilities.workerEvents).toBe(true);
+	expect(typeof sink).toBe("function");
+});

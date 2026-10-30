@@ -34,6 +34,10 @@ interface PluginContext {
 		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
 		interrupt?(input: { sessionID: string }): Promise<unknown>;
 	};
+	/** Pinned in OpenCode v2.2.2: options-object subscribe returning a lazy async iterable. Absence leaves worker events unsupported. */
+	event?: {
+		subscribe(options?: { types?: string[]; signal?: AbortSignal }): AsyncIterable<{ id?: string; type: string; data?: Record<string, unknown> }>;
+	};
 }
 
 interface Run {
@@ -79,6 +83,24 @@ export default {
 		const runs = new Map<string, Run>();
 		let owner: string | undefined;
 		let resetting = false;
+		// One subscription fans every raw bus event out to each runtime's owned-child
+		// routing (one async iterable cannot be consumed twice). When the host does
+		// not expose the pinned subscribe surface, streaming stays unsupported.
+		const busSinks = new Set<(event: { id?: string; type: string; data?: Record<string, unknown> }) => void>();
+		const busController = new AbortController();
+		const busHost = typeof ctx.event?.subscribe === "function" ? ctx.event : undefined;
+		if (busHost) {
+			void (async () => {
+				const iterator = busHost.subscribe({ signal: busController.signal })[Symbol.asyncIterator]();
+				for (;;) {
+					const next = await iterator.next();
+					if (next.done) break;
+					for (const sink of busSinks) {
+						try { sink(next.value); } catch {}
+					}
+				}
+			})().catch(() => { /* bus ended or failed: streaming is best-effort; settlement paths do not depend on it */ });
+		}
 		// Native notification matching depends on this exact description format.
 		const services = {
 			now: () => Date.now(),
@@ -93,6 +115,7 @@ export default {
 				execute: native!.execute,
 				contextFor: () => { if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
 				interrupt: typeof ctx.session.interrupt === "function" ? ((childSessionID: string) => Promise.resolve(ctx.session.interrupt!({ sessionID: childSessionID }))) : undefined,
+				bus: typeof ctx.event?.subscribe === "function" ? { add: (sink) => { busSinks.add(sink); } } : undefined,
 				validateReference: async (reference) => {
 					const [parent, child] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.get({ sessionID: reference.id })]);
 					if (parent.id !== sessionID || !parent.location?.directory || await canonicalize(parent.location.directory) !== workspace || child.id !== reference.id || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace) throw new Error("OpenCode child ownership or workspace does not match.");
@@ -352,6 +375,6 @@ export default {
 			});
 		});
 		// Embedding hosts may call this on unload. Process exit also releases SQLite locks.
-		return { close() { for (const run of runs.values()) run.lease?.close(); } };
+		return { close() { busController.abort(); for (const run of runs.values()) run.lease?.close(); } };
 	},
 };

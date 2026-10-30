@@ -1,4 +1,4 @@
-import type { WorkerConfig, WorkerHandle, WorkerOwner, WorkerReference, WorkerRuntime, WorkerTurnOptions, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
+import type { ExecutorEvent, WorkerConfig, WorkerHandle, WorkerOwner, WorkerReference, WorkerRuntime, WorkerTurnOptions, WorkerTurnRequest, WorkerTurnResult, WorkerUsage } from "../core/worker.ts";
 import { createNativeExecutor, OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 
 const RUNTIME = "native-subagent";
@@ -12,6 +12,15 @@ type Handle<C extends NativeToolContext> = WorkerHandle & {
 	publish?: (id: string) => Promise<void>;
 };
 
+/** One raw host bus event, as pinned from OpenCode v2.2.2 (`GET /api/event` and the plugin `ctx.event.subscribe` stream). */
+export interface OpenCodeBusEvent {
+	/** Stable native identity (`evt_...`); the controller deduplicates repeats. */
+	id?: string;
+	type: string;
+	/** Event payload; `sessionID` routes every session-scoped event. */
+	data?: Record<string, unknown>;
+}
+
 /** Reconciliation requires host-provided proof for the exact pending request. */
 export interface OpenCodeWorkerRuntime extends WorkerRuntime {
 	/** Restore saved intent without starting or reattaching to native work. */
@@ -20,21 +29,34 @@ export interface OpenCodeWorkerRuntime extends WorkerRuntime {
 	settle(request: WorkerTurnRequest, persistSettlement: (result: WorkerTurnResult) => Promise<void>): Promise<WorkerTurnResult>;
 	status(worker: WorkerHandle): { uncertain: boolean; unsettled: boolean; backgroundPending: boolean; backgrounded: boolean };
 	reconcile(request: WorkerTurnRequest, options: WorkerTurnOptions, wait: (childId: string, request: WorkerTurnRequest, signal: AbortSignal) => Promise<{ status: "completed" | "error" | "cancelled"; text: string }>, persistSettlement: (result: WorkerTurnResult) => Promise<void>): Promise<WorkerTurnResult>;
+	/** Feed one raw host bus event into this runtime's owned-child routing. */
+	ingestBusEvent(event: OpenCodeBusEvent): void;
 }
 
-/** The host supplies the original tool context and validates ownership on reopen.
+/**
+ * The host supplies the original tool context and validates ownership on reopen.
  * `interrupt` is the host's native session interruption (session.interrupt in
  * OpenCode v2); when absent, aborting an owned child is unsupported and the
- * adapter must say so instead of implying the control exists. */
+ * adapter must say so instead of implying the control exists. `bus` is the
+ * host's event fan-out (one plugin subscription, many consumers); when absent,
+ * owned-child streaming and usage accounting are unavailable and the adapter
+ * reports that honestly instead of implying the events exist.
+ */
 export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params: {
 	execute: NativeSubagentExecute<C>;
 	contextFor: (request: WorkerTurnRequest) => C;
 	validateReference: (reference: WorkerReference) => Promise<void>;
 	interrupt?: (childSessionID: string) => Promise<unknown>;
 	agent?: string;
+	bus?: { add(sink: (event: OpenCodeBusEvent) => void): void };
 }): OpenCodeWorkerRuntime {
+	type ActiveTurn = { request: WorkerTurnRequest; options: WorkerTurnOptions; baseline?: WorkerUsage; sawUsage?: boolean; toolNames: Map<string, string> };
 	const handles = new Set<Handle<C>>();
 	const openingReferences = new Set<string>();
+	/** Active turns keyed by owned child session; events for other sessions are ignored. */
+	const activeTurns = new Map<string, ActiveTurn>();
+	/** Last cumulative per-session reading (`session.usage.updated` is monotonic per session). */
+	const usageByChild = new Map<string, WorkerUsage>();
 	const referenceKey = (id: string) => id;
 	function assertUnowned(id: string, except?: Handle<C>): void {
 		if (openingReferences.has(referenceKey(id)) || [...handles].some((handle) => handle !== except && handle.reference?.id === id)) {
@@ -73,8 +95,94 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 	function result(request: WorkerTurnRequest, text: string): WorkerTurnResult {
 		return { runId: request.runId, requestId: request.requestId, worker: request.worker, role: "executor", status: "completed", text };
 	}
+	/** `session.usage.updated` readings are cumulative per session; a turn reports its own delta. */
+	function usageDelta(final: WorkerUsage | undefined, baseline: WorkerUsage | undefined): WorkerUsage | undefined {
+		if (!final) return undefined;
+		if (!baseline) return final;
+		const subtract = (a: number | undefined, b: number | undefined) => (a === undefined || b === undefined ? undefined : a - b);
+		return {
+			inputTokens: subtract(final.inputTokens, baseline.inputTokens),
+			outputTokens: subtract(final.outputTokens, baseline.outputTokens),
+			cacheReadTokens: subtract(final.cacheReadTokens, baseline.cacheReadTokens),
+			cacheWriteTokens: subtract(final.cacheWriteTokens, baseline.cacheWriteTokens),
+			reasoningTokens: subtract(final.reasoningTokens, baseline.reasoningTokens),
+			cost: subtract(final.cost, baseline.cost),
+		};
+	}
+	function parseUsage(data: Record<string, unknown>): WorkerUsage | undefined {
+		const tokens = data.tokens && typeof data.tokens === "object" ? data.tokens as Record<string, unknown> : undefined;
+		const cache = tokens?.cache && typeof tokens.cache === "object" ? tokens.cache as Record<string, unknown> : undefined;
+		if (!tokens) return undefined;
+		const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+		return {
+			inputTokens: num(tokens.input),
+			outputTokens: num(tokens.output),
+			cacheReadTokens: num(cache?.read),
+			cacheWriteTokens: num(cache?.write),
+			reasoningTokens: num(tokens.reasoning),
+			cost: num(data.cost),
+		};
+	}
+	/** Map one pinned bus event to the shared contract; unmapped kinds stay silent. */
+	function mapExecutorEvent(type: string, data: Record<string, unknown>, turn: { toolNames: Map<string, string> }): ExecutorEvent | undefined {
+		switch (type) {
+			case "session.reasoning.started": return { type: "reasoning_start" };
+			case "session.reasoning.delta": return typeof data.delta === "string" ? { type: "reasoning_delta", delta: data.delta } : undefined;
+			// `session.reasoning.ended` carries the full private reasoning content; the
+			// contract has no kind for it and private reasoning is never surfaced.
+			case "session.text.started": return { type: "text_start" };
+			case "session.text.delta": return typeof data.delta === "string" ? { type: "text_delta", delta: data.delta } : undefined;
+			case "session.text.ended": return typeof data.text === "string" ? { type: "text_end", content: data.text } : undefined;
+			case "session.tool.input.started": {
+				if (typeof data.id === "string" && typeof data.name === "string") turn.toolNames.set(data.id, data.name);
+				return undefined;
+			}
+			case "session.tool.called": {
+				if (typeof data.id !== "string") return undefined;
+				return { type: "tool_start", toolCallId: data.id, toolName: turn.toolNames.get(data.id) ?? "unknown", args: data.input };
+			}
+			case "session.tool.progress": {
+				if (typeof data.id !== "string") return undefined;
+				return { type: "tool_update", toolCallId: data.id, partialResult: data.metadata };
+			}
+			case "session.tool.success":
+			case "session.tool.failed": {
+				if (typeof data.id !== "string") return undefined;
+				const metadata = data.metadata && typeof data.metadata === "object" ? data.metadata as Record<string, unknown> : undefined;
+				return { type: "tool_end", toolCallId: data.id, toolName: turn.toolNames.get(data.id) ?? "unknown", isError: type === "session.tool.failed" || metadata?.error === true, result: data.content };
+			}
+			default: return undefined;
+		}
+	}
+	/** Route one raw host bus event to owned active turns; everything else is silent. */
+	function ingestBusEvent(event: OpenCodeBusEvent): void {
+		if (closed || !event || typeof event !== "object") return;
+		const data = event.data && typeof event.data === "object" ? event.data : undefined;
+		const type = typeof event.type === "string" ? event.type : undefined;
+		if (!type || !data || typeof data.sessionID !== "string") return;
+		const childID = data.sessionID;
+		if (type === "session.usage.updated") {
+			const usage = parseUsage(data);
+			if (usage) usageByChild.set(childID, usage);
+			const turn = activeTurns.get(childID);
+			if (turn && usage) turn.sawUsage = true;
+			return;
+		}
+		const turn = activeTurns.get(childID);
+		if (!turn) return;
+		const mapped = mapExecutorEvent(type, data, turn);
+		if (!mapped) return;
+		turn.options.onEvent({
+			runId: turn.request.runId,
+			requestId: turn.request.requestId,
+			worker: turn.request.worker,
+			nativeEventId: typeof event.id === "string" ? event.id : undefined,
+			event: mapped,
+		});
+	}
+	if (params.bus) params.bus.add(ingestBusEvent);
 	return {
-		capabilities: { ...OPENCODE_CAPABILITIES, workerAbort: !!params.interrupt },
+		capabilities: { ...OPENCODE_CAPABILITIES, workerAbort: !!params.interrupt, workerEvents: !!params.bus },
 		async create(owner, config) { if (closed) throw new Error("OpenCode runtime is shut down."); check(owner, config); return make(owner, config); },
 		async restorePending(owner, config, pending, reference) {
 			if (closed) throw new Error("OpenCode runtime is shut down.");
@@ -115,14 +223,26 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 			const ctx = context(request, options);
 			if (ctx.signal.aborted) throw new Error("OpenCode worker turn was cancelled before submission.");
 			handle.active = true;
-			handle.publish = async (id) => { await options.onReference({ owner: handle.owner, runtime: RUNTIME, id }); };
+			let registeredChild: string | undefined;
+			let registeredTurn: ActiveTurn | undefined;
+			const register = (childID: string) => {
+				registeredChild = childID;
+				registeredTurn = { request, options, baseline: usageByChild.get(childID), toolNames: new Map() };
+				activeTurns.set(childID, registeredTurn);
+			};
+			const existingChild = handle.reference?.id;
+			if (existingChild) register(existingChild);
+			handle.publish = async (id) => { if (!registeredChild) register(id); await options.onReference({ owner: handle.owner, runtime: RUNTIME, id }); };
 			try {
 				const output = await handle.native.prompt(request.prompt, request.requestId, ctx);
-				const completed = Object.freeze(result(request, output.output));
+				// Only a reading observed during this turn proves this turn's usage;
+				// a stale cumulative value would otherwise turn into invented zeros.
+				const usage = registeredTurn?.sawUsage ? usageDelta(usageByChild.get(output.sessionID), registeredTurn.baseline) : undefined;
+				const completed = Object.freeze({ ...result(request, output.output), ...(usage ? { usage } : {}) });
 				handle.unsettled = completed;
 				return completed;
 			} catch (error) { handle.uncertain = { runId: request.runId, requestId: request.requestId }; handle.backgrounded = handle.native.backgroundPending; handle.native.markPending(); throw error; }
-			finally { handle.active = false; handle.publish = undefined; }
+			finally { handle.active = false; handle.publish = undefined; if (registeredChild) activeTurns.delete(registeredChild); }
 		},
 		async reattach() { throw new Error("OpenCode active-turn reattachment is not supported; reconcile proven background completion instead."); },
 		status(worker) { const handle = valid(worker); return { uncertain: !!handle.uncertain, unsettled: !!handle.unsettled, backgroundPending: handle.native.backgroundPending, backgrounded: handle.backgrounded }; },
@@ -163,5 +283,6 @@ export function createOpenCodeWorkerRuntime<C extends NativeToolContext>(params:
 		},
 		async release(worker) { const handle = valid(worker); if (handle.active || handle.uncertain || handle.unsettled) throw new Error("Cannot release an active, uncertain or unsettled OpenCode worker."); handles.delete(handle); },
 		async shutdown() { if (closed) return; if (opening || [...handles].some((h) => h.active || h.uncertain || h.unsettled)) throw new Error("Cannot shut down with active, uncertain or unsettled OpenCode workers."); closed = true; handles.clear(); },
+		ingestBusEvent,
 	};
 }
