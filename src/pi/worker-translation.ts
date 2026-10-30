@@ -12,9 +12,13 @@ export function piModelConfig(model: Model<Api>, thinking: ThinkingLevel): Worke
 	return { provider: model.provider, modelId: model.id, variant: thinking };
 }
 
-/** Absent usage stays absent; callers must not pass a synthetic zero aggregate as evidence. */
+/** Absent usage stays absent; callers must not pass a synthetic zero aggregate as evidence.
+ * A real measurement always has tokens or cost, so an all-zero aggregate means nothing
+ * was measured and stays unknown instead of masquerading as free work. */
 export function piWorkerUsage(usage: Usage | undefined): WorkerUsage | undefined {
 	if (!usage) return undefined;
+	const measured = usage.input > 0 || usage.output > 0 || usage.cacheRead > 0 || usage.cacheWrite > 0 || (usage.reasoning ?? 0) > 0 || usage.cost.total > 0;
+	if (!measured) return undefined;
 	return { inputTokens: usage.input, outputTokens: usage.output, cacheReadTokens: usage.cacheRead,
 		cacheWriteTokens: usage.cacheWrite, reasoningTokens: usage.reasoning, cost: usage.cost.total };
 }

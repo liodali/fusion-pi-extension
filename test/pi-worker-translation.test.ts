@@ -13,4 +13,8 @@ test("Pi model and usage translation preserve the host's fields and unknown usag
 	expect(piModelConfig({ provider: "provider", id: "model" } as Model<Api>, "high")).toEqual({ provider: "provider", modelId: "model", variant: "high" });
 	expect(piWorkerUsage(undefined)).toBeUndefined();
 	expect(piWorkerUsage({ input: 4, output: 3, cacheRead: 2, cacheWrite: 1, cost: { total: 0.5 } } as Usage)).toEqual({ inputTokens: 4, outputTokens: 3, cacheReadTokens: 2, cacheWriteTokens: 1, reasoningTokens: undefined, cost: 0.5 });
+	// A synthetic zero aggregate is "nothing was measured", not free work: it stays unknown.
+	expect(piWorkerUsage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } as unknown as Usage)).toBeUndefined();
+	// Any real measurement keeps the usage, even when most fields are zero.
+	expect(piWorkerUsage({ input: 7, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } as Usage)).toMatchObject({ inputTokens: 7 });
 });

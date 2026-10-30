@@ -16,7 +16,7 @@ function fixture() {
 	const native: ExecutorHandle = {
 		model, thinking: "high", resumeRef: () => "42",
 		async setThinking(level) { calls.push(`thinking:${level}`); },
-		async prompt(_text, opts) { calls.push(`submit:${opts.requestId}`); opts.onEvent({ type: "text_start" }); if (wait) await new Promise<void>((resolve) => { finish = resolve; }); return { text: "done", usage: createEmptyUsage() }; },
+		async prompt(_text, opts) { calls.push(`submit:${opts.requestId}`); opts.onEvent({ type: "text_start" }); if (wait) await new Promise<void>((resolve) => { finish = resolve; }); const empty = createEmptyUsage(); return { text: "done", usage: { ...empty, input: 5, output: 2, totalTokens: 7, cost: { ...empty.cost, total: 0.25 } } }; },
 		async resume(opts) { calls.push(`resume:${opts.requestId}`); return { text: "recovered", stopReason: "aborted", usage: createEmptyUsage() }; },
 		async abort() { calls.push("abort"); }, dispose() { calls.push("release"); },
 	};
@@ -37,7 +37,7 @@ test("Pi executor applies per-turn thinking, forwards owned events and preserves
 	const result = await f.runtime.submit({ runId: "run", requestId: "req", worker, prompt: "work", variant: "low" }, { ...options, onEvent: (event) => events.push(event) });
 	expect(f.calls).toEqual(["thinking:low", "submit:req"]);
 	expect(events).toEqual([{ runId: "run", requestId: "req", worker, event: { type: "text_start" } }]);
-	expect(result).toMatchObject({ status: "completed", role: "executor", text: "done", usage: { inputTokens: 0 } });
+	expect(result).toMatchObject({ status: "completed", role: "executor", text: "done", usage: { inputTokens: 5, outputTokens: 2, cost: 0.25 } });
 	await f.runtime.release(worker);
 	await f.runtime.shutdown();
 	expect(f.calls.slice(-2)).toEqual(["release", "shutdown"]);
@@ -49,6 +49,8 @@ test("reattachment uses the original request without submitting or reconfiguring
 	const result = await f.runtime.reattach({ runId: "run", requestId: "original", worker, prompt: "ignored" }, options);
 	expect(f.calls).toEqual(["open:42", "resume:original"]);
 	expect(result).toMatchObject({ status: "cancelled", text: "recovered" });
+	// The recovery measured nothing: its synthetic zero aggregate stays unknown.
+	expect(result.usage).toBeUndefined();
 	await expect(f.runtime.open({ owner, runtime: "session", id: "42" }, config)).rejects.toThrow();
 });
 
