@@ -1,37 +1,50 @@
 {
-	"name": "pi-fusion-extension",
-	"version": "0.1.0",
-	"description": "Supervisor-executor orchestration for Pi",
-	"type": "module",
-	"keywords": ["pi-package", "pi-extension", "multi-agent", "fusion"],
-	"license": "MIT",
-	"files": ["src", ".pi/extensions/fusion.ts"],
-	"pi": {
-		"extensions": ["./src/index.ts"]
-	},
-	"scripts": {
-		"typecheck": "bunx tsc --noEmit",
-		"test": "bun test",
-		"test:opencode-smoke": "bun test/integration/opencode-smoke.mjs",
-		"test:opencode-workflow": "bun test/integration/opencode-workflow.mjs",
-		"test:opencode-restart": "bun test/integration/opencode-restart.mjs",
-		"test:opencode-restart-live": "bun test/integration/opencode-restart-live.mjs",
-		"test:ownership-cross-process": "bun test/integration/cross-process-ownership.mjs"
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-agent-core": "^1.0.0",
-		"@earendil-works/pi-ai": "^1.0.0",
-		"@earendil-works/pi-coding-agent": "^1.0.0",
-		"@earendil-works/pi-durable": "1.0.3",
-		"@earendil-works/pi-tui": "^1.0.0",
-		"typebox": "^1.3.34"
-	},
-	"peerDependenciesMeta": {
-		"@earendil-works/pi-durable": { "optional": true }
-	},
-	"devDependencies": {
-		"@earendil-works/pi-durable": "1.0.3",
-		"@types/bun": "^1.4.2",
-		"typescript": "^5.9.2"
-	}
+  "name": "pi-fusion-extension",
+  "version": "0.1.0",
+  "description": "Supervisor-executor orchestration for Pi",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "multi-agent",
+    "fusion"
+  ],
+  "license": "MIT",
+  "files": [
+    "src",
+    ".pi/extensions/fusion.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test",
+    "test:opencode-smoke": "bun test/integration/opencode-smoke.mjs",
+    "test:opencode-workflow": "bun test/integration/opencode-workflow.mjs",
+    "test:opencode-restart": "bun test/integration/opencode-restart.mjs",
+    "test:opencode-restart-live": "bun test/integration/opencode-restart-live.mjs",
+    "test:ownership-cross-process": "bun test/integration/cross-process-ownership.mjs",
+    "test:opencode-real-child": "bun test/integration/opencode-real-child.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "^1.0.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "@earendil-works/pi-durable": "1.0.3",
+    "@earendil-works/pi-tui": "^1.0.0",
+    "typebox": "^1.3.34"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-durable": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-durable": "1.0.3",
+    "@types/bun": "^1.4.2",
+    "typescript": "^5.9.2"
+  }
 }
