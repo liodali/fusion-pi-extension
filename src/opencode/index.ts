@@ -1,7 +1,7 @@
 import { FusionController } from "../core/controller.ts";
 import { createManifestStore, readRunManifest, translateOpenCodeV1, type RunManifest } from "../core/manifest.ts";
 import { canonicalWorkspace, openWorkspaceRegistry, type WorkspaceLease } from "../workspace/ownership.ts";
-import { EXECUTOR_SYSTEM_PROMPT, MAX_SCOUT_CALLS, buildScoutPrompt, buildSupervisorPrompt } from "../prompts.ts";
+import { EXECUTOR_SYSTEM_PROMPT, FUSION_SUMMARY_HEADING, MAX_SCOUT_CALLS, buildScoutPrompt, buildSupervisorPrompt } from "../prompts.ts";
 import { MAX_SCOUT_TOOL_CALLS, formatScoutResponse, scoutCapDecision } from "../core/scout.ts";
 import { MAX_REVISIONS } from "../limits.ts";
 import { getOutputPrice, isModelInTier, type FusionModelTier } from "../pricing.ts";
@@ -107,6 +107,8 @@ interface Run {
 	setContext(worker: WorkerHandle, context: ToolContext): void;
 	reconciling?: boolean;
 	before?: WorkspaceSnapshot;
+	/** The supervisor exhausted its continuation budget on an unfinished protocol. */
+	incomplete?: boolean;
 }
 
 /** Match OpenCode's completion notification to this specific native job generation. */
@@ -233,48 +235,120 @@ export default {
 		busSinks.add(onScoutBusEvent);
 		// Supervisor-turn completion channel (pinned live on v2.2.3: every session
 		// turn ends in exactly one session.execution.succeeded | interrupted |
-		// failed event carrying the session ID; session.text.ended carries each
-		// text part's final text). A normal end feeds the shared completion
-		// policy: when the protocol is unfinished and the nudge budget allows, the
-		// controller's continuation text is sent as the next turn via
-		// session.prompt, bounded by MAX_SETTLE_NUDGES. Interrupted and failed
-		// turns never nudge, and the run settles either way.
+		// failed event carrying the session ID and a native event id;
+		// session.text.ended carries each text part's final text). A normal end
+		// feeds the shared completion policy: when the protocol is unfinished and
+		// the nudge budget allows, the controller's continuation text is sent as
+		// the next turn via session.prompt, bounded by MAX_SETTLE_NUDGES and
+		// persisted before delivery. Interrupted and failed turns never nudge.
+		// Completion is bound to Fusion turns (the context hook records the agent
+		// whose context was last built) and to observed event ids, so ordinary
+		// agents and redeliveries never nudge or settle the run.
 		const supervisorText = new Map<string, string>();
-		const onTurnBusEvent = (event: { type: string; data?: Record<string, unknown> }): void => {
+		const turnAgent = new Map<string, string>();
+		const processedTurnIds = new Map<string, Set<string>>();
+		const forgetTurnState = (sessionID: string): void => {
+			supervisorText.delete(sessionID);
+			turnAgent.delete(sessionID);
+			processedTurnIds.delete(sessionID);
+		};
+		const seenTerminalId = (sessionID: string, id: string | undefined): boolean => {
+			if (typeof id !== "string") return true;
+			let seen = processedTurnIds.get(sessionID);
+			if (!seen) { seen = new Set(); processedTurnIds.set(sessionID, seen); }
+			if (seen.has(id)) return false;
+			seen.add(id);
+			if (seen.size > 64) { const oldest = seen.values().next().value; if (oldest !== undefined) seen.delete(oldest); }
+			return true;
+		};
+		const onTurnBusEvent = (event: { id?: string; type: string; data?: Record<string, unknown> }): void => {
 			const data = event.data && typeof event.data === "object" ? event.data : undefined;
 			const sessionID = data && typeof data.sessionID === "string" ? data.sessionID : undefined;
 			if (!sessionID) return;
 			const run = runs.get(sessionID);
 			if (!run) return;
+			// Completion is bound to turns of the Fusion agent: a session reused
+			// with an ordinary agent never nudges or settles the Fusion run.
+			if (turnAgent.get(sessionID) !== "fusion") return;
 			if (event.type === "session.execution.started") {
-				supervisorText.delete(sessionID);
+				// The final assistant response is what the summary policy evaluates.
+				supervisorText.set(sessionID, "");
 				return;
 			}
 			if (event.type === "session.text.ended" && typeof data?.text === "string") {
-				const previous = supervisorText.get(sessionID);
-				supervisorText.set(sessionID, `${previous ? `${previous}\n` : ""}${data.text}`.slice(-20000));
+				supervisorText.set(sessionID, data.text.slice(-20000));
 				return;
 			}
-			if (event.type === "session.execution.interrupted" || event.type === "session.execution.failed") {
+			const terminal = event.type === "session.execution.succeeded" ? "completed" : event.type === "session.execution.interrupted" ? "aborted" : event.type === "session.execution.failed" ? "error" : undefined;
+			if (!terminal) return;
+			if (!seenTerminalId(sessionID, event.id)) return;
+			const lastPart = supervisorText.get(sessionID) ?? "";
+			supervisorText.delete(sessionID);
+			if (terminal !== "completed") {
 				// Cancelled or errored turns are settled without continuation.
-				supervisorText.delete(sessionID);
 				run.controller.settled(fusionMode);
 				return;
 			}
-			if (event.type !== "session.execution.succeeded") return;
-			const lastAssistantText = supervisorText.get(sessionID) ?? "";
-			supervisorText.delete(sessionID);
+			void settleTurn(sessionID, run, lastPart);
+		};
+		busSinks.add(onTurnBusEvent);
+		/** Settle one completed Fusion turn: nudge, hold, or finish the run. */
+		async function settleTurn(sessionID: string, run: Run, lastPart: string): Promise<void> {
 			const status = run.runtime.status(run.handle);
-			// A backgrounded executor or in-flight reconciliation means the turn is
-			// not really settled: the completion notification steers what happens next.
-			const canContinue = !status.backgroundPending && !status.unsettled && !run.reconciling && !scoutInFlight;
-			const nudge = run.controller.continuation({ lastAssistantText, outcome: "completed", canContinue });
-			if (nudge && typeof ctx.session.prompt === "function") {
-				void Promise.resolve(ctx.session.prompt({ sessionID, text: nudge })).catch(() => {});
+			// A backgrounded executor, an in-flight reconciliation, or a running
+			// scout means the turn is not really settled: keep the run active so
+			// its control tools stay available, and let the outstanding work steer
+			// what happens next.
+			const workUnresolved = status.backgroundPending || status.unsettled || run.reconciling || scoutInFlight || hasBackgroundScout();
+			const deliverPrompt = (input: { sessionID: string; id?: string; text?: string }): Promise<unknown> | undefined =>
+				typeof ctx.session.prompt === "function" ? ctx.session.prompt(input) : undefined;
+			const canDeliver = deliverPrompt !== undefined;
+			// A nudge whose delivery failed is retried at the next turn end before
+			// a new nudge is considered; the budget was already consumed.
+			const pendingNudge = run.adapterData?.fusionNudge as { id?: unknown; text?: unknown; state?: unknown } | undefined;
+			if (canDeliver && pendingNudge?.state === "pending" && typeof pendingNudge.id === "string" && typeof pendingNudge.text === "string") {
+				try {
+					await deliverPrompt({ sessionID, id: pendingNudge.id, text: pendingNudge.text });
+					run.adapterData = { ...run.adapterData, fusionNudge: { id: pendingNudge.id, text: pendingNudge.text, state: "delivered" } };
+					if (run.lease) { try { await persist(sessionID, run); } catch { /* best-effort */ } }
+				} catch {
+					await reportCommand(sessionID, "Fusion nudge delivery failed", "Fusion could not deliver its continuation nudge; it will retry when this session next settles. If it keeps failing, deliver the instruction to the fusion agent directly.");
+				}
 				return;
 			}
-			if (!nudge) run.controller.settled(fusionMode);
-		};
+			// Nudges are only consumed when they can actually be delivered.
+			const nudge = canDeliver ? run.controller.continuation({ lastAssistantText: lastPart, outcome: "completed", canContinue: !workUnresolved }) : undefined;
+			if (nudge) {
+				try {
+					const id = `msg_fusion_nudge_${randomUUID().replaceAll("-", "")}`;
+					// Retain the retryable delivery state and persist the nudge budget
+					// before sending, so a reload can neither resend nor forget it.
+					run.adapterData = { ...run.adapterData, fusionNudge: { id, text: nudge, state: "pending" } };
+					if (run.lease) await persist(sessionID, run);
+					await deliverPrompt({ sessionID, id, text: nudge });
+					run.adapterData = { ...run.adapterData, fusionNudge: { id, text: nudge, state: "delivered" } };
+					if (run.lease) { try { await persist(sessionID, run); } catch { /* delivery is confirmed; the state write is best-effort */ } }
+				} catch {
+					await reportCommand(sessionID, "Fusion nudge delivery failed", "Fusion could not deliver its continuation nudge; it will retry when this session next settles. If it keeps failing, deliver the instruction to the fusion agent directly.");
+				}
+				return;
+			}
+			if (workUnresolved) {
+				// Unresolved worker or reconciliation work keeps the run active so
+				// fusion_reconcile stays available; the notification steers next.
+				return;
+			}
+			const protocolComplete = run.controller.state.executed && lastPart.includes(FUSION_SUMMARY_HEADING);
+			if (!protocolComplete) {
+				// The nudge budget ran out (or delivery is unsupported) on an
+				// unfinished protocol: report the run incomplete instead of marking
+				// it complete.
+				run.incomplete = true;
+				return;
+			}
+			run.incomplete = false;
+			run.controller.settled(fusionMode);
+		}
 		busSinks.add(onTurnBusEvent);
 		function resolveScoutGuard(event: ToolHookEvent): ScoutGuardEntry | undefined {
 			if (typeof event.sessionID === "string" && event.sessionID) {
@@ -308,6 +382,12 @@ export default {
 			throw new Error("Tool call limit reached. Answer now with what you have.");
 		});
 		await ctx.session.hook("context", (event) => {
+			// Bind the session's latest turn to its agent: completion events are
+			// only handled for turns the Fusion agent drove.
+			if (typeof event.sessionID === "string" && event.sessionID) {
+				turnAgent.set(event.sessionID, event.agent);
+				if (turnAgent.size > 32) { const oldest = turnAgent.keys().next().value; if (oldest !== undefined) turnAgent.delete(oldest); }
+			}
 			if (event.agent === "fusion") delete event.tools.subagent;
 			// Defense in depth: hide every non-allowlisted tool from the scout agent
 			// when the host exposes child sessions here. The execute.before guard
@@ -487,6 +567,7 @@ export default {
 					await run.runtime.release(run.handle);
 					await run.runtime.shutdown();
 					runs.delete(sessionID);
+					forgetTurnState(sessionID);
 					if (owner === sessionID) owner = undefined;
 					return "Released Fusion resources for this session.";
 				} finally { resetting = false; }
@@ -509,6 +590,7 @@ export default {
 					await holder.runtime.release(holder.handle);
 					await holder.runtime.shutdown();
 					runs.delete(holder.handle.owner.supervisorId);
+					forgetTurnState(holder.handle.owner.supervisorId);
 					if (owner === holder.handle.owner.supervisorId) owner = undefined;
 					return "Released settled Fusion ownership for this workspace.";
 				}
@@ -527,16 +609,21 @@ export default {
 			}
 			const status = run.runtime.status(run.handle);
 			const promptDelivery = run.adapterData?.fusionPrompt as { state?: unknown } | undefined;
-			const nextAction = run.controller.uncertain
+			const nudgeDelivery = (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state;
+			const nextAction = run.incomplete
+				? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
+				: run.controller.uncertain
 				? status.backgroundPending || status.unsettled
 					? "Call fusion_reconcile; if exact completion proof is unavailable, inspect the worker and workspace and explicitly resolve ownership after confirming the worker stopped."
 					: "Inspect the worker and workspace; explicitly resolve ownership after confirming the worker stopped."
 					: promptDelivery?.state === "pending"
 						? "Prompt delivery is unconfirmed. Retry /fusion-run with the same task and message ID, or inspect the session before cleaning."
+					: nudgeDelivery === "pending"
+						? "The last continuation nudge could not be delivered; it retries when this session next settles, or deliver the instruction to the fusion agent directly."
 					: !run.controller.state.executed
 					? "Investigate the original task, then call fusion_delegate with action execute."
 					: "Review the working tree and audit the original task; reset when the run is finished.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
 		}
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
@@ -862,6 +949,7 @@ export default {
 						await run.runtime.release(run.handle);
 						await run.runtime.shutdown();
 						runs.delete(context.sessionID);
+						forgetTurnState(context.sessionID);
 						if (owner === context.sessionID) owner = undefined;
 						return { content: "Fusion run reset." };
 					} finally { resetting = false; }
@@ -948,6 +1036,7 @@ export default {
 			close() {
 				busController.abort();
 				busSinks.delete(onScoutBusEvent);
+				busSinks.delete(onTurnBusEvent);
 				scoutGuards.clear();
 				activeScout = undefined;
 				for (const run of runs.values()) run.lease?.close();
