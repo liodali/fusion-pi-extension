@@ -633,7 +633,7 @@ describe("OpenCode Fusion plugin", () => {
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 			},
 		}, storage);
-		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-status", "fusion-stats", "fusion-clean"]);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean"]);
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
 		expect(prompts).toHaveLength(1);
@@ -644,7 +644,7 @@ describe("OpenCode Fusion plugin", () => {
 		expect(status.originalTask).toBe("Build the thing");
 		expect(status.runActive).toBe(true);
 		expect(status.workspaceClaimed).toBe(true);
-		await expect(commands[4].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
+		await expect(commands[5].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "Another" } })).rejects.toThrow("Finish and reset");
 		// /fusion-status command reports the same payload as the tool.
 		const commandStatus = JSON.parse(String(await commands[2].execute({ sessionID: "one" })));
@@ -1142,6 +1142,90 @@ describe("OpenCode Fusion plugin", () => {
 		await setupTest(makeContext(afterReset), storage);
 		expect((await afterReset.get("fusion_status")!.execute({}, context("one"))).content).toContain("No Fusion run");
 	});
+	test("fusion_resume routes recovery honestly for every run condition", async () => {
+		// Uncertain run with a retained write-ahead intent but no live turn and
+		// no recorded result: reconciliation is unavailable; operator resolution
+		// is documented textually.
+		{
+			const tools = new Map<string, Tool>();
+			await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { throw new Error("must not be called"); } }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} }, { get: async () => undefined, set: async () => { throw new Error("storage unavailable"); }, remove: async () => {} });
+			await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"))).rejects.toThrow("storage unavailable");
+			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.reconcileDetail).toContain("no live turn and no recorded result");
+			expect(resume.pendingRequest?.requestId).toBeString();
+			expect(resume.owner.supervisorId).toBe("one");
+			expect(resume.nextAction).toContain("bun src/workspace/resolve.ts");
+			expect(resume.nextAction).toContain(resume.pendingRequest?.requestId as string);
+			expect(resume.nextAction).toContain("--confirm-stopped");
+			expect(resume.activeTurnReattach).toBe("refused");
+		}
+		// A failed executor submission leaves the turn pending on its completion
+		// notification: exact proof can exist and fusion_reconcile is the route,
+		// across a reload too, with operator resolution documented as fallback.
+		{
+			const tools = new Map<string, Tool>();
+			const storage = memoryStorage();
+			let messages: unknown[] = [];
+			let description = "";
+			const makeContext = (fresh: Map<string, Tool>): TestContext => ({
+				location: { directory: "/workspace" }, session: { context: async () => messages, hook: async () => {} }, tool: {
+					hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, ctx) => {
+						await ctx.progress({ sessionID: "child-r" });
+						description = input.description;
+						throw new Error("connection lost");
+					} }], transform: async (callback) => { callback({ add: (tool) => fresh.set(tool.name, tool) }); },
+				},
+			});
+			await setupTest(makeContext(tools), storage);
+			await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+			let resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.nextAction).toContain("No recovery is owed");
+			await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("connection lost");
+			resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.reconcile).toBe("available");
+			expect(resume.pendingRequest?.requestId).toBe(description);
+			expect(resume.outstanding.backgroundPending).toBe(true);
+			expect(resume.childSessionID).toBe("child-r");
+			expect(resume.nextAction).toContain("Call fusion_reconcile");
+			const restored = new Map<string, Tool>();
+			await setupTest(makeContext(restored), storage);
+			resume = JSON.parse((await restored.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.reconcile).toBe("available");
+			expect(resume.pendingRequest?.requestId).toBe(description);
+			expect(resume.nextAction).toContain("If it reports no matching notification");
+			expect(resume.nextAction).toContain("--confirm-stopped");
+			expect(resume.activeTurnReattach).toBe("refused");
+			expect(resume.reattachReason).toContain("cannot reattach");
+			// Once the recorded notification exists, reconcile adopts it and the
+			// run owes no recovery again.
+			messages = [{ type: "synthetic", description, metadata: { source: "subagent", childID: "child-r", agent: "fusion-executor", state: "completed" }, text: `<subagent sessionID="child-r" state="completed" description="${description}">\nfixed\n</subagent>` }];
+			expect((await restored.get("fusion_reconcile")!.execute({}, context("one"))).content).toContain("fixed");
+			resume = JSON.parse((await restored.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.nextAction).toContain("No recovery is owed");
+		}
+		// Healthy ephemeral experiment: a scout-only run (no workspace claim) still
+		// presents recovery state and never implies reattachment.
+		{
+			const tools = new Map<string, Tool>();
+			await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "answer" } }) }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			} });
+			await tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one"));
+			const resume = JSON.parse((await tools.get("fusion_resume")!.execute({}, context("one"))).content);
+			expect(resume.uncertain).toBe(false);
+			expect(resume.reconcile).toBe("unavailable");
+			expect(resume.reconcileDetail).toContain("nothing is unsettled");
+			expect(resume.activeTurnReattach).toBe("refused");
+			expect(resume.nextAction).toContain("No recovery is owed");
+		}
+	});
 	test("blocks direct subagent calls only for the Fusion supervisor", async () => {
 		const tools = new Map<string, Tool>();
 		let before!: (event: { tool: string; agent: string }) => void;
@@ -1169,7 +1253,7 @@ describe("OpenCode Fusion plugin", () => {
 			list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }],
 			transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 		} });
-		for (const name of ["fusion_delegate", "fusion_status", "fusion_reconcile", "fusion_reset"]) {
+		for (const name of ["fusion_delegate", "fusion_status", "fusion_resume", "fusion_reconcile", "fusion_reset"]) {
 			await expect(tools.get(name)!.execute(name === "fusion_delegate" ? { action: "execute", brief: "recursion" } : {}, context("one", "fusion-executor"))).rejects.toThrow("only to the fusion primary agent");
 			await expect(tools.get(name)!.execute(name === "fusion_delegate" ? { action: "execute", brief: "recursion" } : {}, context("one", "general"))).rejects.toThrow("only to the fusion primary agent");
 		}

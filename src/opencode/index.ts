@@ -712,6 +712,44 @@ export default {
 					: "Review the working tree and audit the original task; reset when the run is finished.";
 			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
 		}
+		/** Resume presentation: recovery surface for the owned or adopted run.
+		 * Routed to fusion_reconcile only when exact completion proof can exist;
+		 * operator resolution is documented textually, never implied. */
+		async function resumeContent(sessionID: string): Promise<string> {
+			const run = runs.get(sessionID);
+			if (!run) {
+				const owned = await registry.inspect(workspace);
+				if (!owned) return "No Fusion run in this session.";
+				return JSON.stringify({
+					message: "The workspace Fusion record is not attached to this session; recovery happens in its owning session or through explicit operator resolution.",
+					runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending,
+					activeTurnReattach: "refused",
+					reattachReason: "Fusion never reattaches another session's executor turn into this session.",
+					nextAction: `Call fusion_resume in the owning session (${owned.manifest.owner.supervisorId}), or after inspecting the worker and workspace run: bun src/workspace/resolve.ts ${workspace} ${owned.manifest.runId} ${owned.manifest.pending?.requestId ?? "--no-request-id"} --confirm-stopped`,
+				});
+			}
+			const status = run.runtime.status(run.handle);
+			const outstanding = { backgroundPending: status.backgroundPending, recordedResult: !!status.unsettled, reconciling: !!run.reconciling, delegating: !!run.controller.state.delegating, scoutInFlight, backgroundScout: hasBackgroundScout() };
+			const pendingRequest = run.controller.pending;
+			// The capability mirrors the fusion_reconcile guard; the detail names
+			// which proof reconcile would adopt, or why none can exist.
+			const resolveCommand = run.runId ? `bun src/workspace/resolve.ts ${workspace} ${run.runId} ${pendingRequest?.requestId ?? "--no-request-id"} --confirm-stopped` : "bun src/workspace/resolve.ts --confirm-stopped";
+			let reconcile: { capability: "available" | "busy" | "unavailable"; detail: string };
+			if (outstanding.delegating || outstanding.reconciling) reconcile = { capability: "busy", detail: "another executor transition is in progress" };
+			else if (run.controller.uncertain && pendingRequest && (outstanding.backgroundPending || outstanding.recordedResult)) reconcile = { capability: "available", detail: outstanding.recordedResult ? "the executor's recorded result can be settled into the run" : "the executor's completion notification is awaited, or may already be recorded in this session" };
+			else if (run.controller.uncertain && pendingRequest) reconcile = { capability: "unavailable", detail: "the retained executor request has no live turn and no recorded result; automatic retry stays disabled while the outcome is unknown" };
+			else reconcile = { capability: "unavailable", detail: run.controller.uncertain ? "the outcome is unknown with no retained request" : "nothing is unsettled; the run owes no recovery" };
+			const nextAction = reconcile.capability === "available"
+				? "Call fusion_reconcile to adopt the executor's exact completion. If it reports no matching notification, inspect the worker and workspace, and after confirming the worker stopped run: " + resolveCommand
+				: reconcile.capability === "busy"
+					? "Wait for the in-flight executor transition to finish, then call fusion_resume again."
+					: run.incomplete
+						? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
+						: run.controller.uncertain
+							? "No exact completion proof can be adopted. Inspect the worker session and the working tree, and after confirming the worker stopped run: " + resolveCommand
+							: "No recovery is owed; the run is active in this session. Continue the protocol and call fusion_reset when it finishes.";
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, model: run.model, childSessionID: run.handle.reference?.id, pendingRequest, outstanding, uncertain: run.controller.uncertain, reconcile: reconcile.capability, reconcileDetail: reconcile.detail, activeTurnReattach: "refused", reattachReason: "OpenCode cannot reattach a live or interrupted executor turn back into this session; recovery routes through the completion notification (fusion_reconcile) or explicit operator resolution.", incomplete: !!run.incomplete, nextAction });
+		}
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
 			if (!run) return "No Fusion run in this session.";
@@ -1001,6 +1039,13 @@ export default {
 				},
 			});
 			editor.add({
+				name: "fusion_resume", description: "Show this Fusion run's recovery state: owner, pending request, reconciliation capability, and the next valid action. Refuses outright anything it cannot honestly promise, including mid-turn reattachment.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
+				async execute(_input, context) {
+					requireSupervisor(context);
+					return { content: await resumeContent(context.sessionID) };
+				},
+			});
+			editor.add({
 				name: "fusion_status", description: "Show the current Fusion run state.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
@@ -1108,6 +1153,11 @@ export default {
 				name: "fusion-stats",
 				description: "Show the current Fusion run's budgets",
 				execute: async (args) => await reportCommand(args.sessionID, "Fusion stats", statsContent(args.sessionID)),
+			});
+			editor.add({
+				name: "fusion-resume",
+				description: "Show the Fusion run's recovery state",
+				execute: async (args) => await reportCommand(args.sessionID, "Fusion resume", await resumeContent(args.sessionID)),
 			});
 			editor.add({
 				name: "fusion-clean",
