@@ -227,6 +227,7 @@ Network/opt-in (consumes something — registry or model usage):
 | --- | --- |
 | Fresh-consumer dependency contract (real installs; asserts consumer override on bun+npm) | `bun run test:consumer-install` |
 | Full OpenCode parity workflow live (`opencode-go/glm-5.3-flash`, two runs) | `bun run test:opencode-parity` |
+| Full Pi acceptance workflow live (real Pi SDK executor/scout sessions; `--model zai/glm-5.3-flash`, `--supervisor opencode-go/gemini-4-argon` defaults; supervisor is fixture-driven) | `bun run test:pi-parity` |
 
 The parity fixture writes its observation record (versions, model, timeline,
 scoped assertions, usage totals) next to its session directory; sanitized,

@@ -46,7 +46,9 @@
     "test:opencode-real-child": "bun test/integration/opencode-real-child.mjs",
     "test:opencode-lifecycle": "bun test/integration/opencode-real-child-lifecycle.mjs",
     "test:opencode-scout": "bun test/integration/opencode-scout.mjs",
-    "test:opencode-parity": "bun run test:opencode-parity-syntax && bun test/integration/opencode-parity.mjs"
+    "test:opencode-parity": "bun run test:opencode-parity-syntax && bun test/integration/opencode-parity.mjs",
+    "test:pi-parity-syntax": "bun scripts/check-syntax.mjs test/integration/pi-parity.mjs",
+    "test:pi-parity": "bun run test:pi-parity-syntax && bun test/integration/pi-parity.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "^1.0.0",
