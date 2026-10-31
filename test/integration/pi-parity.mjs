@@ -1,19 +1,29 @@
 // Opt-in LIVE Pi acceptance fixture (M7.3). Model-consuming: the executor
 // and scout run REAL Pi SDK sessions against a real model with real
 // credentials; nothing about the executor path is mocked. The supervisor
-// side is fixture-driven (Pi's Fusion supervisor is the interactive session
-// by design — the extension requires a dialog-capable UI for a live
-// supervisor — so this fixture drives the same registered tools and hooks a
-// real supervisor session would).
+// side is fixture-driven.
 //
-// Scenario matrix (mirrors the OpenCode parity fixture):
+// SCOPE — real-worker integration coverage, and nothing more. What this
+// fixture verifies live: real executor/scout sessions, real tools in a real
+// git worktree, run manifests, usage accounting, failure reporting, and
+// same-run recovery. What it does NOT verify (native acceptance cases that
+// remain OPEN, not covered here): the actual Pi supervisor lifecycle (a
+// model-driven supervisor turn settling through the real session hooks),
+// UI-driven model configuration (the interactive pickers), and the
+// uncertain-run resume/resolve flow live (covered deterministically by the
+// fault-injection suite; Pi's Fusion supervisor requires a dialog-capable
+// UI, which a scripted fixture does not exercise). Do not cite this fixture
+// as native supervisor acceptance evidence.
+//
+// Scenario matrix (mirrors the OpenCode parity fixture where concepts align):
 //   S1 full protocol happy path — scout → execute → file review → revise →
 //      audit → final fix → settle with `## Fusion summary`; run manifest,
-//      status, and honest usage accounting asserted.
-//   S4 failure/recovery — a delegation is aborted mid-flight (real abort
-//      signal), the run turns uncertain, new runs and resume are refused or
-//      routed honestly (session backend cannot reattach), and the operator
-//      resolution command completes recovery for real.
+//      status, per-delegation usage, and the no-nudge/summary-free-nudge
+//      settlement policy asserted.
+//   S4 failure/recovery — a delegation is aborted after the executor's bash
+//      tool is OBSERVED running (not on a timer), the failure report still
+//      carries real usage, no edits land after the abort, and the run
+//      recovers in the same run.
 //   S2 post-recovery continuity — a fresh run completes after cleanup.
 //
 // Usage: bun test/integration/pi-parity.mjs [--model provider/id]
@@ -147,9 +157,31 @@ try {
 			setWidget: () => {},
 		},
 	};
-	const delegate = async (phase, action, brief, signal) => {
+	const delegate = async (phase, action, brief, signal, onUpdate) => {
 		const callId = `call_${phase}_${action}`;
-		return await tools.get("fusion_delegate").execute(callId, { action, brief }, signal, undefined, ctx);
+		return await tools.get("fusion_delegate").execute(callId, { action, brief }, signal, onUpdate, ctx);
+	};
+	const runsDir = join(agentDir, "fusion", "runs");
+	// The real agent_before_settle event shape the shared policy reads:
+	// outcome "completed" (not "done" — an unexpected outcome value makes
+	// needsContinuation return undefined unconditionally) and canContinue
+	// true, with the supervisor's last assistant message in context.
+	const settleProbe = (lastAssistantText) => hooks.get("agent_before_settle")({
+		outcome: "completed",
+		entries: [],
+		context: { canContinue: true, llmMessages: [{ role: "assistant", content: [{ type: "text", text: lastAssistantText }] }] },
+	});
+	// Run records are selected by identity (task content), never by
+	// directory order.
+	const selectRun = async (predicate, label) => {
+		const files = await readdir(runsDir);
+		const matches = [];
+		for (const file of files) {
+			const record = JSON.parse(await readFile(join(runsDir, file), "utf8"));
+			if (predicate(record)) matches.push(record);
+		}
+		if (matches.length !== 1) throw new Error(`PARITY FAILURE expected exactly one run for ${label}, found ${matches.length}`);
+		return matches[0];
 	};
 
 	// ================= S1: full protocol happy path =================
@@ -178,32 +210,41 @@ try {
 	content = await readFile(join(project, "fixture.txt"), "utf8");
 	assert("S1", "final file is gamma", content === "gamma\n", JSON.stringify(content));
 
-	// Settle the supervisor turn with the summary heading, exactly as the
-	// real agent_settled / agent_before_settled hooks would observe it.
-	const beforeSettle = hooks.get("agent_before_settle")({
-		outcome: "done",
-		entries: [],
-		context: { canContinue: false, llmMessages: [{ role: "assistant", content: [{ type: "text", text: "## Fusion summary\nExecuted, revised, audited, final fix applied." }] }] },
-	});
+	// Settle the supervisor turn with the summary heading, using the real
+	// event shape. Control first: a summary-free settle MUST produce a
+	// continuation nudge — otherwise the no-nudge assertion below is vacuous.
+	const controlNudge = settleProbe("I think the work is done here.");
+	const controlContent = controlNudge?.entries?.find((entry) => entry.customType === "fusion-continue")?.content;
+	assert("S1", "a summary-free settle produces a continuation nudge",
+		controlNudge?.continue === true && typeof controlContent === "string" && controlContent.includes("The Fusion run is not finished"),
+		JSON.stringify(controlNudge)?.slice(0, 160));
+	const beforeSettle = settleProbe("## Fusion summary\nExecuted, revised, audited, final fix applied.");
 	assert("S1", "a summary-bearing settle is not nudged", beforeSettle === undefined, JSON.stringify(beforeSettle)?.slice(0, 120));
 	hooks.get("agent_settled")({}, ctx);
 	await delay(500);
 
-	const runsDir = join(agentDir, "fusion", "runs");
-	const runFiles = await readdir(runsDir);
-	const readRun = async () => JSON.parse(await readFile(join(runsDir, runFiles.at(-1)), "utf8"));
-	const run1 = await readRun();
-	assert("S1", "run manifest persisted", Boolean(run1?.runId), JSON.stringify(run1).slice(0, 120));
+	const run1 = await selectRun((record) => String(record.task ?? record.originalTask ?? "").includes("fixture.txt"), "S1");
+	assert("S1", "run manifest persisted with identity", Boolean(run1?.runId), JSON.stringify(run1).slice(0, 120));
+	assert("S1", "run status is done", run1.status === "done", String(run1.status));
+	assert("S1", "exactly one revision was recorded", run1.revisions === 1, String(run1.revisions));
+	assert("S1", "the final fix was used", run1.finalFixUsed === true, String(run1.finalFixUsed));
+	const delegations = run1?.metrics?.delegations ?? [];
+	assert("S1", "all three delegations were recorded in order",
+		delegations.length === 3 && delegations.map((d) => d.action).join(",") === "execute,revise,final_fix",
+		JSON.stringify(delegations.map((d) => d.action)));
+	assert("S1", "every delegation carries real usage",
+		delegations.every((d) => (d?.usage?.totalTokens ?? 0) > 0),
+		JSON.stringify(delegations.map((d) => d?.usage?.totalTokens ?? null)));
 	result.phases.s1 = {
 		scoutAnswerChars: scout1.content[0].text.length,
 		actions: ["execute", "revise", "final_fix"],
 		finalContent: content,
 		manifest: { runId: run1.runId, status: run1.status, revisions: run1.revisions, finalFixUsed: run1.finalFixUsed },
-		metrics: run1.metrics ?? null,
+		delegationUsage: delegations.map((d) => ({ action: d.action, totalTokens: d.usage.totalTokens, cost: d.usage.cost?.total ?? null })),
+		scoutUsage: run1?.metrics?.scout?.usage ?? null,
+		supervisorUsageTotal: run1?.metrics?.supervisorUsage?.totalTokens ?? null,
+		controlNudgeProduced: controlNudge?.continue === true && typeof controlContent === "string",
 	};
-	assert("S1", "usage was really measured (live model turns)",
-		Boolean((run1?.metrics?.executor?.usage?.totalTokens ?? 0) > 0 || (run1?.metrics?.scout?.usage?.totalTokens ?? 0) > 0),
-		JSON.stringify(run1?.metrics ?? null));
 
 	// ================= S4: failure → honest report → same-run recovery =========
 	// Live abort semantics on the session backend: aborting mid-tool-call
@@ -212,22 +253,47 @@ try {
 	// resume/resolve matrix are covered deterministically by the fault
 	// injection suites (pi-controller-probe); this live phase proves the
 	// failure report is honest and that the protocol recovers in the same
-	// run by retrying the delegation. The brief forces a long turn first (a
-	// blocking bash sleep) so the abort always lands mid-tool-call — a short
-	// task could complete before the abort fires and make this a race.
+	// run by retrying the delegation. The abort fires only after the
+	// executor's blocking bash tool is observed running, so a slow model
+	// still generating cannot race this phase.
 	const task2 = 'Create second.txt containing exactly "delta" followed by a single newline. Then verify with cat.';
 	await commands.get("fusion").handler(task2, ctx);
+	// Abort on OBSERVATION, not on a timer: the delegation's live transcript
+	// is watched until the executor's bash tool is actually running the
+	// blocking sleep; only then is the abort fired. A slow model that is
+	// still generating cannot satisfy this phase.
 	const abort = new AbortController();
-	const aborted = delegate("s4", "execute", 'First run `sleep 25` in bash (mandatory opening step). After it completes, create second.txt containing exactly "delta" followed by a single newline.', abort.signal);
-	await delay(6000);
+	const transcriptLines = [];
+	let bashToolStarted;
+	const bashToolStart = new Promise((resolveStart) => { bashToolStarted = resolveStart; });
+	const onUpdate = (update) => {
+		const transcript = String(update?.details?.transcript ?? "");
+		if (transcript) transcriptLines.push(transcript);
+		if (/\[tool\][^\n]*bash[^\n]*sleep/.test(transcript)) bashToolStarted();
+	};
+	const aborted = delegate("s4", "execute", 'First run `sleep 25` in bash (mandatory opening step). After it completes, create second.txt containing exactly "delta" followed by a single newline.', abort.signal, onUpdate);
+	const observedBash = await Promise.race([bashToolStart.then(() => true), delay(90000).then(() => false)]);
+	assert("S4", "the executor's blocking bash tool was observed running before the abort",
+		observedBash === true, `last transcript tail: ${transcriptLines.at(-1)?.slice(-300) ?? "(none)"}`);
+	const abortAtLineCount = transcriptLines.length;
 	abort.abort();
 	const outcome = await aborted;
 	const outcomeText = String(outcome?.content?.[0]?.text ?? "");
 	assert("S4", "aborted delegation reports failure or unknown outcome", Boolean(outcome?.details?.error) || /unknown|interrupted/i.test(outcomeText), String(outcome?.details?.error ?? outcomeText).slice(0, 140));
 	assert("S4", "the failure report still carries real usage accounting", /Executor usage this delegation/.test(outcomeText) && /\$0\.0/.test(outcomeText), outcomeText.slice(0, 200));
+	// No edits may land after the abort: the target file must stay absent
+	// both immediately and after a settling window.
+	const secondExistsNow = await readFile(join(project, "second.txt"), "utf8").then(() => true, () => false);
+	await delay(3000);
+	const secondExistsAfter = await readFile(join(project, "second.txt"), "utf8").then(() => true, () => false);
+	assert("S4", "no edit landed after the abort", secondExistsNow === false && secondExistsAfter === false, JSON.stringify({ secondExistsNow, secondExistsAfter }));
 	result.phases.s4 = {
+		abortAfterObservedBashTool: observedBash === true,
+		observedToolLine: (transcriptLines.at(-1) ?? "").split("\n").find((line) => line.includes("bash")) ?? null,
+		transcriptLinesAfterAbort: Math.max(0, transcriptLines.length - abortAtLineCount),
 		abortReported: Boolean(outcome?.details?.error) || /unknown|interrupted/i.test(outcomeText),
 		usageInFailureReport: /Executor usage this delegation/.test(outcomeText),
+		noEditsAfterAbort: secondExistsNow === false && secondExistsAfter === false,
 		uncertainPath: "deterministic fault-injection coverage (pi-controller-probe): connection-lost mid-prompt yields unknown outcome, uncertain state, refused new runs, /fusion-resume boundary, /fusion-resolve recovery",
 	};
 
@@ -245,7 +311,7 @@ try {
 		secondAfterRetry = await readFile(join(project, "second.txt"), "utf8").catch(() => null);
 	}
 	assert("S4", "the recovered run staged delta", secondAfterRetry === "delta\n", JSON.stringify(secondAfterRetry));
-	hooks.get("agent_before_settle")({ outcome: "done", entries: [], context: { canContinue: false, llmMessages: [{ role: "assistant", content: [{ type: "text", text: "## Fusion summary\nRecovered from the aborted delegation and completed." }] }] } });
+	assert("S4", "the recovered run's summary settle is not nudged", settleProbe("## Fusion summary\nRecovered from the aborted delegation and completed.") === undefined);
 	hooks.get("agent_settled")({}, ctx);
 	await delay(500);
 	result.phases.s4.retry = { executeError: retry?.details?.error ?? null, neededCorrectiveRevise: correction !== null, reviseError: correction?.details?.error ?? null, second: secondAfterRetry };
@@ -259,12 +325,14 @@ try {
 	assert("S2", "post-recovery run delegated successfully", !exec3?.details?.error, String(exec3?.details?.error ?? ""));
 	const third = await readFile(join(project, "third.txt"), "utf8");
 	assert("S2", "third file is epsilon", third === "epsilon\n", JSON.stringify(third));
-	hooks.get("agent_before_settle")({ outcome: "done", entries: [], context: { canContinue: false, llmMessages: [{ role: "assistant", content: [{ type: "text", text: "## Fusion summary\nThird run completed." }] }] } });
+	assert("S2", "the third run's summary settle is not nudged", settleProbe("## Fusion summary\nThird run completed.") === undefined);
 	hooks.get("agent_settled")({}, ctx);
 	await delay(500);
 	const finalRunFiles = await readdir(runsDir);
 	result.phases.s2 = { third, runFilesOnDisk: finalRunFiles.length };
 	assert("S2", "all runs persisted across the session", finalRunFiles.length >= 3, JSON.stringify(finalRunFiles));
+	const run3 = await selectRun((record) => String(record.task ?? record.originalTask ?? "").includes("third.txt"), "S2");
+	assert("S2", "the third run is recorded as done by identity", run3.status === "done", String(run3.status));
 
 	result.ok = true;
 	result.sessionHash = createHash("sha256").update(JSON.stringify(result.phases)).digest("hex").slice(0, 12);
