@@ -1161,6 +1161,11 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.nextAction).toContain("bun src/workspace/resolve.ts");
 			expect(resume.nextAction).toContain(resume.pendingRequest?.requestId as string);
 			expect(resume.nextAction).toContain("--confirm-stopped");
+			// Every suggested shell argument is single-quoted: request ids carry
+			// spaces ("Fusion execute <uuid>"), so the raw form would split and
+			// fail resolve.ts argument validation.
+			expect(resume.nextAction).toContain(`'${resume.pendingRequest?.requestId as string}'`);
+			expect(resume.nextAction).toContain(`'${"/workspace"}'`);
 			expect(resume.activeTurnReattach).toBe("refused");
 		}
 		// A failed executor submission leaves the turn pending on its completion
@@ -1305,6 +1310,82 @@ describe("OpenCode Fusion plugin", () => {
 		stats = JSON.parse((await restored.get("fusion_stats")!.execute({}, context("one"))).content);
 		expect(stats.usage).toMatchObject({ available: false, complete: false, turns: { reported: 0, missing: 1 } });
 		expect(stats.usage.inputTokens).toBeUndefined();
+	});
+
+	test("reconciled usage is recorded inside the settlement and never double-counted on retry", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let failSettlement = false;
+		const storage = { ...backing, set: async (key: string, value: unknown) => {
+			if (failSettlement && !(value as { pending?: unknown }).pending) { failSettlement = false; throw new Error("settlement storage offline"); }
+			await backing.set(key, value);
+		} };
+		let description = "";
+		let messages: unknown[] = [];
+		const makeContext = (fresh: Map<string, Tool>): TestContext => ({
+			location: { directory: "/workspace" }, session: { context: async () => messages, hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input: { description?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					await ctx.progress({ sessionID: "child-f" });
+					description = input.description ?? "";
+					throw new Error("connection lost");
+				} }], transform: async (callback) => { callback({ add: (tool) => fresh.set(tool.name, tool) }); },
+			},
+		});
+		await setupTest(makeContext(tools), storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("connection lost");
+		const restored = new Map<string, Tool>();
+		await setupTest(makeContext(restored), storage);
+		messages = [{ type: "synthetic", description, metadata: { source: "subagent", childID: "child-f", agent: "fusion-executor", state: "completed" }, text: `<subagent sessionID="child-f" state="completed" description="${description}">\nfixed\n</subagent>` }];
+		// The first reconciliation records its usage inside the settlement, whose
+		// write fails: the count exists in memory only, guarded by a dedupe key.
+		failSettlement = true;
+		await expect(restored.get("fusion_reconcile")!.execute({}, context("one"))).rejects.toThrow("settlement storage offline");
+		// The retried reconciliation must not count the turn again.
+		await restored.get("fusion_reconcile")!.execute({}, context("one"));
+		const stats = JSON.parse((await restored.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.usage).toMatchObject({ turns: { reported: 0, missing: 1 } });
+		// And the persisted state carries the dedupe key: a reload cannot re-count.
+		const manifest = (await storage.get(`run/${createHash("sha256").update("/workspace").digest("hex")}`)) as { adapterData?: { fusionUsage?: { counted?: string[] } } };
+		expect(manifest?.adapterData?.fusionUsage?.counted).toEqual([`reconcile:${description}`]);
+	});
+
+	test("partial usage readings keep the totals honest", async () => {
+		const tools = new Map<string, Tool>();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let executorCalls = 0;
+		const reading = (sessionID: string, tokens: Record<string, unknown>, cost: number) => { busQueue.push({ type: "session.usage.updated", data: { sessionID, tokens, cost } }); busWake?.(); };
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {} },
+			tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					executorCalls++;
+					await ctx.progress({ sessionID: "child-p" });
+					if (executorCalls === 1) reading("child-p", { input: 10, output: 5 }, 3);
+					else reading("child-p", {}, 7);
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					return { output: { sessionID: "child-p", status: "completed", output: "done" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, memoryStorage());
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"));
+		const stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
+		// The second reading carried only cost: the token totals come from one
+		// turn of two, so the usage must not claim completeness.
+		expect(stats.usage).toMatchObject(
+			{ available: true, complete: false, turns: { reported: 2, missing: 0 } },
+		);
+		expect(stats.usage.inputTokens).toBe(10);
+		expect(stats.usage.cost).toBe(7);
+		expect(stats.usage.fieldTurns).toMatchObject({ inputTokens: 1, outputTokens: 1, cost: 2 });
 	});
 	test("blocks direct subagent calls only for the Fusion supervisor", async () => {
 		const tools = new Map<string, Tool>();

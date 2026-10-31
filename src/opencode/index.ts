@@ -556,15 +556,31 @@ export default {
 			const prompt = run.adapterData?.fusionPrompt;
 			return !!prompt && typeof prompt === "object" && (prompt as { state?: unknown }).state === "pending";
 		}
+		/** POSIX single-quote a shell argument so paths and request ids with
+		 * spaces or metacharacters stay single arguments in displayed commands. */
+		function shellQuote(value: string): string {
+			return `'${value.replaceAll("'", `'\\''`)}'`;
+		}
 		/** Aggregate one observed worker turn into the run's persisted usage
 		 * record. A turn whose result carried no usage reading counts as missing,
-		 * so the totals honestly under-report instead of guessing. */
-		function recordUsage(run: Run, result: WorkerTurnResult): void {
-			const current = run.adapterData?.fusionUsage as Record<string, number> | undefined;
-			const next: Record<string, number> = { ...(current ?? {}) };
-			next.turnsReported = (next.turnsReported ?? 0) + (result.usage ? 1 : 0);
-			next.turnsMissing = (next.turnsMissing ?? 0) + (result.usage ? 0 : 1);
-			if (result.usage) for (const [field, value] of Object.entries(result.usage)) if (typeof value === "number" && Number.isFinite(value)) next[field] = (next[field] ?? 0) + value;
+		 * so the totals honestly under-report instead of guessing, and per-field
+		 * coverage (`fieldTurns`) keeps a token-carrying turn from making a
+		 * cost-only turn's totals look complete. `dedupeKey` suppresses a
+		 * re-recorded turn across settlement retries. */
+		function recordUsage(run: Run, result: WorkerTurnResult, dedupeKey?: string): void {
+			const current = (run.adapterData?.fusionUsage ?? {}) as Record<string, unknown> & { turnsReported?: number; turnsMissing?: number; counted?: string[]; fieldTurns?: Record<string, number> };
+			if (dedupeKey && current.counted?.includes(dedupeKey)) return;
+			const next: Record<string, unknown> = { ...current };
+			next.turnsReported = (current.turnsReported ?? 0) + (result.usage ? 1 : 0);
+			next.turnsMissing = (current.turnsMissing ?? 0) + (result.usage ? 0 : 1);
+			const fieldTurns = { ...(current.fieldTurns ?? {}) };
+			for (const [field, value] of Object.entries(result.usage ?? {})) {
+				if (typeof value !== "number" || !Number.isFinite(value)) continue;
+				next[field] = (typeof current[field] === "number" ? current[field] as number : 0) + value;
+				fieldTurns[field] = (fieldTurns[field] ?? 0) + 1;
+			}
+			next.fieldTurns = fieldTurns;
+			if (dedupeKey) next.counted = [...current.counted ?? [], dedupeKey].slice(-16);
 			run.adapterData = { ...run.adapterData, fusionUsage: next };
 		}
 		// The native executor is called directly below; model-originated calls pass
@@ -740,7 +756,7 @@ export default {
 					runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending,
 					activeTurnReattach: "refused",
 					reattachReason: "Fusion never reattaches another session's executor turn into this session.",
-					nextAction: `Call fusion_resume in the owning session (${owned.manifest.owner.supervisorId}), or after inspecting the worker and workspace run: bun src/workspace/resolve.ts ${workspace} ${owned.manifest.runId} ${owned.manifest.pending?.requestId ?? "--no-request-id"} --confirm-stopped`,
+					nextAction: `Call fusion_resume in the owning session (${owned.manifest.owner.supervisorId}), or after inspecting the worker and workspace run: bun src/workspace/resolve.ts ${shellQuote(workspace)} ${shellQuote(owned.manifest.runId)} ${shellQuote(owned.manifest.pending?.requestId ?? "--no-request-id")} --confirm-stopped`,
 				});
 			}
 			const status = run.runtime.status(run.handle);
@@ -748,7 +764,7 @@ export default {
 			const pendingRequest = run.controller.pending;
 			// The capability mirrors the fusion_reconcile guard; the detail names
 			// which proof reconcile would adopt, or why none can exist.
-			const resolveCommand = run.runId ? `bun src/workspace/resolve.ts ${workspace} ${run.runId} ${pendingRequest?.requestId ?? "--no-request-id"} --confirm-stopped` : "bun src/workspace/resolve.ts --confirm-stopped";
+			const resolveCommand = run.runId ? `bun src/workspace/resolve.ts ${shellQuote(workspace)} ${shellQuote(run.runId)} ${shellQuote(pendingRequest?.requestId ?? "--no-request-id")} --confirm-stopped` : "bun src/workspace/resolve.ts --confirm-stopped";
 			let reconcile: { capability: "available" | "busy" | "unavailable"; detail: string };
 			if (outstanding.delegating || outstanding.reconciling) reconcile = { capability: "busy", detail: "another executor transition is in progress" };
 			else if (run.controller.uncertain && pendingRequest && (outstanding.backgroundPending || outstanding.recordedResult)) reconcile = { capability: "available", detail: outstanding.recordedResult ? "the executor's recorded result can be settled into the run" : "the executor's completion notification is awaited, or may already be recorded in this session" };
@@ -768,9 +784,13 @@ export default {
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
 			if (!run) return "No Fusion run in this session.";
-			const usage = run.adapterData?.fusionUsage as Record<string, number> | undefined;
-			const reported = usage?.turnsReported ?? 0;
-			const missing = usage?.turnsMissing ?? 0;
+			const usage = (run.adapterData?.fusionUsage ?? {}) as Record<string, unknown> & { turnsReported?: number; turnsMissing?: number; fieldTurns?: Record<string, number> };
+			const reported = usage.turnsReported ?? 0;
+			const missing = usage.turnsMissing ?? 0;
+			// A summed field is only complete when every reporting turn carried
+			// it: a token total that came from fewer turns than reported must
+			// not look whole.
+			const fieldsFull = reported > 0 && !(["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens", "cost"] as const).some((field) => typeof usage[field] === "number" && (usage.fieldTurns?.[field] ?? 0) !== reported);
 			return JSON.stringify({ runId: run.runId, executed: run.controller.state.executed,
 				revisions: { used: run.controller.state.revisions, limit: MAX_REVISIONS },
 				scoutCalls: { used: run.controller.state.scoutCalls, limit: MAX_SCOUT_CALLS },
@@ -779,14 +799,15 @@ export default {
 				usage: {
 					available: reported > 0,
 					reason: reported > 0 ? undefined : run.controller.state.executed || run.controller.state.scoutCalls > 0 ? "No Fusion worker turn has reported usage on this host yet." : "No Fusion worker turn has run yet.",
-					complete: missing === 0,
+					complete: missing === 0 && (reported === 0 || fieldsFull),
 					turns: { reported, missing },
-					inputTokens: usage?.inputTokens,
-					outputTokens: usage?.outputTokens,
-					cacheReadTokens: usage?.cacheReadTokens,
-					cacheWriteTokens: usage?.cacheWriteTokens,
-					reasoningTokens: usage?.reasoningTokens,
-					cost: usage?.cost,
+					fieldTurns: usage.fieldTurns,
+					inputTokens: usage.inputTokens,
+					outputTokens: usage.outputTokens,
+					cacheReadTokens: usage.cacheReadTokens,
+					cacheWriteTokens: usage.cacheWriteTokens,
+					reasoningTokens: usage.reasoningTokens,
+					cost: usage.cost,
 				} });
 		}
 
@@ -1042,8 +1063,21 @@ export default {
 					try {
 						run.setContext(run.handle, context);
 						const request: WorkerTurnRequest = { runId: run.runId, requestId: pending.requestId, worker: run.handle, prompt: "" };
+						const unresolvedStatus = run.runtime.status(run.handle);
+						const unsettled = unresolvedStatus.unsettled;
 						const persistResult = async (result: import("../core/worker.ts").WorkerTurnResult) => {
 							await run.controller.persistSettlement(result.status, async () => {
+								// The reconciled turn's usage is recorded inside the
+								// persisted settlement itself, so a reload before
+								// another write loses neither the settlement nor the
+								// count. The dedupe key (keyed on the pending request)
+								// keeps a re-run of the same reconciliation — after a
+								// failed settlement write, for instance — from
+								// counting the turn twice. A recorded (unsettled)
+								// result was already counted when its turn
+								// completed, so only notification-adopted turns are
+								// new to the totals.
+								if (!unsettled) recordUsage(run, result, `reconcile:${pending.requestId}`);
 								// Reconciliation settles the same request the evidence was
 								// collected for; anything else gets empty evidence.
 								const retained = run.lastResult;
@@ -1052,11 +1086,6 @@ export default {
 								await run.lease!.save(value); await store.save(value);
 							});
 						};
-						const unsettled = run.runtime.status(run.handle).unsettled;
-						// A recorded result's usage was already counted when its turn
-						// completed (the delegate's collect port); only a result adopted
-						// from the completion notification is new to the totals — and it
-						// carries no usage reading, so it counts as a missing turn.
 						const result = unsettled
 							? await run.runtime.settle(request, persistResult)
 							: await run.runtime.reconcile(request, { signal: context.signal, onEvent: () => {}, onReference: () => persist(context.sessionID, run) }, async (childID, _request, signal) => {
@@ -1068,7 +1097,6 @@ export default {
 								const notification = notificationResult(messages, childID, pending.requestId);
 								return { status: notification.state, text: notification.output };
 							}, persistResult);
-						if (!unsettled) recordUsage(run, result);
 						run.controller.setUncertain(false);
 						const terminalState = result.status;
 						const parsed = run.controller.executorReport(result.text);
