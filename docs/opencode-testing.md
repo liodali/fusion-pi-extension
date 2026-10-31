@@ -40,7 +40,10 @@ Checked 2026-10-28 against locally installed OpenCode v2.2.0.
 | Commands, persistent mode, clean (M6.3) | `fusion-run`, `fusion-mode`, `fusion-status`, `fusion-stats`, `fusion-clean` native commands; mode gates mutation tools per session; clean releases settled resources only | Unit tests (registration, /fusion-run prompt injection, mode gating + persistence, clean settled/foreign/uncertain); model-free live: all five commands in `/api/command` and `fusion-status` invoked through the command API (v2.2.3) |
 | Completion hooks, bounded nudges (M6.4) | Turn-end bus events feed the shared completion policy; nudges sent via session.prompt; interrupted/failed never nudge; runs settle per mode. Review follow-ups: Fusion-turn binding, event dedupe, persisted budget, incomplete reporting, retryable delivery, final-part summary detection; unresolved-work hold across all terminals (interrupt/fail included); budget + settlement + incomplete persist across reload; missing-prompt hosts consume nothing | Channel pinned live (v2.2.3 execution/text event shapes); unit-pinned nudge bound (2), summary suppression, backgrounded suppression, interrupt settle, agent binding, dedupe, reload persistence (incomplete + completed phase), delivery-failure retry and persistence-failure hold; live early-settle observation deferred to the M6.6 parity run |
 | Resume/reconcile control (M6.5) | `fusion_resume` tool and `/fusion-resume` command present owner, pending request, outstanding work, and reconciliation capability (available/busy/unavailable mirroring the `fusion_reconcile` guard); routes to `fusion_reconcile` when exact proof can exist (across reload too); documents concrete operator resolution (`bun src/workspace/resolve.ts ... --confirm-stopped`) otherwise; `activeTurnReattach` refused with reason | Unit-pinned across healthy, backgrounded-miss, retained-intent-without-proof, reload continuity, and scout-only states, plus non-supervisor refusal; model-free live command registration on the installed host (v2.2.5). Recovery after a restart that lost the completion notification stays blocked pending upstream (#36349); cross-session "not attached" presentation and a real restart recovery run join M6.6 parity coverage |
-| Complete OpenCode Fusion workflow | No | Not ready to install/use |
+| Per-run usage metrics (M6.6) | `fusion_stats` reports real worker token/cost totals from observed `session.usage.updated` deltas, aggregated per turn and persisted through `adapterData` across reload; missing readings are counted (`complete: false`) instead of guessed; persistent-mode settled runs are releasable by `fusion-clean` (phase "complete"), unfinished ones refused | Unit-pinned aggregation (scout+execute+revise deltas), reload persistence, reconciled-turn missing honesty, armed-settled clean release/refusal; live run totals observed (run 1: 4/4 turns, 15885 input / 738 output / 32640 cache-read tokens; run 2: 1/1, 5539 input) |
+| Complete OpenCode Fusion workflow (M6.6 parity) | Passes through user-facing controls only on the installed v2.2.5 host: configure → run → scout → execute → file review → revise → audit → final fix → `## Fusion summary` (run 1, one executor child, alpha→beta→gamma); persistent mode + new run (run 2); resume across owning/cross-session/post-clean states | `test/integration/opencode-parity.mjs` exits 0 (`opencode-go/glm-5.3-flash`); supersedes the failed 2026-10-30 CLI workflow run. Known live boundaries: serve-mode gateway models need the provider + opencode account credentials; the prompted supervisor turn may run in a different session than the command's; the supervisor resets its own run unless the task forbids it; the upstream parent-completion gap (#36349) reproduces as an open supervisor turn after its child and the fixture recovers via interrupt + clean + reissue |
+| Complete OpenCode Fusion workflow | Packaging: No | Workflow parity reached (M6.6); independent packaging and install (M7) not ready |
+| Shared Git workspace evidence | Pi and OpenCode use the same snapshot/diff code | Real temporary Git worktree tests; OpenCode requires full review |
 
 The core extraction is partial: the shared controller owns task transitions,
 pending and uncertain state, delegation guards, and the main delegation sequence;
@@ -51,9 +54,11 @@ files. OpenCode
 plugin storage and the shared ownership registry retain the workspace owner,
 original task, budgets, child ID and pending turn across reloads. The SQLite
 workspace coordinator excludes concurrent owners across processes. The package
-still requires Pi peers and is not independently packaged for OpenCode. Passing
-mock tests and the no-model smoke test does not establish harness parity.
-Any native delegation failure leaves the run uncertain and blocks
+still requires Pi peers and is not independently packaged for OpenCode (M7).
+Harness parity through the user-facing controls is now established by the
+M6.6 live parity run (v2.2.5): the full protocol, persistent mode, and all
+six commands pass end to end, with real per-run usage totals observed.
+Any native delegation failure still leaves the run uncertain and blocks
 reset/retry, even when no child ID was received. Inspect the native session and
 working tree before any manual recovery.
 
