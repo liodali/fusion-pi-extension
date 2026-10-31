@@ -1464,6 +1464,46 @@ describe("OpenCode Fusion plugin", () => {
 		await tools.get("fusion_reset")!.execute({}, context("one"));
 	});
 
+	test("clean releases a settled persistent-mode run and refuses an unfinished one", async () => {
+		const tools = new Map<string, Tool>();
+		const commands: CommandDefinition[] = [];
+		const nudges: string[] = [];
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const settle = async (id: string, text: string) => {
+			contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+			busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+			busWake?.();
+			busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } });
+			busWake?.();
+			busQueue.push({ id, type: "session.execution.succeeded", data: { sessionID: "one" } });
+			busWake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		};
+		const reportBlock = '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```';
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, prompt: async (input: { id?: string }) => { if (input.id?.startsWith("msg_fusion_nudge")) nudges.push(input.id); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback: (editor: { add: (command: CommandDefinition) => void }) => Promise<void>) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: reportBlock } }) }], transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		// Persistent mode, then a run: armed and unfinished, clean refuses.
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the fixture" } });
+		await expect(commands[5].execute({ sessionID: "one" })).rejects.toThrow("The Fusion run is still active");
+		// The protocol runs and the summary turn settles the run: persistent
+		// mode keeps it armed, and clean must still release the settled resources.
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build", originalTask: "Build the fixture" }, context("one"));
+		await settle("evt-1", "## Fusion summary");
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.phase).toBe("complete");
+		expect(status.runActive).toBe(true);
+		expect(await commands[5].execute({ sessionID: "one" })).toContain("Released Fusion resources for this session.");
+	});
+
 	test("a backgrounded scout keeps its guard until its execution is observed to end", async () => {
 		const tools = new Map<string, Tool>();
 		let before!: (event: { tool: string; agent: string; sessionID?: string }) => void;

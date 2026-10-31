@@ -648,10 +648,14 @@ export default {
 		/** Release settled Fusion resources for a session, or a settled workspace record left by another one. */
 		async function cleanWorkspace(sessionID: string): Promise<string> {
 			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
+			// A persistent-mode run stays armed (runActive true) after it settles;
+			// phase "complete" is the settled marker, so it releases like any
+			// other settled run instead of deadlocking the session's cleanup.
+			const cleanable = (state: { runActive: boolean; phase: string }): boolean => state.runActive && state.phase !== "complete";
 			const run = runs.get(sessionID);
 			if (run) {
 				if (hasUnconfirmedPrompt(run)) throw new Error("Fusion prompt delivery is unconfirmed. Retry /fusion-run with the same task before cleaning.");
-				if (run.controller.state.runActive) throw new Error("The Fusion run is still active; finish and reset it before cleaning.");
+				if (cleanable(run.controller.state)) throw new Error("The Fusion run is still active; finish and reset it before cleaning.");
 				const error = run.controller.resetError(false, run.reconciling);
 				if (error) throw new Error(`${error} Clean releases settled resources only.`);
 				if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before cleaning.");
@@ -672,13 +676,13 @@ export default {
 				const owned = await registry.inspect(workspace);
 				if (!owned) return "No Fusion resources to clean in this workspace.";
 				if (owned.manifest.recovery !== "settled") throw new Error(`The workspace Fusion record is ${owned.manifest.recovery}; reconcile it or run the explicit operator resolution before cleaning.`);
-				if (owned.manifest.state.runActive || scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion run or scout is still active; clean it from its owning session after it finishes.");
+				if (owned.manifest.state.runActive && owned.manifest.state.phase !== "complete" || scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion run or scout is still active; clean it from its owning session after it finishes.");
 				// An adopted run's held lease is the same record: release through it
 				// rather than claiming the workspace a second time in this process.
 				const holder = [...runs.values()].find((candidate) => candidate.lease && candidate.lease.manifest.runId === owned.manifest.runId);
 				if (holder?.lease) {
 					const error = holder.controller.resetError(false, holder.reconciling);
-					if (error || holder.controller.state.runActive) throw new Error("The owning Fusion run is still active; clean it from its owning session after it finishes.");
+					if (error || cleanable(holder.controller.state)) throw new Error("The owning Fusion run is still active; clean it from its owning session after it finishes.");
 					await store.removeSettled(holder.runId);
 					await holder.lease.release();
 					holder.lease = undefined;

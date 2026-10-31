@@ -29,7 +29,8 @@
     "test:ownership-cross-process": "bun test/integration/cross-process-ownership.mjs",
     "test:opencode-real-child": "bun test/integration/opencode-real-child.mjs",
     "test:opencode-lifecycle": "bun test/integration/opencode-real-child-lifecycle.mjs",
-    "test:opencode-scout": "bun test/integration/opencode-scout.mjs"
+    "test:opencode-scout": "bun test/integration/opencode-scout.mjs",
+    "test:opencode-parity": "bun test/integration/opencode-parity.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "^1.0.0",
