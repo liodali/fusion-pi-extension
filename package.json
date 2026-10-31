@@ -32,6 +32,7 @@
     "test:syntax": "bun scripts/check-syntax.mjs",
     "test:opencode-parity-syntax": "bun scripts/check-syntax.mjs test/integration/opencode-parity.mjs",
     "test:opencode-smoke": "bun test/integration/opencode-smoke.mjs",
+    "test:pi-load": "bun test/integration/pi-load.mjs",
     "test:opencode-workflow": "bun test/integration/opencode-workflow.mjs",
     "test:opencode-restart": "bun test/integration/opencode-restart.mjs",
     "test:opencode-restart-live": "bun test/integration/opencode-restart-live.mjs",
