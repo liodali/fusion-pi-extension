@@ -480,6 +480,10 @@ describe("OpenCode Fusion plugin", () => {
 		gate();
 		await turning;
 		await new Promise((resolve) => setTimeout(resolve, 50));
+		// The interrupt cancelled the pending nudge the moment it arrived; the
+		// settlement that resumes from persistence must not deliver into the
+		// cancelled turn.
+		expect(nudges).toHaveLength(0);
 		// The queued interrupt settles after the earlier settlement completes.
 		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive).toBe(false);
 		// A reset during settlement: the resumed settlement aborts instead of
@@ -488,7 +492,7 @@ describe("OpenCode Fusion plugin", () => {
 		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Next" } });
 		await settle("evt-3", "Working.");
-		expect(nudges).toHaveLength(2);
+		expect(nudges).toHaveLength(1);
 		failPrompt = true;
 		gated = true;
 		const staleTurn = settle("evt-4", "More.");
@@ -499,7 +503,7 @@ describe("OpenCode Fusion plugin", () => {
 		await staleTurn;
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		// The stale settlement aborted: no stale nudge delivered, and the reset holds.
-		expect(nudges).toHaveLength(2);
+		expect(nudges).toHaveLength(1);
 		expect((await tools.get("fusion_status")!.execute({}, context("one"))).content).toBe("No Fusion run in this session.");
 	});
 

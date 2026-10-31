@@ -292,6 +292,15 @@ export default {
 			// control tools (fusion_reconcile among them) stay available, and let
 			// the outstanding work steer what happens next.
 			const workUnresolved = status.backgroundPending || status.unsettled || run.reconciling || scoutInFlight || hasBackgroundScout();
+			// Cancellation is recorded the moment an interrupt or failure
+			// arrives — not when its queued settlement runs — so a settlement
+			// paused at persistence can never resume into delivering the
+			// cancelled nudge. Unresolved work still holds: there the
+			// outstanding work, not the interrupt, decides the nudge's fate.
+			if (terminal !== "completed" && !workUnresolved) {
+				const pendingNudge = run.adapterData?.fusionNudge as { state?: unknown } | undefined;
+				if (pendingNudge?.state === "pending") run.adapterData = { ...run.adapterData, fusionNudge: { ...pendingNudge, state: "cancelled" } };
+			}
 			// Settlement is serialized per run: terminals queue behind earlier
 			// settlements so a late interrupt can never interleave with an
 			// in-flight nudge delivery or state write.
@@ -306,6 +315,15 @@ export default {
 			// switch while settlement is in flight must not deliver a stale nudge
 			// or mutate a run this instance no longer owns.
 			const stale = (): boolean => runs.get(sessionID) !== run || turnAgent.get(sessionID) !== "fusion";
+			// Cancellation and outstanding work are re-read from the run at
+			// delivery time — not from locals captured at settlement start —
+			// because an interrupt can cancel the nudge and a worker can
+			// background while a settlement is paused at persistence.
+			const nudgeCancelled = (): boolean => (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state === "cancelled";
+			const workUnresolvedNow = (): boolean => {
+				const status = run.runtime.status(run.handle);
+				return status.backgroundPending || status.unsettled || run.reconciling || scoutInFlight || hasBackgroundScout();
+			};
 			const persistRun = async (): Promise<boolean> => {
 				if (!run.lease) return true;
 				try {
@@ -354,7 +372,10 @@ export default {
 					await reportIssue("Fusion could not write its continuation intent; the nudge will retry when this session next settles.");
 					return;
 				}
-				if (stale()) return;
+				// The pause at persistence is exactly where an interrupt lands:
+				// a cancellation it recorded there, or work that became
+				// unresolved during the pause, aborts this delivery.
+				if (stale() || nudgeCancelled() || workUnresolvedNow()) return;
 				try {
 					await deliverPrompt({ sessionID, id: pendingNudge.id, text: pendingNudge.text });
 					run.adapterData = { ...run.adapterData, fusionNudge: { id: pendingNudge.id, text: pendingNudge.text, state: "delivered" } };
@@ -375,7 +396,9 @@ export default {
 					await reportIssue("Fusion could not write its continuation intent; the nudge will retry when this session next settles.");
 					return;
 				}
-				if (stale()) return;
+				// Same pause, same exposure: an interrupt recorded during the
+				// persistence await cancels this nudge before it is sent.
+				if (stale() || nudgeCancelled() || workUnresolvedNow()) return;
 				try {
 					await deliverPrompt({ sessionID, id, text: nudge });
 					run.adapterData = { ...run.adapterData, fusionNudge: { id, text: nudge, state: "delivered" } };
