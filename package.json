@@ -13,8 +13,13 @@
   "license": "MIT",
   "files": [
     "src",
-    ".pi/extensions/fusion.ts"
+    ".pi/extensions/fusion.ts",
+    "examples",
+    "docs/install.md"
   ],
+  "bin": {
+    "fusion-resolve": "./src/workspace/resolve.ts"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./pi": "./src/index.ts",

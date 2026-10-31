@@ -39,7 +39,7 @@
 // boundary, not a defect this fixture polices.
 //
 // Model-free; touches the network only to install from the registry.
-import { mkdtemp, readdir, readFile, rm, writeFile, copyFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile, copyFile, stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -82,6 +82,32 @@ async function codemodeCopies(consumerDir) {
 		}
 	}
 	return copies;
+}
+
+// The published surface the install guide depends on: the OpenCode agent
+// definitions ship with the package, the consolidated install guide ships,
+// and the Pi project-local discovery shim ships. Missing files break the
+// documented install steps, so these are asserted like the codemode rows.
+async function shippedAssets(consumerDir) {
+	const pkgRoot = join(consumerDir, "node_modules/pi-fusion-extension");
+	const wanted = {
+		"agent fusion.md": join(pkgRoot, "examples/opencode/agents/fusion.md"),
+		"agent fusion-executor.md": join(pkgRoot, "examples/opencode/agents/fusion-executor.md"),
+		"agent fusion-scout.md": join(pkgRoot, "examples/opencode/agents/fusion-scout.md"),
+		"install guide": join(pkgRoot, "docs/install.md"),
+		"Pi discovery shim": join(pkgRoot, ".pi/extensions/fusion.ts"),
+		"operator CLI": join(pkgRoot, "src/workspace/resolve.ts"),
+	};
+	const assets = {};
+	for (const [label, path] of Object.entries(wanted)) {
+		try {
+			await stat(path);
+			assets[label] = true;
+		} catch {
+			assets[label] = false;
+		}
+	}
+	return assets;
 }
 
 async function describeCopy(consumerDir, packageDir) {
@@ -137,6 +163,7 @@ async function scenario(name, { manager, override, tarball }) {
 		const installer = manager === "bun" ? ["bun", ["install"]] : ["npm", ["install", "--no-audit", "--no-fund", "--loglevel=error"]];
 		const install = spawnSync(installer[0], installer[1], { cwd: consumerDir, encoding: "utf8" });
 		const copies = await codemodeCopies(consumerDir);
+		const shipped = await shippedAssets(consumerDir);
 		const probe = await importProbe(consumerDir);
 		return {
 			name,
@@ -145,6 +172,7 @@ async function scenario(name, { manager, override, tarball }) {
 			installExit: install.status,
 			installNote: install.status === 0 ? "" : `${install.stdout ?? ""}${install.stderr ?? ""}`.split("\n").filter(Boolean).slice(-3).join(" | "),
 			copies,
+			shipped,
 			importOk: probe.importOk,
 			probeNote: probe.output,
 		};
@@ -157,9 +185,15 @@ const run = async () => {
 	const tarball = await packTarball();
 	const result = { checkedAt: new Date().toISOString(), tarball, scenarios: [] };
 	const assertHealthy = (scenario) => {
-		const healthy = scenario.installExit === 0 && scenario.importOk && scenario.copies.length > 0
+		const shippedAll = Object.values(scenario.shipped ?? {}).every(Boolean) && Object.keys(scenario.shipped ?? {}).length > 0;
+		const healthy = scenario.installExit === 0 && scenario.importOk && shippedAll
+			&& scenario.copies.length > 0
 			&& scenario.copies.every((copy) => /^1\.0\./.test(copy.version) && copy.carriesSymbol);
-		return { healthy, failure: healthy ? "" : `install=${scenario.installExit}, importOk=${scenario.importOk}, copies=${JSON.stringify(scenario.copies)}` };
+		const shippedGaps = Object.entries(scenario.shipped ?? {}).filter(([, present]) => !present).map(([label]) => label);
+		return {
+			healthy,
+			failure: healthy ? "" : `install=${scenario.installExit}, importOk=${scenario.importOk}, shippedGaps=${JSON.stringify(shippedGaps)}, copies=${JSON.stringify(scenario.copies)}`,
+		};
 	};
 
 	const bunGuided = await scenario("bun with documented consumer override", { manager: "bun", override: "~1.0.3", tarball });

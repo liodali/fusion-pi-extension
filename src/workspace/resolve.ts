@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 import { canonicalWorkspace, openWorkspaceRegistry } from "./ownership.ts";
 
 /** An operator must independently verify worker termination and review the tree. */
@@ -30,7 +31,7 @@ export async function resolveWorkspaceOwnership(input: { cwd: string; runId: str
 if (import.meta.main) {
 	const [cwd, runId, request, confirmation, ...extra] = process.argv.slice(2);
 	if (!cwd || !runId || !request || confirmation !== "--confirm-stopped" || extra.length) {
-		console.error("Usage: bun src/workspace/resolve.ts <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped");
+		console.error("Usage: fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped");
 		process.exitCode = 2;
 	} else {
 		try {

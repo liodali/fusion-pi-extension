@@ -16,6 +16,7 @@ rely on:
 | `pi-fusion-extension/pi` | same file (alias) | Pi hosts |
 | `pi-fusion-extension/opencode` | OpenCode plugin (`src/opencode/index.ts`) | OpenCode hosts |
 | `pi-fusion-extension/package.json` | package metadata | tooling |
+| `fusion-resolve` (bin) | operator ownership resolution CLI (`src/workspace/resolve.ts`, runs under bun) | operators, package installs |
 
 The import graphs behind the two entrypoints are isolated and statically
 pinned (`test/package-isolation.test.ts`): the OpenCode closure contains no
@@ -55,11 +56,14 @@ consumer directories (real tarball installs):
 
 ## Installing for Pi
 
-1. Install `pi-fusion-extension` into the Pi host (or workspace) so the
-   manifest's `pi.extensions` field resolves: it points at
-   `.pi/extensions/fusion.ts`, which re-exports the default export of
-   `src/index.ts`. `bun test/integration/pi-load.mjs` proves this exact shim
-   loads and registers the documented surface.
+1. Install `pi-fusion-extension` into the Pi host (or workspace). A Pi host
+   resolves the extension from the targets listed in the package manifest's
+   `pi.extensions` field — `./src/index.ts`, the extension's default export.
+   The package also ships a project-local discovery file,
+   `.pi/extensions/fusion.ts`, which re-exports that same extension; both
+   forms are pinned by `test:pi-load`, which loads the manifest targets
+   exactly as the manifest states them and asserts the shim re-exports the
+   same module.
 2. Ensure the Pi stack versions are compatible (see the codemode constraint
    above). Development pins validated in this repository:
    `@earendil-works/*` 1.0.3, `typebox` 1.3.27.
@@ -93,13 +97,15 @@ be declared supported. This boundary is deliberate honesty, not a bug.
    (The parity fixture uses the equivalent copied-checkout form: it copies
    `src` into the project `.opencode/fusion` and re-exports
    `../fusion/opencode/index.ts` — both shapes load the same entry.)
-2. Copy the three agent definitions from `examples/opencode/agents/` into the
-   project's `.opencode/agents/`:
-   - `fusion.md` — primary supervisor agent; grants `subagents` only for the
-     two Fusion subagents and denies direct `subagents` otherwise.
+2. Copy the three agent definitions into the project's `.opencode/agents/`:
+   - `fusion.md` — primary supervisor agent; grants subagents only for the
+     two Fusion subagents and denies direct subagents otherwise.
    - `fusion-executor.md` — subagent that implements the decided brief and is
      denied every Fusion control except its tool surface.
    - `fusion-scout.md` — read-only investigation subagent.
+   The agent files ship in the published package
+   (`node_modules/pi-fusion-extension/examples/opencode/agents/` in an
+   install; `examples/opencode/agents/` in this checkout).
    These are the exact agent files the live parity fixture ran with
    (`opencode-go/glm-5.3-flash`, OpenCode v2.2.5). Other permission
    inheritance shapes remain unverified.
@@ -155,15 +161,39 @@ settle/uncertain transitions on submission failures; bounded settle nudges
 detection across reload; early-settlement prevention so a supervisor cannot
 prematurely finish a delegation sequence.
 
-**Operator resolution.** When a run recovered after a restart lost its
-completion notification, `fusion-resume` / `fusion-reconcile` present the
-owner, the pending request, outstanding work, and the capability state. When
-exact recovery proof cannot exist (e.g. across reload with retained intent
-but no proof), the presentation quotes the exact operator command:
+**Operator resolution.** `/fusion-resume` is a **user-facing command**
+(OpenCode `/fusion-resume`; Pi `fusion-resume`) that presents the owner run,
+the pending request, outstanding work, and the reconciliation capability.
+Its presentation routes the next step; it is not the reconcile itself:
+
+- When exact completion proof can exist, the presentation directs the fusion
+  supervisor session to call the model-facing tool `fusion_reconcile` —
+  which exists as a Fusion tool the supervisor calls by choice, never as a
+  user slash command (e.g. across reload with retained intent but no proof,
+  automatic retry stays disabled).
+- Otherwise it quotes the operator resolution command (below).
+
+**Operator resolution command.** In the repository/checkout install — the
+shape the live parity fixture verified — the presentation quotes:
 
 ```
 bun src/workspace/resolve.ts <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
 ```
+
+For a package install the same script ships and is exposed as the
+`fusion-resolve` bin — run it with exactly the arguments the presentation
+carried:
+
+```
+./node_modules/.bin/fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
+bunx --bun fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --confirm-stopped
+```
+
+(The bin has a `#!/usr/bin/env bun` shebang, so the TypeScript executes
+under bun in both forms.) Honest limitation: the text quoted inside the
+tool presentation assumes the checkout install — the only live-verified
+shape so far; on a package install, follow the presented arguments through
+one of the bin invocations above.
 
 Pass the run's pending request id when one exists; pass `--no-request-id`
 when nothing is retained. Every argument is POSIX-quoted by the presentation

@@ -4,6 +4,17 @@ A price-tiered supervisor/executor orchestration extension for the Pi coding age
 
 This is an independent community Pi extension. It is not an official Cognition or Devin product and is not affiliated with either.
 
+## Install and operating guide
+
+Pi and OpenCode installation, agent setup, credentials, operating commands, and
+recovery directions are consolidated in [docs/install.md](docs/install.md): the
+package entrypoints (`pi-fusion-extension/opencode` for the OpenCode plugin,
+`pi-fusion-extension` / `/pi` for the Pi extension), what a consumer install
+pulls, supported OpenCode versions (v2.2.3–v2.2.5), the OpenCode agent files,
+the gateway credential pair, `FUSION_OWNERSHIP_DIR`, and the automatic /
+operator / blocked-boundary split of recovery (including the `fusion-resolve`
+operator CLI and the upstream restart deadline).
+
 ## How it works
 
 ```mermaid
