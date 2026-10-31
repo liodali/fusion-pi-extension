@@ -38,6 +38,7 @@ describe("OpenCode Fusion plugin", () => {
 		const storage = memoryStorage();
 		const nudges: (string | undefined)[] = [];
 		const injections: (string | undefined)[] = [];
+		const published: { description?: string }[] = [];
 		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
 		let busWake: (() => void) | undefined;
 		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
@@ -46,7 +47,7 @@ describe("OpenCode Fusion plugin", () => {
 		await setupTest({
 			location: { directory: "/workspace" },
 			event: eventHost,
-			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id?.startsWith("msg_fusion_nudge")) nudges.push(value.text); else injections.push(value.text); } },
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, synthetic: async (input) => { published.push(input); }, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id?.startsWith("msg_fusion_nudge")) nudges.push(value.text); else injections.push(value.text); } },
 			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
 		}, storage);
@@ -209,7 +210,7 @@ describe("OpenCode Fusion plugin", () => {
 		fusionTurn("evt-turn-2", "Still investigating.");
 		await settle();
 		expect(nudges).toHaveLength(1);
-		expect(published.some((entry) => entry.description === "Fusion nudge delivery failed")).toBe(true);
+		expect(published.some((entry) => entry.description === "Fusion settlement issue")).toBe(true);
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.nudgeDelivery).toBe("pending");
 		nudgeDeliveryFails = false;
@@ -366,13 +367,13 @@ describe("OpenCode Fusion plugin", () => {
 		failPrompt = true;
 		await settle("evt-2", "Still working.");
 		expect(nudges).toHaveLength(1);
-		expect(published.some((entry) => entry.description === "Fusion nudge delivery failed")).toBe(true);
+		expect(published.some((entry) => entry.description === "Fusion settlement issue")).toBe(true);
 		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).nudgeDelivery).toBe("pending");
 		// A retry while persistence is failing does not deliver an unrecorded nudge.
 		failPersist = true;
 		await settle("evt-3");
 		expect(nudges).toHaveLength(1);
-		expect(published.filter((entry) => entry.description === "Fusion nudge delivery failed").length).toBeGreaterThanOrEqual(2);
+		expect(published.filter((entry) => entry.description === "Fusion settlement issue").length).toBeGreaterThanOrEqual(2);
 		// Persistence and transport recover: the retry delivers without consuming the budget twice.
 		failPersist = false;
 		failPrompt = false;
@@ -429,6 +430,123 @@ describe("OpenCode Fusion plugin", () => {
 		expect(status.phase).toBe("complete");
 		expect(status.executed).toBe(true);
 		expect(status.incomplete).toBe(false);
+	});
+
+	test("settlement serializes per run and stale settlements abort after resets", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let gate!: () => void;
+		let gated = false;
+		const storage = { ...backing, set: async (key: string, value: unknown) => { if (gated) await new Promise<void>((resolve) => { gate = resolve; }); await backing.set(key, value); } };
+		const nudges: string[] = [];
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		let failPrompt = true;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		const settle = async (id: string, text?: string) => {
+			contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+			busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+			busWake?.();
+			if (text !== undefined) { busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } }); busWake?.(); }
+			busQueue.push({ id, type: "session.execution.succeeded", data: { sessionID: "one" } });
+			busWake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		};
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id?.startsWith("msg_fusion_nudge")) { if (failPrompt) throw new Error("prompt transport down"); if (value.text !== undefined) nudges.push(value.text); } } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Task" } });
+		// Turn 1 leaves an undelivered nudge behind (transport down).
+		await settle("evt-1", "Working.");
+		expect(nudges).toHaveLength(0);
+		// Turn 2 retries the nudge; its settlement write is gated mid-flight.
+		gated = true;
+		const turning = settle("evt-2", "Still working.");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		// The interrupt queues behind the in-flight settlement: nothing settles
+		// or delivers while the earlier settlement is still running.
+		busQueue.push({ id: "evt-int", type: "session.execution.interrupted", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive).toBe(true);
+		gated = false;
+		failPrompt = false;
+		gate();
+		await turning;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		// The queued interrupt settles after the earlier settlement completes.
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive).toBe(false);
+		// A reset during settlement: the resumed settlement aborts instead of
+		// delivering a stale nudge or writing over the reset. The new run's fresh
+		// budget nudges evt-3 normally.
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Next" } });
+		await settle("evt-3", "Working.");
+		expect(nudges).toHaveLength(2);
+		failPrompt = true;
+		gated = true;
+		const staleTurn = settle("evt-4", "More.");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+		gated = false;
+		gate();
+		await staleTurn;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		// The stale settlement aborted: no stale nudge delivered, and the reset holds.
+		expect(nudges).toHaveLength(2);
+		expect((await tools.get("fusion_status")!.execute({}, context("one"))).content).toBe("No Fusion run in this session.");
+	});
+
+	test("settlement write failures are visible, retryable, and recover", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let failPersist = false;
+		const storage = { ...backing, set: async (key: string, value: unknown) => { if (failPersist) throw new Error("storage offline"); await backing.set(key, value); } };
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		const published: { description?: string }[] = [];
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		const settle = async (id: string) => {
+			contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+			busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+			busWake?.();
+			busQueue.push({ id, type: "session.execution.succeeded", data: { sessionID: "one" } });
+			busWake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		};
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, synthetic: async (input) => { published.push(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		// Runs start through the model-facing tool: this host has no prompt surface.
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		// An interrupted turn whose settlement write fails: visible and retryable.
+		failPersist = true;
+		contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+		busQueue.push({ id: "evt-int", type: "session.execution.interrupted", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.settlementWrite).toBe("pending");
+		expect(status.runActive).toBe(false);
+		expect(published.some((entry) => entry.description === "Fusion settlement issue")).toBe(true);
+		// The next settlement retries the write and recovers.
+		failPersist = false;
+		await settle("evt-next");
+		status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.settlementWrite).toBe("saved");
+		expect(published.filter((entry) => entry.description === "Fusion settlement issue")).toHaveLength(1);
 	});
 
 	test("the nudge budget survives a reload", async () => {
