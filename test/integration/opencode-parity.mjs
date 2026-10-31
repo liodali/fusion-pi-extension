@@ -46,7 +46,7 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   const write = async () => { record.n = seq; await writeFile(join(ctx.location.directory, "parity-observer.json"), JSON.stringify(record)); };
   await ctx.tool.hook("execute.after", async (event) => {
     if (typeof event.tool !== "string") return;
-    const entry = { n: ++seq, tool: event.tool, sessionID: event.sessionID ?? null, status: event.status ?? null, input: event.input === undefined ? null : JSON.stringify(event.input).slice(0, 400), result: JSON.stringify(event.result ?? null).slice(0, 300), action: event.result?.metadata?.action ?? null, child: event.result?.metadata?.childSessionID ?? null };
+    const entry = { n: ++seq, tool: event.tool, sessionID: event.sessionID ?? null, status: event.status ?? null, input: event.input === undefined ? null : JSON.stringify(event.input).slice(0, 400), result: JSON.stringify(event.result ?? null).slice(0, 1200), action: event.result?.metadata?.action ?? null, child: event.result?.metadata?.childSessionID ?? null };
     if (event.status === "completed") record.timeline.push(entry);
     else if (event.tool.startsWith("fusion_")) record.failedCalls.push(entry);
     await write();
@@ -236,9 +236,9 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
     }
     // A run the supervisor itself reset after delivering its summary is a
     // completed protocol, not a probe failure — scoped to THIS run's
-    // supervising session and its sequence window, so a previous run's
-    // summary cannot satisfy it.
-    if (((await readObserver())?.textsEntries ?? []).some((entry) => entry.sessionID === label.current && entry.n >= (label.startN ?? 0) && String(entry.text).includes("## Fusion summary"))) return { runActive: false, resetBySupervisor: true };
+    // supervising session and its sequence window (strictly after the
+    // boundary), so a previous run's summary cannot satisfy it.
+    if (((await readObserver())?.textsEntries ?? []).some((entry) => entry.sessionID === label.current && entry.n > (label.startN ?? -1) && String(entry.text).includes("## Fusion summary"))) return { runActive: false, resetBySupervisor: true };
     throw new Error(`No session owns a Fusion run (${failures.join(" | ")})`);
   };
   // Wait for the run to settle: one status probe per observed turn end (any
@@ -298,6 +298,23 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
     }
     throw new Error(`${name}: the supervisor turn repeatedly failed to complete after its executor child (upstream parent-completion gap, anomalyco/opencode#36349)`);
   };
+  // Read-evidence parsing: the claimed review/audit must target the exact
+  // fixture path (basename match, so unrelated files like fixture-notes.md
+  // cannot qualify) and the captured result must show the file's staged
+  // content for that protocol step — review verifies the executed state,
+  // the requirements audit re-reads the staged state it audits.
+  const readTarget = (entry) => {
+    try {
+      const strings = [];
+      const walk = (node, depth) => { if (node === null || typeof node !== "object" || depth > 3) { if (typeof node === "string") strings.push(node); return; } for (const value of Object.values(node)) walk(value, depth + 1); };
+      walk(JSON.parse(entry.input ?? "null"), 0);
+      return strings.map((value) => value.replace(/\\/g, "/").split("/").pop()).find((base) => base === "fixture.txt" || base === "second.txt") ?? null;
+    } catch { return null; }
+  };
+  const readResult = (entry) => {
+    try { const parsed = JSON.parse(entry.result ?? "null"); return typeof parsed === "string" ? parsed : JSON.stringify(parsed); }
+    catch { return String(entry.result ?? ""); }
+  };
   const task1 = 'Start with one fusion_scout question about this workspace. Then run the full Fusion protocol to create fixture.txt containing exactly "alpha" followed by a single newline. Review the file, revise it to exactly "beta" followed by a single newline, audit it against this instruction, and apply the final fix so it contains exactly "gamma" followed by a single newline. Finish with the Fusion summary. Do NOT call fusion_reset afterwards: leave the finished run in place for the user to inspect.';
   const run1 = await driveRun("run 1", sessionID, task1);
   result.supervisor1 = run1.control.current;
@@ -317,10 +334,13 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   const execute1 = timeline1.find((entry) => entry.tool === "fusion_delegate" && entry.action === "execute");
   const revise1 = timeline1.find((entry) => entry.tool === "fusion_delegate" && entry.action === "revise");
   const finalFix1 = timeline1.find((entry) => entry.tool === "fusion_delegate" && entry.action === "final_fix");
-  const fixtureReads1 = timeline1.filter((entry) => entry.tool === "read" && entry.sessionID === control1.current && String(entry.input ?? "").includes("fixture"));
-  const review1 = execute1 !== undefined && revise1 !== undefined && fixtureReads1.some((read) => read.n > execute1.n && read.n < revise1.n);
-  const audit1 = revise1 !== undefined && finalFix1 !== undefined && fixtureReads1.some((read) => read.n > revise1.n && read.n < finalFix1.n);
-  const summary1 = (observer1.textsEntries ?? []).filter((entry) => entry.sessionID === control1.current && entry.n >= (run1.startN ?? 0) && String(entry.text).includes("## Fusion summary"));
+  const fixtureReads1 = timeline1.filter((entry) => entry.tool === "read" && entry.sessionID === control1.current && readTarget(entry) === "fixture.txt");
+  // Review: a read of the changed fixture whose captured result shows the
+  // executed stage; audit: a distinct read showing the staged state the
+  // requirements audit re-examines before the final fix.
+  const review1 = execute1 !== undefined && revise1 !== undefined && fixtureReads1.some((read) => read.n > execute1.n && read.n < revise1.n && readResult(read).includes("alpha"));
+  const audit1 = revise1 !== undefined && finalFix1 !== undefined && fixtureReads1.some((read) => read.n > revise1.n && read.n < finalFix1.n && readResult(read).includes("beta"));
+  const summary1 = (observer1.textsEntries ?? []).filter((entry) => entry.sessionID === control1.current && entry.n > (run1.startN ?? -1) && String(entry.text).includes("## Fusion summary"));
   result.runs.push({ task: 1, fixture, actions, children, scout: timeline1.some((call) => call.tool === "fusion_scout"), summary: summary1.length > 0, reviewBetweenExecuteAndRevise: review1, auditBetweenReviseAndFinalFix: audit1 });
   assert.equal(fixture, "gamma\n", `Run 1 fixture content was ${JSON.stringify(fixture)}`);
   assert.deepEqual(actions, ["execute", "revise", "final_fix"], `Run 1 delegation sequence was ${JSON.stringify(actions)}`);
@@ -377,9 +397,9 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   const second = await readFile(join(project, "second.txt"), "utf8");
   const actions2 = calls2.filter((call) => call.tool === "fusion_delegate" && call.status === "completed").map((call) => call.action);
   const execute2 = calls2.find((call) => call.tool === "fusion_delegate" && call.action === "execute");
-  const secondReads2 = calls2.filter((call) => call.tool === "read" && call.sessionID === control2.current && String(call.input ?? "").includes("second"));
-  const review2 = execute2 !== undefined && secondReads2.some((read) => read.n > execute2.n);
-  const summary2 = (observer2.textsEntries ?? []).filter((entry) => entry.sessionID === control2.current && entry.n >= (run2.startN ?? 0) && String(entry.text).includes("## Fusion summary"));
+  const secondReads2 = calls2.filter((call) => call.tool === "read" && call.sessionID === control2.current && readTarget(call) === "second.txt");
+  const review2 = execute2 !== undefined && secondReads2.some((read) => read.n > execute2.n && readResult(read).includes("delta"));
+  const summary2 = (observer2.textsEntries ?? []).filter((entry) => entry.sessionID === control2.current && entry.n > (run2.startN ?? -1) && String(entry.text).includes("## Fusion summary"));
   result.runs.push({ task: 2, fixture: second, actions: actions2, children: [...new Set(calls2.filter((call) => call.tool === "fusion_delegate" && call.child).map((call) => call.child))], scout: calls2.some((call) => call.tool === "fusion_scout"), summary: summary2.length > 0, reviewAfterExecute: review2 });
   assert.equal(second, "delta\n", `Run 2 second.txt content was ${JSON.stringify(second)}`);
   assert.ok(actions2.length > 0 && actions2[0] === "execute", `Run 2 delegation sequence was ${JSON.stringify(actions2)}`);
