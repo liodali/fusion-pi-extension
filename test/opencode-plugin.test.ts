@@ -1226,6 +1226,86 @@ describe("OpenCode Fusion plugin", () => {
 			expect(resume.nextAction).toContain("No recovery is owed");
 		}
 	});
+	test("per-run usage totals aggregate observed readings and survive reload", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		let executorCalls = 0;
+		// The host reports cumulative per-session readings; only the delta of a
+		// monotonic reading belongs to the turn.
+		const reading = (sessionID: string, tokens: { input: number; output: number }, cost: number) => { busQueue.push({ type: "session.usage.updated", data: { sessionID, tokens, cost } }); busWake?.(); };
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async () => {} },
+			tool: {
+				hook: async () => {},
+				list: async () => [{ id: "subagent", execute: async (input: { agent?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					if (input.agent === "fusion-scout") {
+						await ctx.progress({ sessionID: "scout-1" });
+						reading("scout-1", { input: 20, output: 10 }, 2);
+						await new Promise((resolve) => setTimeout(resolve, 10));
+						return { output: { sessionID: "scout-1", status: "completed", output: "answer" } };
+					}
+					executorCalls++;
+					await ctx.progress({ sessionID: "child-1" });
+					reading("child-1", executorCalls === 1 ? { input: 100, output: 50 } : { input: 300, output: 120 }, executorCalls === 1 ? 10 : 30);
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					return { output: { sessionID: "child-1", status: "completed", output: "done" } };
+				} }],
+				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+			},
+		}, storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		await tools.get("fusion_scout")!.execute({ questions: ["Where?"] }, context("one"));
+		let stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.usage).toMatchObject({ available: true, complete: true, turns: { reported: 1, missing: 0 }, inputTokens: 20, outputTokens: 10, cost: 2 });
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"));
+		stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.usage).toMatchObject({ available: true, complete: true, turns: { reported: 3, missing: 0 }, inputTokens: 320, outputTokens: 130, cost: 32 });
+		// Reload: the persisted adapterData keeps the accumulated totals.
+		const reloaded = new Map<string, Tool>();
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child-1", status: "completed", output: "done" } }) }],
+			transform: async (callback) => { callback({ add: (tool) => reloaded.set(tool.name, tool) }); },
+		} }, storage);
+		stats = JSON.parse((await reloaded.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.usage).toMatchObject({ turns: { reported: 3, missing: 0 }, inputTokens: 320, outputTokens: 130, cost: 32 });
+	});
+
+	test("a reconciled turn without a usage reading counts as missing, not zero", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		let description = "";
+		let messages: unknown[] = [];
+		const makeContext = (fresh: Map<string, Tool>): TestContext => ({
+			location: { directory: "/workspace" }, session: { context: async () => messages, hook: async () => {} }, tool: {
+				hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input: { description?: string }, ctx: { progress: (update: Record<string, unknown>) => Promise<void> }) => {
+					await ctx.progress({ sessionID: "child-u" });
+					description = input.description ?? "";
+					throw new Error("connection lost");
+				} }], transform: async (callback) => { callback({ add: (tool) => fresh.set(tool.name, tool) }); },
+			},
+		});
+		await setupTest(makeContext(tools), storage);
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		// The failed submission observed no result and no usage: nothing is counted.
+		await expect(tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"))).rejects.toThrow("connection lost");
+		let stats = JSON.parse((await tools.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.usage).toMatchObject({ available: false, complete: true, turns: { reported: 0, missing: 0 } });
+		const restored = new Map<string, Tool>();
+		await setupTest(makeContext(restored), storage);
+		messages = [{ type: "synthetic", description, metadata: { source: "subagent", childID: "child-u", agent: "fusion-executor", state: "completed" }, text: `<subagent sessionID="child-u" state="completed" description="${description}">\nfixed\n</subagent>` }];
+		await restored.get("fusion_reconcile")!.execute({}, context("one"));
+		// The reconciled turn ran, but its usage reading was never observed: the
+		// totals stay absent and the turn is reported missing rather than zero.
+		stats = JSON.parse((await restored.get("fusion_stats")!.execute({}, context("one"))).content);
+		expect(stats.usage).toMatchObject({ available: false, complete: false, turns: { reported: 0, missing: 1 } });
+		expect(stats.usage.inputTokens).toBeUndefined();
+	});
 	test("blocks direct subagent calls only for the Fusion supervisor", async () => {
 		const tools = new Map<string, Tool>();
 		let before!: (event: { tool: string; agent: string }) => void;

@@ -11,7 +11,7 @@ import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspace
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
-import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest } from "../core/worker.ts";
+import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
 
@@ -556,6 +556,17 @@ export default {
 			const prompt = run.adapterData?.fusionPrompt;
 			return !!prompt && typeof prompt === "object" && (prompt as { state?: unknown }).state === "pending";
 		}
+		/** Aggregate one observed worker turn into the run's persisted usage
+		 * record. A turn whose result carried no usage reading counts as missing,
+		 * so the totals honestly under-report instead of guessing. */
+		function recordUsage(run: Run, result: WorkerTurnResult): void {
+			const current = run.adapterData?.fusionUsage as Record<string, number> | undefined;
+			const next: Record<string, number> = { ...(current ?? {}) };
+			next.turnsReported = (next.turnsReported ?? 0) + (result.usage ? 1 : 0);
+			next.turnsMissing = (next.turnsMissing ?? 0) + (result.usage ? 0 : 1);
+			if (result.usage) for (const [field, value] of Object.entries(result.usage)) if (typeof value === "number" && Number.isFinite(value)) next[field] = (next[field] ?? 0) + value;
+			run.adapterData = { ...run.adapterData, fusionUsage: next };
+		}
 		// The native executor is called directly below; model-originated calls pass
 		// through OpenCode's tool hook and must not bypass Fusion's run guards.
 		// Both guards (subagent denial and scout cap) live in the single
@@ -753,12 +764,26 @@ export default {
 		function statsContent(sessionID: string): string {
 			const run = runs.get(sessionID);
 			if (!run) return "No Fusion run in this session.";
+			const usage = run.adapterData?.fusionUsage as Record<string, number> | undefined;
+			const reported = usage?.turnsReported ?? 0;
+			const missing = usage?.turnsMissing ?? 0;
 			return JSON.stringify({ runId: run.runId, executed: run.controller.state.executed,
 				revisions: { used: run.controller.state.revisions, limit: MAX_REVISIONS },
 				scoutCalls: { used: run.controller.state.scoutCalls, limit: MAX_SCOUT_CALLS },
 				finalFixUsed: run.controller.state.finalFixUsed,
 				lastResult: run.lastResult ? { requestId: run.lastResult.requestId, status: run.lastResult.status } : undefined,
-				usage: { available: false, reason: "Aggregate token and cost totals are not yet collected by the OpenCode plugin." } });
+				usage: {
+					available: reported > 0,
+					reason: reported > 0 ? undefined : run.controller.state.executed || run.controller.state.scoutCalls > 0 ? "No Fusion worker turn has reported usage on this host yet." : "No Fusion worker turn has run yet.",
+					complete: missing === 0,
+					turns: { reported, missing },
+					inputTokens: usage?.inputTokens,
+					outputTokens: usage?.outputTokens,
+					cacheReadTokens: usage?.cacheReadTokens,
+					cacheWriteTokens: usage?.cacheWriteTokens,
+					reasoningTokens: usage?.reasoningTokens,
+					cost: usage?.cost,
+				} });
 		}
 
 		await ctx.tool.transform((editor) => {
@@ -864,6 +889,7 @@ export default {
 							},
 							recordReference: () => persist(context.sessionID, run),
 							collect: async (result, before) => {
+								recordUsage(run, result);
 								const workspaceAfter = await snapshotWorkspaceAfter(before, nodeGitExec);
 								const evidence = await workspaceEvidenceRefs(before, nodeGitExec, undefined, workspaceAfter);
 								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: evidence ?? [] };
@@ -962,6 +988,11 @@ export default {
 							activeScout.childSessionID = reference.id;
 							trackScoutGuard(reference.id, activeScout.entry);
 						} });
+						recordUsage(run, result);
+						// The accumulated totals are advisory: they ride the next strict
+						// settlement write, with a best-effort persist here so a claimed
+						// run keeps them across reloads without ever blocking the answer.
+						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
 						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
 						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
@@ -1017,7 +1048,12 @@ export default {
 								await run.lease!.save(value); await store.save(value);
 							});
 						};
-						const result = run.runtime.status(run.handle).unsettled
+						const unsettled = run.runtime.status(run.handle).unsettled;
+						// A recorded result's usage was already counted when its turn
+						// completed (the delegate's collect port); only a result adopted
+						// from the completion notification is new to the totals — and it
+						// carries no usage reading, so it counts as a missing turn.
+						const result = unsettled
 							? await run.runtime.settle(request, persistResult)
 							: await run.runtime.reconcile(request, { signal: context.signal, onEvent: () => {}, onReference: () => persist(context.sessionID, run) }, async (childID, _request, signal) => {
 								if (signal.aborted) throw new Error("Fusion reconciliation was cancelled.");
@@ -1028,6 +1064,7 @@ export default {
 								const notification = notificationResult(messages, childID, pending.requestId);
 								return { status: notification.state, text: notification.output };
 							}, persistResult);
+						if (!unsettled) recordUsage(run, result);
 						run.controller.setUncertain(false);
 						const terminalState = result.status;
 						const parsed = run.controller.executorReport(result.text);
@@ -1053,7 +1090,7 @@ export default {
 				},
 			});
 			editor.add({
-				name: "fusion_stats", description: "Show the current Fusion run's review and scout budgets. Token and cost totals are unavailable.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
+				name: "fusion_stats", description: "Show the current Fusion run's review and scout budgets and its observed worker token and cost totals.", input: { type: "object", properties: {}, additionalProperties: false }, options: { codemode: false },
 				async execute(_input, context) {
 					requireSupervisor(context);
 					return { content: statsContent(context.sessionID) };
