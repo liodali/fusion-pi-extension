@@ -437,7 +437,11 @@ describe("OpenCode Fusion plugin", () => {
 		const backing = memoryStorage();
 		let gate!: () => void;
 		let gated = false;
-		const storage = { ...backing, set: async (key: string, value: unknown) => { if (gated) await new Promise<void>((resolve) => { gate = resolve; }); await backing.set(key, value); } };
+		let finishScout!: () => void;
+		let scoutEntered!: () => void;
+		const scoutStarted = new Promise<void>((resolve) => { scoutEntered = resolve; });
+		const scoutGate = new Promise<void>((resolve) => { finishScout = resolve; });
+		const storage = { ...backing, set: async (key: string, value: unknown) => { if (gated) { gated = false; await new Promise<void>((resolve) => { gate = resolve; }); } await backing.set(key, value); } };
 		const nudges: string[] = [];
 		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
 		let busWake: (() => void) | undefined;
@@ -459,7 +463,7 @@ describe("OpenCode Fusion plugin", () => {
 			event: eventHost,
 			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id?.startsWith("msg_fusion_nudge")) { if (failPrompt) throw new Error("prompt transport down"); if (value.text !== undefined) nudges.push(value.text); } } },
 			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
-			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => { if (input.agent === "fusion-scout") { scoutEntered(); await scoutGate; return { output: { sessionID: "scout", status: "completed", output: "answer" } }; } return { output: { sessionID: "child", status: "completed", output: "done" } }; } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
 		}, storage);
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Task" } });
 		// Turn 1 leaves an undelivered nudge behind (transport down).
@@ -469,12 +473,17 @@ describe("OpenCode Fusion plugin", () => {
 		gated = true;
 		const turning = settle("evt-2", "Still working.");
 		await new Promise((resolve) => setTimeout(resolve, 50));
+		const scouting = tools.get("fusion_scout")!.execute({ questions: ["Where is the code?"] }, context("one"));
+		await scoutStarted;
 		// The interrupt queues behind the in-flight settlement: nothing settles
 		// or delivers while the earlier settlement is still running.
 		busQueue.push({ id: "evt-int", type: "session.execution.interrupted", data: { sessionID: "one" } });
 		busWake?.();
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive).toBe(true);
+		finishScout();
+		await scouting;
+		// Work has resolved before the paused nudge write resumes.
 		gated = false;
 		failPrompt = false;
 		gate();
@@ -484,8 +493,14 @@ describe("OpenCode Fusion plugin", () => {
 		// settlement that resumes from persistence must not deliver into the
 		// cancelled turn.
 		expect(nudges).toHaveLength(0);
-		// The queued interrupt settles after the earlier settlement completes.
-		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive).toBe(false);
+		// The interrupt observed outstanding work, so recovery stays active even
+		// though its pending continuation has been cancelled.
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).runActive).toBe(true);
+		// The recorded cancellation is durable under the hold: storage carries
+		// it, so a reload cannot revive the abandoned continuation.
+		const persistedNudge = ((await storage.get(`run/${createHash("sha256").update("/workspace").digest("hex")}`)) as { adapterData?: { fusionNudge?: { state?: string } } } | undefined)?.adapterData?.fusionNudge?.state;
+		expect(persistedNudge).toBe("cancelled");
+		await tools.get("fusion_reset")!.execute({}, context("one"));
 		// A reset during settlement: the resumed settlement aborts instead of
 		// delivering a stale nudge or writing over the reset. The new run's fresh
 		// budget nudges evt-3 normally.

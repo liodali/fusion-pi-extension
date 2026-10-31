@@ -295,9 +295,9 @@ export default {
 			// Cancellation is recorded the moment an interrupt or failure
 			// arrives — not when its queued settlement runs — so a settlement
 			// paused at persistence can never resume into delivering the
-			// cancelled nudge. Unresolved work still holds: there the
-			// outstanding work, not the interrupt, decides the nudge's fate.
-			if (terminal !== "completed" && !workUnresolved) {
+			// cancelled nudge. Outstanding work keeps recovery controls active,
+			// but never revokes cancellation of a pending continuation.
+			if (terminal !== "completed") {
 				const pendingNudge = run.adapterData?.fusionNudge as { state?: unknown } | undefined;
 				if (pendingNudge?.state === "pending") run.adapterData = { ...run.adapterData, fusionNudge: { ...pendingNudge, state: "cancelled" } };
 			}
@@ -342,8 +342,15 @@ export default {
 			};
 			// Unresolved worker or reconciliation work keeps the run active across
 			// every terminal so fusion_reconcile stays available; the outstanding
-			// work steers what happens next.
-			if (turn.workUnresolved) return;
+			// work steers what happens next. Event-time cancellation recorded
+			// before this settlement queued still becomes durable here — staleness
+			// first so a reset mid-hold is never overwritten, and persistence
+			// after so a reload cannot revive a continuation its turn cancelled.
+			if (turn.workUnresolved) {
+				if (stale()) return;
+				if (!(await persistRun())) await reportIssue("Fusion could not write its settlement; it will retry when this session next settles.");
+				return;
+			}
 			// Nudge delivery requires the host's prompt surface; without it, no
 			// budget is consumed and an unfinished protocol reports incomplete.
 			const deliverPrompt = (input: { sessionID: string; id?: string; text?: string }): Promise<unknown> | undefined =>
