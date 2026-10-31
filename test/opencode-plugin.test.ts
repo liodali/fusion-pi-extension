@@ -189,7 +189,7 @@ describe("OpenCode Fusion plugin", () => {
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
 		}, storage);
 		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
-		await commands[0].execute({ sessionID: "one", prompt: { text: "Task" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		// An ordinary agent driving the same session never nudges or settles the run.
 		contextHook({ agent: "build", tools: {}, sessionID: "one" });
 		busQueue.push({ id: "evt-build", type: "session.execution.succeeded", data: { sessionID: "one" } });
@@ -246,7 +246,7 @@ describe("OpenCode Fusion plugin", () => {
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
 		}, storage);
 		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
-		await commands[0].execute({ sessionID: "one", prompt: { text: "Task" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
 		// An interim part quoting the heading does not suppress the audit nudge.
 		await settle(["The plan said \"## Fusion summary\" would come last.", "Still reviewing the diff."]);
@@ -256,6 +256,179 @@ describe("OpenCode Fusion plugin", () => {
 		expect(nudges).toHaveLength(1);
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.phase).toBe("complete");
+	});
+
+	test("interrupted and failed turns keep unresolved runs active and reconcile available", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, prompt: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-bg" });
+				return { output: { sessionID: "child-bg", status: "running", output: "backgrounded" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await commands[0].execute({ sessionID: "one", prompt: { text: "Build it" } });
+		const backgrounded = await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		expect(backgrounded.content).toContain("running in the background");
+		const runState = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// Interrupted and failed terminals hold the run active while the executor
+		// work is unresolved, so fusion_reconcile stays available.
+		contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+		busQueue.push({ id: "evt-int", type: "session.execution.interrupted", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		let state = await runState();
+		expect(state.runActive).toBe(true);
+		expect(state.uncertain).toBe(true);
+		const fusionRecord: Record<string, unknown> = { fusion_reconcile: {}, read: {} };
+		contextHook({ agent: "fusion", tools: fusionRecord, sessionID: "one" });
+		expect(fusionRecord).toHaveProperty("fusion_reconcile");
+		busQueue.push({ id: "evt-fail", type: "session.execution.failed", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		expect((await runState()).runActive).toBe(true);
+	});
+
+	test("without session.prompt the nudge budget is not consumed and unfinished runs report incomplete", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		// Without session.prompt, runs start through the model-facing fusion_start tool.
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+		busQueue.push({ id: "evt-1", type: "session.execution.succeeded", data: { sessionID: "one" } });
+		busWake?.();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		const state = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		// No budget consumed, no delivery faked; the unfinished protocol reports incomplete and stays active.
+		expect(state.settleNudges).toBe(0);
+		expect(state.nudgeDelivery).toBeUndefined();
+		expect(state.incomplete).toBe(true);
+		expect(state.runActive).toBe(true);
+	});
+
+	test("nudge retries re-persist intent, respect unresolved work, and survive persistence failure", async () => {
+		const tools = new Map<string, Tool>();
+		const backing = memoryStorage();
+		let failPersist = false;
+		const storage = { ...backing, set: async (key: string, value: unknown) => { if (failPersist) throw new Error("storage offline"); await backing.set(key, value); } };
+		const nudges: string[] = [];
+		const published: { description?: string }[] = [];
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		let failPrompt = false;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		await setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {}, synthetic: async (input) => { published.push(input); }, prompt: async (input) => { const value = input as { id?: string; text?: string }; if (value.id?.startsWith("msg_fusion_nudge")) { if (failPrompt) throw new Error("prompt transport down"); if (value.text !== undefined) nudges.push(value.text); } } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const settle = async (id: string, text?: string) => {
+			contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+			busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+			busWake?.();
+			if (text !== undefined) { busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text } }); busWake?.(); }
+			busQueue.push({ id, type: "session.execution.succeeded", data: { sessionID: "one" } });
+			busWake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		};
+		await settle("evt-1", "Working.");
+		expect(nudges).toHaveLength(1);
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).nudgeDelivery).toBe("delivered");
+		// The next nudge delivery fails: the failure is published and delivery stays pending.
+		failPrompt = true;
+		await settle("evt-2", "Still working.");
+		expect(nudges).toHaveLength(1);
+		expect(published.some((entry) => entry.description === "Fusion nudge delivery failed")).toBe(true);
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).nudgeDelivery).toBe("pending");
+		// A retry while persistence is failing does not deliver an unrecorded nudge.
+		failPersist = true;
+		await settle("evt-3");
+		expect(nudges).toHaveLength(1);
+		expect(published.filter((entry) => entry.description === "Fusion nudge delivery failed").length).toBeGreaterThanOrEqual(2);
+		// Persistence and transport recover: the retry delivers without consuming the budget twice.
+		failPersist = false;
+		failPrompt = false;
+		await settle("evt-4");
+		expect(nudges).toHaveLength(2);
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).nudgeDelivery).toBe("delivered");
+	});
+
+	test("final settlement and incomplete state survive a reload", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		const busQueue: { id?: string; type: string; data?: Record<string, unknown> }[] = [];
+		let busWake: (() => void) | undefined;
+		let contextHook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		const eventHost = { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = busQueue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { busWake = resolve; }); } } } } }) };
+		const commands: CommandDefinition[] = [];
+		const settle = async (id: string, parts: string[]) => {
+			contextHook({ agent: "fusion", tools: {}, sessionID: "one" });
+			busQueue.push({ type: "session.execution.started", data: { sessionID: "one" } });
+			busWake?.();
+			for (const part of parts) { busQueue.push({ type: "session.text.ended", data: { sessionID: "one", text: part } }); busWake?.(); }
+			busQueue.push({ id, type: "session.execution.succeeded", data: { sessionID: "one" } });
+			busWake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		};
+		const run = async () => setupTest({
+			location: { directory: "/workspace" },
+			event: eventHost,
+			session: { context: async () => [], hook: async (_name: string, callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void) => { contextHook = callback; }, switchAgent: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		await run();
+		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		// Exhaust the budget: incomplete, persisted across reload.
+		await settle("evt-1", ["Working."]);
+		await settle("evt-2", ["Working."]);
+		await settle("evt-3", ["Working."]);
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).incomplete).toBe(true);
+		await run();
+		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).incomplete).toBe(true);
+		await tools.get("fusion_reset")!.execute({}, context("one"));
+		// A completed run settles across reload too.
+		await run();
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await settle("evt-done", ["## Fusion summary\nAll done."]);
+		let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.phase).toBe("complete");
+		// Persistent mode is on, so the run stays armed; the completed phase is what persists.
+		await run();
+		status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.phase).toBe("complete");
+		expect(status.executed).toBe(true);
+		expect(status.incomplete).toBe(false);
 	});
 
 	test("the nudge budget survives a reload", async () => {
@@ -284,7 +457,7 @@ describe("OpenCode Fusion plugin", () => {
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
 		}, storage);
 		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
-		await commands[0].execute({ sessionID: "one", prompt: { text: "Task" } });
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
 		await settle("Working.");
 		await settle("Still working.");
 		expect(nudges).toHaveLength(2);

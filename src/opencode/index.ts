@@ -110,7 +110,6 @@ interface Run {
 	/** The supervisor exhausted its continuation budget on an unfinished protocol. */
 	incomplete?: boolean;
 }
-
 /** Match OpenCode's completion notification to this specific native job generation. */
 function notificationResult(messages: readonly unknown[], childID: string, description: string): { state: "completed" | "error" | "cancelled"; output: string } {
 	for (const item of messages) {
@@ -284,70 +283,99 @@ export default {
 			if (!seenTerminalId(sessionID, event.id)) return;
 			const lastPart = supervisorText.get(sessionID) ?? "";
 			supervisorText.delete(sessionID);
-			if (terminal !== "completed") {
-				// Cancelled or errored turns are settled without continuation.
-				run.controller.settled(fusionMode);
-				return;
-			}
-			void settleTurn(sessionID, run, lastPart);
+			const status = run.runtime.status(run.handle);
+			// A backgrounded executor, an in-flight reconciliation, or a running
+			// scout means the turn is not really settled — for ANY terminal,
+			// including interrupts and failures: keep the run active so its
+			// control tools (fusion_reconcile among them) stay available, and let
+			// the outstanding work steer what happens next.
+			const workUnresolved = status.backgroundPending || status.unsettled || run.reconciling || scoutInFlight || hasBackgroundScout();
+			void settleTurn(sessionID, run, { lastPart, terminal, workUnresolved });
 		};
 		busSinks.add(onTurnBusEvent);
 		/** Settle one completed Fusion turn: nudge, hold, or finish the run. */
-		async function settleTurn(sessionID: string, run: Run, lastPart: string): Promise<void> {
-			const status = run.runtime.status(run.handle);
-			// A backgrounded executor, an in-flight reconciliation, or a running
-			// scout means the turn is not really settled: keep the run active so
-			// its control tools stay available, and let the outstanding work steer
-			// what happens next.
-			const workUnresolved = status.backgroundPending || status.unsettled || run.reconciling || scoutInFlight || hasBackgroundScout();
+		async function settleTurn(sessionID: string, run: Run, turn: { lastPart: string; terminal: "completed" | "aborted" | "error"; workUnresolved: boolean }): Promise<void> {
+			const persistRun = async (): Promise<boolean> => {
+				if (!run.lease) return true;
+				try { await persist(sessionID, run); return true; } catch { return false; }
+			};
+			const reportDeliveryFailure = async (): Promise<void> => {
+				try {
+					await reportCommand(sessionID, "Fusion nudge delivery failed", "Fusion could not deliver its continuation nudge; it will retry when this session next settles. If it keeps failing, deliver the instruction to the fusion agent directly.");
+				} catch { /* hosts without session.synthetic surface the failure through fusion_status instead. */ }
+			};
+			// Unresolved worker or reconciliation work keeps the run active across
+			// every terminal so fusion_reconcile stays available; the outstanding
+			// work steers what happens next.
+			if (turn.workUnresolved) return;
+			// Nudge delivery requires the host's prompt surface; without it, no
+			// budget is consumed and an unfinished protocol reports incomplete.
 			const deliverPrompt = (input: { sessionID: string; id?: string; text?: string }): Promise<unknown> | undefined =>
 				typeof ctx.session.prompt === "function" ? ctx.session.prompt(input) : undefined;
-			const canDeliver = deliverPrompt !== undefined;
-			// A nudge whose delivery failed is retried at the next turn end before
-			// a new nudge is considered; the budget was already consumed.
+			const canDeliver = typeof ctx.session.prompt === "function";
 			const pendingNudge = run.adapterData?.fusionNudge as { id?: unknown; text?: unknown; state?: unknown } | undefined;
+			if (turn.terminal !== "completed") {
+				// Cancelled or errored turns settle without continuation; an
+				// undelivered nudge is dropped with the turn it belonged to.
+				if (pendingNudge?.state === "pending") run.adapterData = { ...run.adapterData, fusionNudge: { ...pendingNudge, state: "cancelled" } };
+				run.controller.settled(fusionMode);
+				await persistRun();
+				return;
+			}
+			// A nudge whose delivery failed is retried at the next completed turn
+			// end before a new nudge is considered; the budget was already
+			// consumed, and the intent is re-persisted before the retry sends.
 			if (canDeliver && pendingNudge?.state === "pending" && typeof pendingNudge.id === "string" && typeof pendingNudge.text === "string") {
+				if (!(await persistRun())) {
+					await reportDeliveryFailure();
+					return;
+				}
 				try {
 					await deliverPrompt({ sessionID, id: pendingNudge.id, text: pendingNudge.text });
 					run.adapterData = { ...run.adapterData, fusionNudge: { id: pendingNudge.id, text: pendingNudge.text, state: "delivered" } };
-					if (run.lease) { try { await persist(sessionID, run); } catch { /* best-effort */ } }
+					await persistRun();
 				} catch {
-					await reportCommand(sessionID, "Fusion nudge delivery failed", "Fusion could not deliver its continuation nudge; it will retry when this session next settles. If it keeps failing, deliver the instruction to the fusion agent directly.");
+					await reportDeliveryFailure();
 				}
 				return;
 			}
 			// Nudges are only consumed when they can actually be delivered.
-			const nudge = canDeliver ? run.controller.continuation({ lastAssistantText: lastPart, outcome: "completed", canContinue: !workUnresolved }) : undefined;
+			const nudge = canDeliver ? run.controller.continuation({ lastAssistantText: turn.lastPart, outcome: "completed", canContinue: !turn.workUnresolved }) : undefined;
 			if (nudge) {
+				const id = `msg_fusion_nudge_${randomUUID().replaceAll("-", "")}`;
+				// Retain the retryable delivery state and persist the nudge budget
+				// before sending, so a reload can neither resend nor forget it.
+				run.adapterData = { ...run.adapterData, fusionNudge: { id, text: nudge, state: "pending" } };
+				const persisted = await persistRun();
+				if (!persisted) {
+					await reportDeliveryFailure();
+					return;
+				}
 				try {
-					const id = `msg_fusion_nudge_${randomUUID().replaceAll("-", "")}`;
-					// Retain the retryable delivery state and persist the nudge budget
-					// before sending, so a reload can neither resend nor forget it.
-					run.adapterData = { ...run.adapterData, fusionNudge: { id, text: nudge, state: "pending" } };
-					if (run.lease) await persist(sessionID, run);
 					await deliverPrompt({ sessionID, id, text: nudge });
 					run.adapterData = { ...run.adapterData, fusionNudge: { id, text: nudge, state: "delivered" } };
-					if (run.lease) { try { await persist(sessionID, run); } catch { /* delivery is confirmed; the state write is best-effort */ } }
+					await persistRun();
 				} catch {
-					await reportCommand(sessionID, "Fusion nudge delivery failed", "Fusion could not deliver its continuation nudge; it will retry when this session next settles. If it keeps failing, deliver the instruction to the fusion agent directly.");
+					await reportDeliveryFailure();
 				}
 				return;
 			}
-			if (workUnresolved) {
-				// Unresolved worker or reconciliation work keeps the run active so
-				// fusion_reconcile stays available; the notification steers next.
-				return;
-			}
-			const protocolComplete = run.controller.state.executed && lastPart.includes(FUSION_SUMMARY_HEADING);
+			const protocolComplete = run.controller.state.executed && turn.lastPart.includes(FUSION_SUMMARY_HEADING);
 			if (!protocolComplete) {
 				// The nudge budget ran out (or delivery is unsupported) on an
 				// unfinished protocol: report the run incomplete instead of marking
-				// it complete.
+				// it complete, and keep the state across reloads.
 				run.incomplete = true;
+				run.adapterData = { ...run.adapterData, fusionIncomplete: true };
+				await persistRun();
 				return;
 			}
 			run.incomplete = false;
+			run.adapterData = { ...run.adapterData, fusionIncomplete: false };
 			run.controller.settled(fusionMode);
+			// Final settlement survives reload: the manifest carries the deactivated
+			// run and its completion phase.
+			await persistRun();
 		}
 		busSinks.add(onTurnBusEvent);
 		function resolveScoutGuard(event: ToolHookEvent): ScoutGuardEntry | undefined {
@@ -428,7 +456,7 @@ export default {
 			const handle = record?.pending ? await runtime.restorePending(workerOwner, config, { runId, requestId: record.pending.requestId }, reference) : reference ? await runtime.open(reference, config) : await runtime.create(workerOwner, config);
 			if (record?.pending) controller.setPending({ action: record.pending.action, requestId: record.pending.requestId });
 			controller.setUncertain(!!record && record.recovery !== "settled");
-			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model, adapterData: record?.adapterData, setContext(worker, context) { toolContexts.set(worker, context); } };
+			return { controller, handle, runtime, runId, lastResult: record?.lastResult, model, adapterData: record?.adapterData, incomplete: (record?.adapterData as { fusionIncomplete?: unknown } | undefined)?.fusionIncomplete === true, setContext(worker, context) { toolContexts.set(worker, context); } };
 		}
 		const store = createManifestStore({
 			read: () => ctx.storage.get(storageKey), write: async (value) => { await ctx.storage.set(storageKey, value); }, remove: async () => { await ctx.storage.remove(storageKey); },
