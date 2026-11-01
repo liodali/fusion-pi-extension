@@ -126,6 +126,7 @@ export default {
 		}
 	}
 	assert.ok(fusionCommands && fusionCommands.length >= 5, `Fusion commands did not register: ${JSON.stringify(fusionCommands)}`);
+	assert.ok(fusionCommands.includes("fusion-config"), `fusion-config was not registered: ${JSON.stringify(fusionCommands)}`);
 	console.error("fusion commands:", fusionCommands.join(", "));
 	// The command API can drive registered commands in a session (fusion-status is model-free).
 	const commandSession = await fetch(`${url}/api/session`, { method: "POST", headers: { authorization: authHeader2, "content-type": "application/json" }, body: JSON.stringify({}) });
@@ -133,12 +134,33 @@ export default {
 	const commandSessionText = await commandSession.text();
 	const commandSessionBody = JSON.parse(commandSessionText);
 	const commandSessionID = commandSessionBody.id ?? commandSessionBody.data?.id;
-	const commandInvoked = await fetch(`${url}/api/session/${commandSessionID}/command`, { method: "POST", headers: { authorization: authHeader2, "content-type": "application/json" }, body: JSON.stringify({ name: "fusion-status", text: "" }) });
-	assert.ok(commandInvoked.status >= 200 && commandInvoked.status < 300, `fusion-status command invocation failed (${commandInvoked.status})`);
-	const inboxResponse = await fetch(`${url}/api/session/${commandSessionID}/inbox`, { headers: { authorization: authHeader2 } });
-	assert.equal(inboxResponse.status, 200, "Could not inspect the command output inbox");
-	const inbox = await inboxResponse.json();
-	assert.ok(inbox.data?.some((entry) => entry.type === "synthetic" && entry.payload?.description === "Fusion status" && typeof entry.payload?.text === "string" && entry.payload.text.includes("Fusion")), "Fusion status output was not delivered to the session inbox");
+	const runCommand = async (name, text) => {
+		const invoked = await fetch(`${url}/api/session/${commandSessionID}/command`, { method: "POST", headers: { authorization: authHeader2, "content-type": "application/json" }, body: JSON.stringify({ name, text }) });
+		assert.ok(invoked.status >= 200 && invoked.status < 300, `${name} command invocation failed (${invoked.status})`);
+	};
+	const inboxEntry = async (description) => {
+		const response = await fetch(`${url}/api/session/${commandSessionID}/inbox`, { headers: { authorization: authHeader2 } });
+		assert.equal(response.status, 200, "Could not inspect the command output inbox");
+		const inbox = await response.json();
+		return (inbox.data ?? []).find((entry) => entry.type === "synthetic" && entry.payload?.description === description && typeof entry.payload?.text === "string") ?? null;
+	};
+	await runCommand("fusion-status", "");
+	let statusEntry = null;
+	for (let i = 0; i < 30 && !statusEntry; i++) { statusEntry = await inboxEntry("Fusion status"); if (!statusEntry) await delay(200); }
+	assert.ok(statusEntry, "Fusion status output was not delivered to the session inbox");
+	// /fusion-config: no arguments (read-only view) and list (bounded catalog
+	// listing) both work through the real command surface without a model call.
+	await runCommand("fusion-config", "");
+	let configEntry = null;
+	for (let i = 0; i < 30 && !configEntry; i++) { configEntry = await inboxEntry("Fusion config"); if (!configEntry) await delay(200); }
+	assert.ok(configEntry, "fusion-config output was not delivered to the session inbox");
+	assert.ok(configEntry.payload.text.includes("Saved preference:"), `fusion-config show output was malformed: ${configEntry.payload.text}`);
+	assert.ok(configEntry.payload.text.includes("/fusion-config <provider>/<model> [variant]"), "fusion-config show did not document its syntax");
+	await runCommand("fusion-config", "list");
+	let listEntry = null;
+	for (let i = 0; i < 30 && !listEntry; i++) { listEntry = await inboxEntry("Fusion config models"); if (!listEntry) await delay(200); }
+	assert.ok(listEntry, "fusion-config list output was not delivered to the session inbox");
+	assert.ok(/-\s+\S+\/\S+/.test(listEntry.payload.text), `fusion-config list produced no model lines: ${listEntry.payload.text.slice(0, 200)}`);
 	let result;
 	while (Date.now() < deadline) {
 		try { result = JSON.parse(await readFile(join(project, "probe-result.json"), "utf8")); break; }

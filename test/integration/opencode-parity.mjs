@@ -1,11 +1,15 @@
 // Opt-in live parity run (consumes model usage). Drives the full Fusion
 // protocol through the USER-FACING controls only: /fusion-run, /fusion-status,
-// /fusion-stats, /fusion-resume, /fusion-clean, /fusion-mode. Configure runs
-// through the plugin API before any run (no user-facing configure command
-// exists by design); everything the model does flows from the run prompt.
+// /fusion-stats, /fusion-resume, /fusion-clean, /fusion-mode. The executor
+// model is configured through the plugin API before any run (the /fusion-config
+// command shares the same serialized operation and is covered by the
+// model-free fixtures); everything the model does flows from the run prompt.
+// With FUSION_OPENCODE_TARBALL set, the run uses the dedicated installed
+// package instead of a copied checkout (step 5's installed-package workflow).
 // Supersedes the failed 2026-10-30 CLI workflow run.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -37,16 +41,41 @@ const redactAll = (value) => JSON.parse(JSON.stringify(value, (_key, item) => {
   return redactText(item);
 }));
 try {
-  const project = join(root, "project");
-  await mkdir(join(project, ".opencode/plugins"), { recursive: true });
-  await mkdir(join(project, ".opencode/agents"), { recursive: true });
-  await cp(join(repo, "src"), join(project, ".opencode/fusion"), { recursive: true });
-  await cp(join(repo, "examples/opencode/agents"), join(project, ".opencode/agents"), { recursive: true });
-  await writeFile(join(project, ".opencode/plugins/fusion.ts"), 'export { default } from "../fusion/opencode/index.ts";\n');
-  // Loads after the Fusion plugin (name ordering): configures the executor
-  // model against the live catalog before any run, and observes the bus and
-  // Fusion tool calls as in-process evidence.
-  await writeFile(join(project, ".opencode/plugins/z-parity-observer.ts"), `
+  // The project layout depends on the fixture mode:
+  //  - default: loads the plugin from a copied checkout (src → .opencode/fusion).
+  //  - FUSION_OPENCODE_TARBALL: installs the dedicated fusion-opencode package
+  //    into a bare consumer and loads it through the native `plugins` entry —
+  //    the same shape users install. Agents come from the package's native
+  //    contribution; nothing is copied into .opencode/agents.
+  const packageTarball = process.env.FUSION_OPENCODE_TARBALL;
+  let project = join(root, "project");
+  let consumer = null;
+  if (packageTarball) {
+    result.installation = { kind: "dedicated-package", tarballSha256: createHash("sha256").update(await readFile(packageTarball)).digest("hex") };
+    consumer = join(root, "consumer");
+    await mkdir(join(consumer, "project"), { recursive: true });
+    await cp(packageTarball, join(consumer, "fusion-opencode.tgz"));
+    await writeFile(join(consumer, "package.json"), JSON.stringify({ name: "fusion-parity-consumer", private: true, type: "module", dependencies: { "fusion-opencode": "file:./fusion-opencode.tgz" } }, null, 2) + "\n");
+    const install = spawnSync("bun", ["install"], { cwd: consumer, encoding: "utf8" });
+    assert.equal(install.status, 0, `consumer install failed: ${install.stderr}`);
+    project = join(consumer, "project");
+    await mkdir(join(project, ".opencode/plugins"), { recursive: true });
+  } else {
+    await mkdir(join(project, ".opencode/plugins"), { recursive: true });
+    await mkdir(join(project, ".opencode/agents"), { recursive: true });
+    await cp(join(repo, "src"), join(project, ".opencode/fusion"), { recursive: true });
+    await cp(join(repo, "examples/opencode/agents"), join(project, ".opencode/agents"), { recursive: true });
+    await writeFile(join(project, ".opencode/plugins/fusion.ts"), 'export { default } from "../fusion/opencode/index.ts";\n');
+  }
+  // Loads after the Fusion plugin: configures the executor model against the
+  // live catalog before any run, and observes the bus and Fusion tool calls as
+  // in-process evidence. In checkout mode that order comes from discovery-name
+  // ordering (fusion.ts < z-parity-observer.ts); in package mode the observer
+  // is a directory entry listed AFTER the package in the ordered `plugins`
+  // array, because discovered plugins load before configured ones.
+  const observerPlugin = packageTarball ? join(project, "parity-observer") : join(project, ".opencode/plugins/z-parity-observer.ts");
+  if (packageTarball) await mkdir(observerPlugin, { recursive: true });
+  await writeFile(packageTarball ? join(observerPlugin, "index.ts") : observerPlugin, `
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 export default { id: "fusion-parity-observer", async setup(ctx) {
@@ -99,7 +128,7 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   await writeFile(join(project, "opencode.json"), JSON.stringify({ permissions: [
     ...["shell", "external_directory", "webfetch", "websearch", "skill", "glob", "grep", "read", "edit"].map((action) => ({ action, resource: "*", effect: "deny" })),
     ...["read", "edit"].flatMap((action) => ["fixture.txt", "second.txt", "*/fixture.txt", "*/second.txt"].map((resource) => ({ action, resource, effect: "allow" }))),
-  ] }));
+  ], ...(packageTarball ? { plugins: ["../node_modules/fusion-opencode", "./parity-observer"] } : {}) }));
   const env = Object.fromEntries(["PATH", "HOME", "SHELL", "TMPDIR", "LANG", "SYSTEMROOT"].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
   for (const [key, folder] of Object.entries({ XDG_DATA_HOME: "data", XDG_CONFIG_HOME: "config", XDG_CACHE_HOME: "cache", XDG_STATE_HOME: "state" })) env[key] = join(root, folder);
   env.FUSION_OWNERSHIP_DIR = join(root, "ownership");
@@ -479,7 +508,11 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   } catch {}
   result.ok = false;
   try {
-    await writeArtifact("opencode-parity", result, { secrets: knownSecrets() });
+    // The failure artifact carries the observer record too: the console dump
+    // is lossy in piped runs, and the observer's timeline/terminals are the
+    // evidence a stall diagnosis needs. Sanitization and secret redaction go
+    // through writeArtifact like every other artifact write.
+    await writeArtifact("opencode-parity", { ...result, observer, observerNote }, { secrets: knownSecrets() });
   } catch {}
   // The terminal failure output is redacted too, and the original error is
   // never rethrown: an error message can embed credentials (a boot-timeout

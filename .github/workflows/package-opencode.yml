@@ -14,12 +14,17 @@ on:
       - 'examples/opencode/**'
       - 'docs/install.md'
       - 'scripts/check-syntax.mjs'
-      - 'test/package-isolation.test.ts'
-      - 'test/integration/artifact.mjs'
-      - 'test/integration/clean-install.mjs'
+      - 'scripts/build-opencode-package.mjs'
+      - 'scripts/generate-agent-markdown.mjs'
+      - 'test/**'
 
 permissions:
   contents: read
+
+env:
+  # The host version the native surfaces were pinned and verified on
+  # (docs/opencode-install-and-config-plan.md, step 1 readiness report).
+  OPENCODE_CLI_VERSION: '2.2.5'
 
 jobs:
   package:
@@ -34,19 +39,30 @@ jobs:
           bun-version: '1.4.4'
       - name: Install development dependencies
         run: bun install
+      - name: Install the pinned OpenCode host
+        run: npm install -g @opencode/cli@${OPENCODE_CLI_VERSION}
       - name: Check package boundaries and syntax
         run: |
-          bun test test/package-isolation.test.ts
-          bun run test:syntax test/integration/artifact.mjs test/integration/clean-install.mjs
+          bun test
+          bun run typecheck
+          bun run test:pi-load
+          bun run test:syntax test/integration/artifact.mjs test/integration/clean-install.mjs test/integration/opencode-native-surface.mjs test/integration/opencode-package-load.mjs
       - name: Test a clean OpenCode consumer install
         run: bun run test:clean-install
-      - name: Pack installable plugin
+      - name: Pack installable plugins
         run: |
           mkdir -p dist
           npm pack --pack-destination dist
+          bun run build:opencode-package
+          npm pack ./dist/fusion-opencode --pack-destination dist
           cd dist
           sha256sum *.tgz > SHA256SUMS
-      - name: Upload plugin package
+      - name: Verify the native host surfaces (model-free)
+        run: bun run test:opencode-native
+      - name: Load the exact dedicated tarball through the package loader
+        run: |
+          FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-package-load
+      - name: Upload plugin packages
         uses: actions/upload-artifact@v4
         with:
           name: fusion-opencode-${{ github.sha }}
@@ -58,4 +74,13 @@ jobs:
         with:
           name: fusion-opencode-install-evidence-${{ github.sha }}
           path: artifacts/clean-install-*.json
+          if-no-files-found: ignore
+      - name: Upload native-surface and package-load evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-opencode-native-evidence-${{ github.sha }}
+          path: |
+            artifacts/opencode-native-surface-*.json
+            artifacts/opencode-package-load-*.json
           if-no-files-found: ignore
