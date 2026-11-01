@@ -633,7 +633,7 @@ describe("OpenCode Fusion plugin", () => {
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 			},
 		}, storage);
-		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean"]);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean"]);
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
 		expect(prompts).toHaveLength(1);
@@ -644,10 +644,10 @@ describe("OpenCode Fusion plugin", () => {
 		expect(status.originalTask).toBe("Build the thing");
 		expect(status.runActive).toBe(true);
 		expect(status.workspaceClaimed).toBe(true);
-		await expect(commands[5].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
+		await expect(commands[6].execute({ sessionID: "one" })).rejects.toThrow("run is still active");
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "Another" } })).rejects.toThrow("Finish and reset");
 		// /fusion-status command reports the same payload as the tool.
-		const commandStatus = JSON.parse(String(await commands[2].execute({ sessionID: "one" })));
+		const commandStatus = JSON.parse(String(await commands[3].execute({ sessionID: "one" })));
 		expect(commandStatus.originalTask).toBe("Build the thing");
 		await tools.get("fusion_reset")!.execute({}, context("one"));
 		// After reset the run is gone: /fusion can start the next one.
@@ -703,8 +703,8 @@ describe("OpenCode Fusion plugin", () => {
 			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => { commands.push(command); } }); } },
 			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({}) }], transform: async () => {} },
 		});
-		await commands[2].execute({ sessionID: "one" });
 		await commands[3].execute({ sessionID: "one" });
+		await commands[4].execute({ sessionID: "one" });
 		expect(published).toEqual([{ sessionID: "one", description: "Fusion status", text: "No Fusion run in this session.", resume: false }, { sessionID: "one", description: "Fusion stats", text: "No Fusion run in this session.", resume: false }]);
 	});
 
@@ -1574,7 +1574,7 @@ describe("OpenCode Fusion plugin", () => {
 		// Persistent mode, then a run: armed and unfinished, clean refuses.
 		await commands[1].execute({ sessionID: "one", prompt: { text: "on" } });
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the fixture" } });
-		await expect(commands[5].execute({ sessionID: "one" })).rejects.toThrow("The Fusion run is still active");
+		await expect(commands[6].execute({ sessionID: "one" })).rejects.toThrow("The Fusion run is still active");
 		// The protocol runs and the summary turn settles the run: persistent
 		// mode keeps it armed, and clean must still release the settled resources.
 		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build", originalTask: "Build the fixture" }, context("one"));
@@ -1582,7 +1582,7 @@ describe("OpenCode Fusion plugin", () => {
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.phase).toBe("complete");
 		expect(status.runActive).toBe(true);
-		expect(await commands[5].execute({ sessionID: "one" })).toContain("Released Fusion resources for this session.");
+		expect(await commands[6].execute({ sessionID: "one" })).toContain("Released Fusion resources for this session.");
 	});
 
 	test("a backgrounded scout keeps its guard until its execution is observed to end", async () => {
@@ -2067,4 +2067,273 @@ test("concurrent scouting preserves the pending executor's native call context",
 		{ agent: "fusion-executor", callID: "executor-call" },
 	]);
 	await tools.get("fusion_reset")!.execute({}, context("one"));
+});
+
+describe("native agent contribution", () => {
+	type AgentRecord = { id: string; name: string; mode: "subagent" | "primary" | "all"; hidden: boolean; description?: string; system?: string; permissions?: { action: string; resource: string; effect: string }[] };
+	/** Fake v2.2.5 agent editor: get reads current records; update-on-missing creates from a default draft. */
+	const fakeEditor = (records: Map<string, AgentRecord>) => ({
+		list: () => [...records.values()],
+		get: (id: string) => records.get(id),
+		default: () => {},
+		remove: (id: string) => { records.delete(id); },
+		update: (id: string, update: (agent: AgentRecord) => void) => {
+			const draft: AgentRecord = records.get(id) ?? { id, name: id, mode: "primary", hidden: false, permissions: [] };
+			update(draft);
+			records.set(id, draft);
+		},
+	});
+	const contributionHarness = async (records: Map<string, AgentRecord>) => {
+		const tools = new Map<string, Tool>();
+		let agentCallback!: (editor: ReturnType<typeof fakeEditor>) => void;
+		let disposed = 0;
+		const handle = await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+			agent: {
+				transform: async (callback: (editor: ReturnType<typeof fakeEditor>) => void) => { agentCallback = callback; return { dispose: async () => { disposed += 1; } }; },
+				list: async () => [...records.values()],
+			},
+		});
+		return { tools, replay: () => agentCallback(fakeEditor(records)), disposed: () => disposed, close: handle };
+	};
+
+	test("contributes fusion, fusion-executor, and fusion-scout through update-on-missing", async () => {
+		const records = new Map<string, AgentRecord>();
+		const { tools, replay } = await contributionHarness(records);
+		replay();
+		expect([...records.keys()].sort()).toEqual(["fusion", "fusion-executor", "fusion-scout"]);
+		expect(records.get("fusion")!.mode).toBe("primary");
+		expect(records.get("fusion-executor")!.mode).toBe("subagent");
+		expect(records.get("fusion-scout")!.mode).toBe("subagent");
+		expect(records.get("fusion")!.system).toContain("You are the Fusion supervisor.");
+		expect(records.get("fusion")!.permissions).toContainEqual({ action: "subagent", resource: "*", effect: "deny" });
+		expect(records.get("fusion")!.permissions).toContainEqual({ action: "subagent", resource: "fusion-executor", effect: "allow" });
+		expect(records.get("fusion-scout")!.permissions!.every((rule) => rule.effect === "deny")).toBe(true);
+		// Registry rebuilds replay the transform: contribution state stays deduplicated.
+		replay();
+		replay();
+		const status = (await tools.get("fusion_status")!.execute({}, context("one"))).content;
+		// No run exists yet: status falls to the no-run branch unless conflicts exist.
+		expect(status).toBe("No Fusion run in this session.");
+		expect(records.size).toBe(3);
+	});
+
+	test("an identical legacy markdown definition is accepted without conflict", async () => {
+		const records = new Map<string, AgentRecord>();
+		const { replay, tools } = await contributionHarness(records);
+		replay();
+		const contributed = records.get("fusion")!;
+		records.clear();
+		records.set("fusion", { ...contributed, permissions: [...contributed.permissions!.slice().reverse()] });
+		replay();
+		const status = (await tools.get("fusion_status")!.execute({}, context("one"))).content;
+		expect(status).toBe("No Fusion run in this session.");
+	});
+
+	test("a conflicting legacy definition is reported and never overridden", async () => {
+		const records = new Map<string, AgentRecord>();
+		const { replay, tools } = await contributionHarness(records);
+		replay();
+		const original = records.get("fusion")!;
+		records.set("fusion", { ...original, system: "an outdated supervisor prompt" });
+		records.set("fusion-scout", { ...records.get("fusion-scout")!, description: "stale description" });
+		replay();
+		// The legacy values win (host precedence) and the conflict is surfaced.
+		expect(records.get("fusion")!.system).toBe("an outdated supervisor prompt");
+		const status = (await tools.get("fusion_status")!.execute({}, context("one"))).content;
+		expect(status).toContain("Installed agent definitions override");
+		expect(status).toContain("fusion (system)");
+		expect(status).toContain("fusion-scout (description)");
+	});
+
+	test("hosts without the agent surface keep the legacy markdown installation path", async () => {
+		const tools = new Map<string, Tool>();
+		const close = await setupTest({
+			location: { directory: "/workspace" },
+			session: { context: async () => [], hook: async () => {} },
+			command: { list: async () => ({ data: [] }), transform: async () => {} },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		expect(tools.has("fusion_start")).toBe(true);
+		const status = (await tools.get("fusion_status")!.execute({}, context("one"))).content;
+		expect(status).toBe("No Fusion run in this session.");
+		close.close();
+	});
+
+	test("close() disposes owned registrations", async () => {
+		const records = new Map<string, AgentRecord>();
+		const harness = await contributionHarness(records);
+		harness.replay();
+		harness.close.close();
+		expect(harness.disposed()).toBeGreaterThanOrEqual(1);
+	});
+});
+
+describe("/fusion-config command", () => {
+	const catalogData = () => [
+		{ providerID: "prov", id: "small", name: "Small", status: "active", enabled: true, cost: [{ output: 1 }] },
+		{ providerID: "prov", id: "org/slash-model", name: "Slashed", status: "active", enabled: true, variants: [{ id: "low" }, { id: "high" }], cost: [{ output: 2 }] },
+		{ providerID: "prov", id: "gone", name: "Disabled", status: "active", enabled: false, cost: [] },
+		{ providerID: "other", id: "big", name: "Big", status: "active", enabled: true, cost: [{ output: 20 }] },
+	];
+	const harness = async (data = catalogData()) => {
+		const tools = new Map<string, Tool>();
+		const commands: CommandDefinition[] = [];
+		const published: { sessionID: string; description?: string; text: string; resume?: boolean }[] = [];
+		const storage = memoryStorage();
+		const close = await setupTest({
+			location: { directory: "/workspace" },
+			model: { list: async () => ({ data }) },
+			session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```' } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const config = commands.find((command) => command.name === "fusion-config")!;
+		expect(config).toBeTruthy();
+		return { tools, config, published, storage, close };
+	};
+
+	test("no arguments show the saved preference and syntax without creating a run", async () => {
+		const { tools, config, published } = await harness();
+		await config.execute({ sessionID: "one", prompt: { text: "" } });
+		await config.execute({ sessionID: "one" });
+		expect(published).toHaveLength(2);
+		for (const entry of published) {
+			expect(entry.description).toBe("Fusion config");
+			expect(entry.text).toContain("Saved preference: none.");
+			expect(entry.text).toContain("no run in this session");
+			expect(entry.text).toContain("/fusion-config <provider>/<model> [variant]");
+			expect(entry.text).toContain("executor and the scout share the chosen model");
+		}
+		// Read-only: no run materialized for the session.
+		expect((await tools.get("fusion_status")!.execute({}, context("one"))).content).toBe("No Fusion run in this session.");
+	});
+
+	test("list shows validated choices with variants, filters, hides disabled entries, and bounds output", async () => {
+		const many = [...catalogData(), ...Array.from({ length: 45 }, (_, index) => ({ providerID: "bulk", id: `m${index}`, name: `Bulk ${index}`, status: "active", enabled: true, cost: [] }))];
+		const { config, published } = await harness(many);
+		await config.execute({ sessionID: "one", prompt: { text: "list" } });
+		const listing = published.at(-1)!;
+		expect(listing.description).toBe("Fusion config models");
+		expect(listing.text).toContain("showing the first 40");
+		expect(listing.text).toContain("Narrow the output with /fusion-config list <filter>");
+		await config.execute({ sessionID: "one", prompt: { text: "list slash" } });
+		const filtered = published.at(-1)!.text;
+		expect(filtered).toContain("prov/org/slash-model");
+		expect(filtered).toContain("[variants: low, high]");
+		expect(filtered).not.toContain("prov/gone");
+		expect(filtered).not.toContain("bulk/m");
+	});
+
+	test("an explicit selection shares the tool's operation: applies now before work, persists, and reports shared use", async () => {
+		const { config, published, tools } = await harness();
+		await config.execute({ sessionID: "one", prompt: { text: "prov/org/slash-model low" } });
+		expect(published.at(-1)!.text).toContain("configured for this run: prov/org/slash-model (variant low)");
+		expect(published.at(-1)!.text).toContain("The scout uses its run's executor model");
+		// The preference persisted: a fresh look shows it saved.
+		await config.execute({ sessionID: "one", prompt: { text: "" } });
+		expect(published.at(-1)!.text).toContain("Saved preference: prov/org/slash-model#low.");
+		// Model IDs containing slashes parse on the first slash and reach the catalog.
+		await config.execute({ sessionID: "one", prompt: { text: "prov/org/slash-model" } });
+		expect(published.at(-1)!.text).toContain("prov/org/slash-model");
+		// After executor work starts, the selection is saved for the next run.
+		await tools.get("fusion_start")!.execute({ task: "Original task" }, context("one"));
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "build" }, context("one"));
+		await config.execute({ sessionID: "one", prompt: { text: "other/big" } });
+		expect(published.at(-1)!.text).toContain("the next run (executor work has already started): other/big");
+	});
+
+	test("invalid selections change nothing and report the reason", async () => {
+		const { config, published, tools } = await harness();
+		await expect(config.execute({ sessionID: "one", prompt: { text: "prov/missing" } })).rejects.toThrow("not in the OpenCode model catalog");
+		await expect(config.execute({ sessionID: "one", prompt: { text: "prov/small turbo" } })).rejects.toThrow("no variant");
+		await expect(config.execute({ sessionID: "one", prompt: { text: "provsmall" } })).rejects.toThrow("Usage: /fusion-config");
+		await expect(config.execute({ sessionID: "one", prompt: { text: "prov/small extra extra2" } })).rejects.toThrow("Too many arguments");
+		await expect(config.execute({ sessionID: "one", prompt: { text: "prov/other/one two three" } })).rejects.toThrow("Too many arguments");
+		await expect(config.execute({ sessionID: "one", prompt: { text: "/leading-slash" } })).rejects.toThrow("A model selection must be <provider>/<model>");
+		// Nothing was persisted by the failed attempts.
+		await config.execute({ sessionID: "one", prompt: { text: "" } });
+		expect(published.at(-1)!.text).toContain("Saved preference: none.");
+		expect((await tools.get("fusion_status")!.execute({}, context("one"))).content).toBe("No Fusion run in this session.");
+	});
+
+	test("a failed preference write stays retryable and changes nothing", async () => {
+		// The storage failure path: a failing set must throw without changing
+		// the preference, and a retry after the failure is repaired succeeds.
+		const tools = new Map<string, Tool>();
+		const commands: CommandDefinition[] = [];
+		const published: { text: string }[] = [];
+		const memory = memoryStorage();
+		let failSet = true;
+		const brokenStorage = { ...memory, set: async (key: string, value: unknown) => { if (failSet) throw new Error("disk full"); await memory.set(key, value); } };
+		await setupTest({
+			location: { directory: "/workspace" },
+			model: { list: async () => ({ data: catalogData() }) },
+			session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, brokenStorage);
+		const configCommand = commands.find((command) => command.name === "fusion-config")!;
+		await expect(configCommand.execute({ sessionID: "one", prompt: { text: "prov/small" } })).rejects.toThrow("disk full");
+		// Retry after the failure is repaired: the same selection then succeeds.
+		failSet = false;
+		await configCommand.execute({ sessionID: "one", prompt: { text: "prov/small" } });
+		expect(published.at(-1)!.text).toContain("prov/small");
+	});
+
+	test("an unavailable catalog refuses honestly for list and set", async () => {
+		const { config } = await harness([]);
+		await expect(config.execute({ sessionID: "one", prompt: { text: "list" } })).resolves.toBeTruthy();
+		await expect(config.execute({ sessionID: "one", prompt: { text: "prov/small" } })).rejects.toThrow("not in the OpenCode model catalog");
+	});
+
+	test("a completed scout defers the model change to the next run", async () => {
+		const { tools, config, published } = await harness();
+		// The reviewer's repro: configure old, run a scout, configure new —
+		// "this run" would misreport what the scout already used.
+		const first = await tools.get("fusion_configure")!.execute({ provider: "other", model: "big" }, context("one"));
+		expect(first.metadata?.applied).toBe("now");
+		await tools.get("fusion_scout")!.execute({ questions: ["q"] }, context("one"));
+		await config.execute({ sessionID: "one", prompt: { text: "prov/small" } });
+		expect(published.at(-1)!.text).toContain("the next run (a scout has already run in this run): prov/small");
+		// The run keeps its own model; only the saved preference moved.
+		await config.execute({ sessionID: "one", prompt: { text: "" } });
+		const view = published.at(-1)!.text;
+		expect(view).toContain("Saved preference: prov/small.");
+		expect(view).toContain("Current run: other/big.");
+	});
+
+	test("an in-flight scout defers the model change to the next run", async () => {
+		const tools = new Map<string, Tool>();
+		const commands: CommandDefinition[] = [];
+		const published: { text: string }[] = [];
+		let releaseScout!: () => void;
+		const gate = new Promise<void>((resolve) => { releaseScout = resolve; });
+		let scoutEntered = false;
+		await setupTest({
+			location: { directory: "/workspace" },
+			model: { list: async () => ({ data: catalogData() }) },
+			session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { await callback({ add: (command) => commands.push(command) }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input) => {
+				if (input.agent === "fusion-scout") { scoutEntered = true; await gate; }
+				return { output: { sessionID: input.agent === "fusion-scout" ? "scout-child" : "child", status: "completed", output: input.agent === "fusion-scout" ? "answer" : "done" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const configCommand = commands.find((command) => command.name === "fusion-config")!;
+		const scout = tools.get("fusion_scout")!;
+		const inFlight = scout.execute({ questions: ["q"] }, context("one"));
+		for (let i = 0; i < 500 && !scoutEntered; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(scoutEntered).toBe(true);
+		await configCommand.execute({ sessionID: "one", prompt: { text: "prov/small" } });
+		expect(published.at(-1)!.text).toContain("the next run (a Fusion scout is still running): prov/small");
+		releaseScout();
+		await inFlight;
+		// After the scout finishes, the deferral reason reflects its history.
+		await configCommand.execute({ sessionID: "one", prompt: { text: "other/big" } });
+		expect(published.at(-1)!.text).toContain("the next run (a scout has already run in this run): other/big");
+	});
 });

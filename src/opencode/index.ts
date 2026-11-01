@@ -11,6 +11,7 @@ import { snapshotWorkspace, snapshotWorkspaceAfter, workspaceDiffStat, workspace
 import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
+import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -54,9 +55,37 @@ interface CommandDefinition {
 interface CommandEditor {
 	add(command: CommandDefinition): unknown;
 }
+/** v2.2.5 `Agent.Info` subset Fusion reads and writes. `system` is the prompt; there is no `prompt` field. */
+interface AgentRecord {
+	id: string;
+	name: string;
+	mode: "subagent" | "primary" | "all";
+	hidden: boolean;
+	description?: string;
+	system?: string;
+	permissions?: { action: string; resource: string; effect: string }[];
+}
+/** Pinned live on OpenCode v2.2.5: the agent editor has exactly these methods — no `add`. `update` on a missing ID creates the agent. */
+interface AgentEditor {
+	list(): readonly AgentRecord[];
+	get(id: string): AgentRecord | undefined;
+	default(id: string | undefined): void;
+	update(id: string, update: (agent: AgentRecord) => void): void;
+	remove(id: string): void;
+}
+/** A registration handle returned by transforms; disposing removes the transform's effect. */
+interface NativeRegistration {
+	dispose(): unknown;
+}
 interface PluginContext {
 	location: { directory: string };
 	storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<unknown>; remove(key: string): Promise<unknown> };
+	/** Pinned live on OpenCode v2.2.5. Absence leaves Fusion's agents to manual Markdown installation. */
+	agent?: {
+		transform(callback: (editor: AgentEditor) => void): Promise<NativeRegistration>;
+		list?(): Promise<unknown>;
+		reload?(): Promise<void>;
+	};
 	tool: {
 		list(): Promise<readonly { id: string; execute: NativeSubagentExecute<ToolContext> }[]>;
 		transform(callback: (editor: { add(tool: ToolDefinition): void }) => void): Promise<unknown>;
@@ -487,6 +516,83 @@ export default {
 				if (!runs.get(sessionID ?? "")?.controller.state.runActive) for (const name of FUSION_GATED_TOOLS) delete event.tools[name];
 			}
 		});
+		// Native agent contribution (pinned live on OpenCode v2.2.5; see
+		// docs/opencode-install-and-config-plan.md step 1): the agent editor has
+		// no `add` method — `update()` on a missing ID creates the agent from an
+		// `Agent.Info.default` draft — so Fusion contributes its supervisor,
+		// executor, and scout through update-on-missing. Markdown/config-defined
+		// agents with the same ID keep precedence over plugin contributions on
+		// this host, which is exactly the collision policy: a legacy manual
+		// install stays authoritative and is never silently overridden.
+		// Conflicts are detected in the transform callback when the editor
+		// already exposes the legacy agent, and — authoritatively — by
+		// re-reading the merged registry at query time (agentReport below),
+		// because the first transform replay may run before Markdown agents are
+		// visible in its editor. The transform callback runs after setup returns
+		// and replays on every registry rebuild, so contribution state is
+		// deduplicated here and registry reads are never awaited inside setup
+		// (a read awaited in setup never resolves on this host).
+		const agentContribution: { supported: boolean; contributed: string[]; acceptedLegacy: string[]; conflicts: { id: string; differences: string[] }[] } = {
+			supported: typeof ctx.agent?.transform === "function",
+			contributed: [],
+			acceptedLegacy: [],
+			conflicts: [],
+		};
+		const agentRegistration = agentContribution.supported ? await ctx.agent!.transform((editor) => {
+			for (const definition of FUSION_AGENTS) {
+				const existing = editor.get(definition.id);
+				if (existing) {
+					const differences: string[] = [];
+					if (existing.mode !== definition.mode) differences.push("mode");
+					if ((existing.description ?? "") !== definition.description) differences.push("description");
+					if ((existing.system ?? "") !== definition.system) differences.push("system");
+					if (!fusionPermissionsEqual(existing.permissions, definition.permissions)) differences.push("permissions");
+					if (differences.length === 0) {
+						if (!agentContribution.acceptedLegacy.includes(definition.id)) agentContribution.acceptedLegacy.push(definition.id);
+					} else if (!agentContribution.conflicts.some((conflict) => conflict.id === definition.id)) {
+						agentContribution.conflicts.push({ id: definition.id, differences });
+					}
+					continue;
+				}
+				editor.update(definition.id, (agent) => {
+					agent.mode = definition.mode;
+					agent.description = definition.description;
+					agent.system = definition.system;
+					agent.permissions = definition.permissions.map((rule) => ({ action: rule.action, resource: rule.resource, effect: rule.effect }));
+				});
+				if (!agentContribution.contributed.includes(definition.id)) agentContribution.contributed.push(definition.id);
+			}
+		}) : undefined;
+		/** Authoritative agent report at query time. The transform callback runs
+		 * before Markdown/config agents are guaranteed visible in its editor
+		 * (live-observed on v2.2.5: first replay may not see them, later replays
+		 * do), so detection recorded during the transform is advisory; this read
+		 * — safe outside setup, where registry reads never resolve — reconciles
+		 * what actually holds in the merged registry. */
+		async function agentReport(): Promise<{ supported: boolean; contributed: string[]; acceptedLegacy: string[]; conflicts: { id: string; differences: string[] }[]; observed?: { id: string; state: "available" | "conflict" | "unavailable"; differences?: string[] }[] }> {
+			if (!agentContribution.supported) return { ...agentContribution, observed: [] };
+			const report = { ...agentContribution, observed: [] as { id: string; state: "available" | "conflict" | "unavailable"; differences?: string[] }[] };
+			if (typeof ctx.agent?.list !== "function") return report;
+			try {
+				const listed = await ctx.agent.list();
+				const agents = Array.isArray(listed) ? listed : Array.isArray((listed as { data?: unknown[] })?.data) ? (listed as { data: unknown[] }).data : [];
+				const byId = new Map<string, AgentRecord>();
+				for (const agent of agents) if (agent && typeof (agent as AgentRecord).id === "string") byId.set((agent as AgentRecord).id, agent as AgentRecord);
+				for (const definition of FUSION_AGENTS) {
+					const agent = byId.get(definition.id);
+					if (!agent) { report.observed!.push({ id: definition.id, state: "unavailable" }); continue; }
+					const differences: string[] = [];
+					if (agent.mode !== definition.mode) differences.push("mode");
+					if ((agent.description ?? "") !== definition.description) differences.push("description");
+					if ((agent.system ?? "") !== definition.system) differences.push("system");
+					if (!fusionPermissionsEqual(agent.permissions, definition.permissions)) differences.push("permissions");
+					report.observed!.push(differences.length > 0 ? { id: definition.id, state: "conflict", differences } : { id: definition.id, state: "available" });
+				}
+			} catch {
+				/* the registry read is unavailable: the advisory transform state stands */
+			}
+			return report;
+		}
 		const storageKey = `run/${createHash("sha256").update(ctx.location.directory).digest("hex")}`;
 		async function makeRun(sessionID: string, record?: RunManifest): Promise<Run> {
 			const toolContexts = new WeakMap<WorkerHandle, ToolContext>();
@@ -661,6 +767,106 @@ export default {
 				throw error;
 			} finally { starting = false; }
 		}
+		/** One configuration operation shared by the fusion_configure tool and
+		 * the /fusion-config command: validate the selection against the live
+		 * catalog before any mutation, serialize with run start/reset/delegation
+		 * transitions, persist the preference, and apply it immediately only to
+		 * a safely replaceable executor handle — one that cannot have produced
+		 * worker work: no submission, no native child to orphan, and no scout
+		 * activity or history (scouts run on the run's model, so a mid-run
+		 * change would misreport what this run used). Pending, uncertain,
+		 * backgrounded, and foreign-owned work never has its handle replaced.
+		 * Failures stay retryable: a failed preference write releases the
+		 * replacement handle and changes nothing; a failed handle replacement
+		 * never reaches the write. */
+		async function configureExecutorModel(sessionID: string, selection: { provider: string; modelId: string; variant?: string }): Promise<{ applied: "now" | "next-run"; appliedReason: string; config: WorkerModelConfig; metadata: Record<string, unknown> }> {
+			const { config, metadata } = await validateCatalogModel(selection.provider, selection.modelId, selection.variant);
+			if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
+			configuring = true;
+			try {
+				const run = await runFor(sessionID);
+				const active = run.runtime.status(run.handle);
+				const executorStarted = run.controller.state.executed || !!run.controller.pending || run.controller.uncertain || run.reconciling || active.backgrounded || active.backgroundPending || active.unsettled;
+				// Scout work counts: an in-flight or backgrounded scout holds a
+				// handle built from the run's model, and completed scouts already
+				// consumed their budget on it.
+				const scoutActive = scoutInFlight || hasBackgroundScout();
+				const scoutDone = run.controller.state.scoutCalls > 0;
+				const workStarted = executorStarted || scoutActive || scoutDone;
+				let applied: "now" | "next-run";
+				let appliedReason = "";
+				if (!workStarted && !run.handle.reference) {
+					const replacement = await run.runtime.create({ harness: "opencode", supervisorId: sessionID, workspace }, { role: "executor", model: config });
+					try { await ctx.storage.set(modelKey, config); } catch (error) { await run.runtime.release(replacement); throw error; }
+					await run.runtime.release(run.handle);
+					run.handle = replacement;
+					run.model = config;
+					applied = "now";
+				} else {
+					await ctx.storage.set(modelKey, config);
+					applied = "next-run";
+					appliedReason = executorStarted ? "executor work has already started" : scoutActive ? "a Fusion scout is still running" : scoutDone ? "a scout has already run in this run" : "the executor child already exists";
+				}
+				preferredModel = config;
+				if (run.lease) await persist(sessionID, run);
+				return { applied, appliedReason, config, metadata };
+			} finally { configuring = false; }
+		}
+		/** Presentation shared by the tool and the command. */
+		function formatConfiguredModel(result: { applied: "now" | "next-run"; appliedReason: string; config: WorkerModelConfig; metadata: Record<string, unknown> }): string {
+			return `Fusion executor model configured for ${result.applied === "now" ? "this run" : `the next run (${result.appliedReason})`}: ${result.config.provider}/${result.config.modelId}${result.config.variant ? ` (variant ${result.config.variant})` : ""}. The scout uses its run's executor model; the supervisor's model stays OpenCode's own selector. ${JSON.stringify(result.metadata)}`;
+		}
+		/** Parse /fusion-config text per the published contract. The explicit
+		 * selection splits on the FIRST slash so model IDs containing slashes
+		 * still work; the variant is one optional whitespace-separated token. */
+		function parseConfigCommand(text: string): { action: "show" } | { action: "list"; filter?: string } | { action: "set"; provider: string; modelId: string; variant?: string } | { action: "error"; message: string } {
+			const trimmed = text.trim();
+			if (!trimmed) return { action: "show" };
+			const tokens = trimmed.split(/\s+/);
+			if (tokens[0] === "list") {
+				const filter = tokens.slice(1).join(" ").trim();
+				return { action: "list", ...(filter ? { filter } : {}) };
+			}
+			if (tokens.length > 2) return { action: "error", message: "Too many arguments." };
+			const slash = tokens[0].indexOf("/");
+			if (slash <= 0 || slash >= tokens[0].length - 1) return { action: "error", message: "A model selection must be <provider>/<model>." };
+			const provider = tokens[0].slice(0, slash);
+			const modelId = tokens[0].slice(slash + 1);
+			return { action: "set", provider, modelId, ...(tokens[1] !== undefined ? { variant: tokens[1] } : {}) };
+		}
+		/** Bounded, optionally filtered listing of validated catalog choices. */
+		async function listCatalogModels(filter: string | undefined): Promise<string> {
+			const enabled = (await hostModels()).filter((entry) => entry.enabled !== false);
+			const needle = filter?.toLowerCase();
+			const matched = enabled.filter((entry) => !needle || `${entry.providerID}/${entry.id}`.toLowerCase().includes(needle) || (entry.name ?? "").toLowerCase().includes(needle));
+			const MAX_LISTED = 40;
+			const shown = matched.slice(0, MAX_LISTED);
+			const lines = shown.map((entry) => {
+				const variants = (entry.variants ?? []).map((candidate) => typeof candidate?.id === "string" ? candidate.id : "").filter(Boolean);
+				return `- ${entry.providerID}/${entry.id}${entry.name ? ` (${entry.name})` : ""}${variants.length ? ` [variants: ${variants.join(", ")}]` : ""}`;
+			});
+			const header = matched.length > MAX_LISTED
+				? `${matched.length} models match; showing the first ${MAX_LISTED}. Narrow the output with /fusion-config list <filter>.`
+				: `${matched.length} model${matched.length === 1 ? "" : "s"} ${needle ? `matching "${filter}"` : "available"}.`;
+			return `${header}\n${lines.join("\n")}`;
+		}
+		/** The no-argument view: saved preference, current run model, and the
+		 * command syntax. Read-only — it never creates a run or claims the
+		 * workspace, unlike an explicit selection. */
+		function configStatusText(sessionID: string): string {
+			const format = (model: WorkerModelConfig | undefined) => model ? `${model.provider}/${model.modelId}${model.variant ? `#${model.variant}` : ""}` : undefined;
+			const run = runs.get(sessionID);
+			return [
+				"Fusion executor model configuration.",
+				`Saved preference: ${format(preferredModel) ?? "none"}.`,
+				`Current run: ${run ? format(run.model) ?? "the host-configured model" : "no run in this session"}.`,
+				"Usage:",
+				"  /fusion-config <provider>/<model> [variant]",
+				"  /fusion-config list [filter]",
+				"The selection splits on the first slash, so model IDs containing slashes work.",
+				"The executor and the scout share the chosen model; the supervisor's model stays OpenCode's own selector.",
+			].join("\n");
+		}
 		/** Release settled Fusion resources for a session, or a settled workspace record left by another one. */
 		async function cleanWorkspace(sessionID: string): Promise<string> {
 			if (resetting || starting || configuring || promptInFlight) throw new Error("A Fusion run transition is in progress.");
@@ -719,7 +925,15 @@ export default {
 			const run = runs.get(sessionID);
 			if (!run) {
 				const owned = await registry.inspect(workspace);
-				if (!owned) return "No Fusion run in this session.";
+				if (!owned) {
+					const report = await agentReport();
+					const observedConflicts = (report.observed ?? []).filter((entry) => entry.state === "conflict");
+					if (observedConflicts.length > 0) {
+						const detail = observedConflicts.map((conflict) => `${conflict.id} (${conflict.differences!.join(", ")})`).join("; ");
+						return `No Fusion run in this session. Installed agent definitions override this plugin's for: ${detail}. Update or remove those agent files to let the plugin manage them.`;
+					}
+					return "No Fusion run in this session.";
+				}
 				return JSON.stringify({ message: "Another Fusion run owns this workspace.", runId: owned.manifest.runId, owner: owned.manifest.owner, recovery: owned.manifest.recovery, pending: owned.manifest.pending, nextAction: "Reconcile in the owning harness or explicitly resolve ownership after inspecting the worker and workspace." });
 			}
 			const status = run.runtime.status(run.handle);
@@ -741,7 +955,7 @@ export default {
 					: !run.controller.state.executed
 					? "Investigate the original task, then call fusion_delegate with action execute."
 					: "Review the working tree and audit the original task; reset when the run is finished.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, nextAction });
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, agents: await agentReport(), nextAction });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -834,36 +1048,8 @@ export default {
 					if (!input || typeof input !== "object") throw new Error("Invalid Fusion configuration input.");
 					const value = input as Record<string, unknown>;
 					if (typeof value.provider !== "string" || !value.provider.trim() || typeof value.model !== "string" || !value.model.trim() || (value.variant !== undefined && (typeof value.variant !== "string" || !value.variant.trim()))) throw new Error("Invalid Fusion configuration input.");
-					const { config, metadata } = await validateCatalogModel(value.provider.trim(), value.model.trim(), typeof value.variant === "string" ? value.variant.trim() : undefined);
-					if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
-					configuring = true;
-					try {
-						const run = await runFor(context.sessionID);
-						const active = run.runtime.status(run.handle);
-						const workStarted = run.controller.state.executed || !!run.controller.pending || run.controller.uncertain || run.reconciling || active.backgrounded || active.backgroundPending || active.unsettled;
-						// Recreate the executor handle only while it cannot have produced
-						// work: no submission yet and no native child to orphan.
-						let applied: "now" | "next-run";
-						let appliedReason = "";
-						if (!workStarted && !run.handle.reference) {
-							const replacement = await run.runtime.create({ harness: "opencode", supervisorId: context.sessionID, workspace }, { role: "executor", model: config });
-							try { await ctx.storage.set(modelKey, config); } catch (error) { await run.runtime.release(replacement); throw error; }
-							await run.runtime.release(run.handle);
-							run.handle = replacement;
-							run.model = config;
-							applied = "now";
-						} else {
-							await ctx.storage.set(modelKey, config);
-							applied = "next-run";
-							appliedReason = workStarted ? "executor work has already started" : "the executor child already exists";
-						}
-						preferredModel = config;
-						if (run.lease) await persist(context.sessionID, run);
-						return {
-							content: `Fusion executor model configured for ${applied === "now" ? "this run" : `the next run (${appliedReason})`}: ${config.provider}/${config.modelId}${config.variant ? ` (variant ${config.variant})` : ""}. The scout uses its run's executor model. ${JSON.stringify(metadata)}`,
-							metadata: { model: config, applied, ...metadata },
-						};
-					} finally { configuring = false; }
+					const result = await configureExecutorModel(context.sessionID, { provider: value.provider.trim(), modelId: value.model.trim(), ...(typeof value.variant === "string" && value.variant.trim() ? { variant: value.variant.trim() } : {}) });
+					return { content: formatConfiguredModel(result), metadata: { model: result.config, applied: result.applied, ...result.metadata } };
 				},
 			});
 			editor.add({
@@ -1166,10 +1352,9 @@ export default {
 			await ctx.session.synthetic({ sessionID, text: content, description, resume: false });
 			return content;
 		}
-		await ctx.command?.transform?.((editor) => {
+		const commandRegistration = await ctx.command?.transform?.((editor) => {
 			editor.add({
-				name: "fusion-run",
-				description: "Start a Fusion run with the given task [task]",
+				name: "fusion-run",				description: "Start a Fusion run with the given task [task]",
 				execute: async (args) => {
 					const task = args.prompt?.text?.trim();
 					if (!task) throw new Error("Provide a task: /fusion-run <task>");
@@ -1214,6 +1399,22 @@ export default {
 				},
 			});
 			editor.add({
+				name: "fusion-config",
+				description: "Show or set the Fusion executor model (executor and scout) [list [filter] | provider/model [variant]]",
+				execute: async (args) => {
+					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
+					// The command is user-driven: no supervisor authorization, no
+					// active run required, and no model call — an explicit selection
+					// shares the serialized operation the fusion_configure tool uses.
+					const parsed = parseConfigCommand(args.prompt?.text ?? "");
+					if (parsed.action === "error") throw new Error(`${parsed.message} Usage: /fusion-config [list [filter] | <provider>/<model> [variant]]`);
+					if (parsed.action === "show") return await reportCommand(args.sessionID, "Fusion config", configStatusText(args.sessionID));
+					if (parsed.action === "list") return await reportCommand(args.sessionID, "Fusion config models", await listCatalogModels(parsed.filter));
+					const result = await configureExecutorModel(args.sessionID, parsed);
+					return await reportCommand(args.sessionID, "Fusion config", formatConfiguredModel(result));
+				},
+			});
+			editor.add({
 				name: "fusion-status",
 				description: "Show the current Fusion run state",
 				execute: async (args) => await reportCommand(args.sessionID, "Fusion status", await statusContent(args.sessionID)),
@@ -1238,6 +1439,11 @@ export default {
 			});
 		});
 		// Embedding hosts may call this on unload. Process exit also releases SQLite locks.
+		/** Dispose a native registration handle defensively: unload paths must never throw. */
+		const disposeRegistration = (registration: unknown): void => {
+			if (!registration || typeof (registration as { dispose?: unknown }).dispose !== "function") return;
+			try { void Promise.resolve((registration as { dispose: () => unknown }).dispose()).catch(() => {}); } catch {}
+		};
 		return {
 			close() {
 				busController.abort();
@@ -1247,6 +1453,10 @@ export default {
 				settlementChains.clear();
 				activeScout = undefined;
 				for (const run of runs.values()) run.lease?.close();
+				// Owned native registrations (agents, commands) are removed so a
+				// close-without-unload cannot leave Fusion's contributions behind.
+				disposeRegistration(agentRegistration);
+				disposeRegistration(commandRegistration);
 			},
 		};
 	},
