@@ -45,7 +45,8 @@ Use OpenCode **2.2.3–2.2.5** and Bun. To get an installable package:
 1. Open this repository's **Actions → Package OpenCode plugin** workflow.
 2. Select **Run workflow**, or open a successful run for a `v*` tag or relevant pull request.
 3. Download the `fusion-opencode-<commit>` artifact and extract it. It contains
-   `pi-fusion-extension-<version>.tgz` and `SHA256SUMS`.
+   `fusion-opencode-<version>.tgz`, `pi-fusion-extension-<version>.tgz`, and
+   `SHA256SUMS`.
 
 Verify the download from its extracted directory (`shasum -a 256 -c SHA256SUMS`
 on macOS, or `sha256sum -c SHA256SUMS` on Linux). Then install in your project,
@@ -53,33 +54,60 @@ replacing the tarball path with your download:
 
 ```sh
 cd /path/to/your/project
-bun add /path/to/pi-fusion-extension-0.1.0.tgz
-mkdir -p .opencode/plugins .opencode/agents
-printf '%s\n' 'export { default } from "pi-fusion-extension/opencode";' > .opencode/plugins/fusion.ts
-cp node_modules/pi-fusion-extension/examples/opencode/agents/*.md .opencode/agents/
+bun add /path/to/fusion-opencode-0.1.0.tgz
 ```
 
-Restart OpenCode in that project. Configure your provider credentials through
-OpenCode, then try:
+Then add the plugin to your project's `opencode.json(c)`. **Append to the
+existing `plugins` array — do not replace the file**, or you will lose your
+configured providers, plugins, and permissions:
+
+```jsonc
+// opencode.jsonc — merge into your existing configuration
+{
+  // ...your existing providers, permissions, and other settings...
+  "plugins": [
+    // ...your existing plugin entries, if any...
+    "./node_modules/fusion-opencode"
+  ]
+}
+```
+
+Only if the project has no configuration file at all:
+
+```sh
+printf '{"plugins":["./node_modules/fusion-opencode"]}\n' > opencode.json
+```
+
+Restart OpenCode in that project. The plugin contributes the `fusion`,
+`fusion-executor`, and `fusion-scout` agents by itself — no agent files to
+copy. Configure your provider credentials through OpenCode, then try:
 
 ```text
 /fusion-run Implement a small improvement and verify it with the relevant checks.
+/fusion-config list
+/fusion-config opencode-go/glm-5.3-flash
 /fusion-status
 /fusion-stats
 /fusion-clean
 ```
 
 `/fusion-run` starts the Fusion supervisor, which delegates to the executor and
-reviews its work. Ask the supervisor to call `fusion_configure` to select an
-executor provider/model; the scout uses that model too. OpenCode uses
+reviews its work. `/fusion-config` shows or sets the executor and scout model
+(`list [filter]` for catalog choices, `<provider>/<model> [variant]` to select —
+validated against the host catalog, split on the first slash so model IDs with
+slashes work, saved across restarts). The supervisor's own model stays
+OpenCode's native selector. OpenCode uses
 `/fusion-mode on` and `/fusion-mode off` for persistent mode. After an
 interruption, use `/fusion-resume` and follow its recovery instructions.
 
-The OpenCode entry installs no Pi SDK dependencies. The workflow uploads a
-package artifact; it does not publish to npm or create a GitHub release.
-For local packaging, run `npm pack` from this repository and install the
-resulting tarball using the same steps. See the [operating guide](docs/install.md)
-for gateway credentials, shared ownership configuration, and recovery limits.
+The dedicated package has no dependencies (no Pi SDKs, no plugin SDK). The
+workflow uploads a package artifact; it does not publish to npm or create a
+GitHub release, so `opencode plugin add fusion-opencode` becomes available
+only after publication. For local packaging, run `npm run
+build:opencode-package && npm pack ./dist/fusion-opencode` and install the
+resulting tarball using the same steps. The legacy manual install (Pi package
+plus copied agent files) still works — see the
+[operating guide](docs/install.md) before mixing the two.
 
 ### Pi project-local development
 

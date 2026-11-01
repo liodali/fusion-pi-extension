@@ -81,38 +81,97 @@ the host; the ownership registry is shared across harnesses (below).
 
 ## Installing for OpenCode
 
-### Downloading a GitHub Actions package
+There are two supported shapes: the **dedicated `fusion-opencode` package**
+(preferred — the plugin contributes its agents itself, nothing to copy) and
+the **legacy manual install** (copy the agent Markdown files yourself). Do
+not mix them: on OpenCode v2.2.5 a Markdown-defined agent keeps precedence
+over the plugin's contribution, so leftover copies silently override the
+plugin's definitions. `/fusion-status` reports such conflicts.
 
-Run **Package OpenCode plugin** from the repository's Actions tab (Run
-workflow). The workflow also runs for `v*` tags and relevant pull requests.
-It checks package isolation and a clean consumer install, then uploads
-`fusion-opencode-<commit>` containing the package tarball and `SHA256SUMS`.
-Download and extract that artifact, then install it from your project:
+### Dedicated package (preferred)
+
+Once the package is published, install it through OpenCode's native plugin
+manager:
+
+```sh
+opencode plugin add fusion-opencode
+```
+
+Until then, use the package built by the **Package OpenCode plugin** workflow
+(see below): the `fusion-opencode-<commit>` artifact contains
+`fusion-opencode-<version>.tgz`. Install it as your project's plugin:
 
 ```sh
 sha256sum -c /path/to/extracted-artifact/SHA256SUMS # run from the extracted directory
 cd /path/to/your/project
-bun add /path/to/extracted-artifact/pi-fusion-extension-0.1.0.tgz
-mkdir -p .opencode/plugins .opencode/agents
-printf '%s\n' 'export { default } from "pi-fusion-extension/opencode";' > .opencode/plugins/fusion.ts
-cp node_modules/pi-fusion-extension/examples/opencode/agents/*.md .opencode/agents/
+bun add /path/to/extracted-artifact/fusion-opencode-<version>.tgz
 ```
 
-Use the tarball filename from your downloaded artifact if its version differs.
-Restart OpenCode in that project and start with `/fusion-run <task>`.
+Then add the plugin to your project's `opencode.json(c)`. **Append to the
+existing `plugins` array — do not replace the file**, or you will lose your
+configured providers, plugins, and permissions:
+
+```jsonc
+// opencode.jsonc — merge into your existing configuration
+{
+  // ...your existing providers, permissions, and other settings...
+  "plugins": [
+    // ...your existing plugin entries, if any...
+    "./node_modules/fusion-opencode"
+  ]
+}
+```
+
+Only if the project has no configuration file at all:
+
+```sh
+printf '{"plugins":["./node_modules/fusion-opencode"]}\n' > opencode.json
+```
+
+Restart OpenCode in that project. The plugin registers the `fusion`,
+`fusion-executor`, and `fusion-scout` agents natively (no
+`.opencode/agents/` copies needed), together with the Fusion tools and
+`/fusion-run`, `/fusion-config`, `/fusion-status`, `/fusion-stats`,
+`/fusion-resume`, `/fusion-clean`, and `/fusion-mode` commands. The package
+has no dependencies — no Pi SDKs and no `@opencode/plugin` SDK — and loading
+it through the native `plugins` entry, an empty-agent project, and a full
+model-free run lifecycle are covered by `bun run test:opencode-package-load`.
+
+### Downloading a GitHub Actions package
+
+Run **Package OpenCode plugin** from the repository's Actions tab (Run
+workflow). The workflow also runs for `v*` tags and relevant pull requests.
+It checks package isolation and a clean consumer install, verifies the
+native host surfaces (`test:opencode-native`), loads the exact dedicated
+tarball through the real package loader (`test:opencode-package-load`), and
+uploads `fusion-opencode-<commit>` containing both package tarballs
+(`pi-fusion-extension` and `fusion-opencode`) plus `SHA256SUMS`.
+
 This workflow uploads build artifacts; it does not publish to npm or create a
-GitHub release. The package contains both harness entrypoints; loading
-`/opencode` requires no Pi dependencies.
+GitHub release. `opencode plugin add` needs a published npm package; installing
+this plugin directly from this repository's Git source is **not** supported
+(subpath Git packages that reference the repository root do not install on
+OpenCode's bun-based installer — the live experiments are recorded in
+`docs/opencode-install-and-config-plan.md`, step 2). Until the package is
+published, the artifact path above configures the local `node_modules`
+directory through `opencode.json` instead.
 
 **Supported versions: OpenCode v2.2.3 – v2.2.5.** The plugin API is
 hand-mirrored in `src/opencode/index.ts` — there is no `@opencode-ai`
 dependency — so an OpenCode release outside this range must be re-pinned and
 its surfaces reverified (plugin tools/commands, `session.execution.*` and
 `session.text.ended` events, `session.prompt`, catalog shape) before it can
-be declared supported. This boundary is deliberate honesty, not a bug.
+be declared supported. Native agent contribution
+(`ctx.agent.transform`, update-on-missing semantics, Markdown precedence,
+lazy per-location activation) is verified live on v2.2.5 and recorded in
+`docs/opencode-install-and-config-plan.md`; on hosts without that surface the
+plugin skips contribution silently and the legacy agent files below are
+required. This boundary is deliberate honesty, not a bug.
 
-1. Install the package and load the plugin through the `./opencode` entry —
-   a project-local discovered plugin that re-exports it:
+### Legacy manual install (Pi package + copied agents)
+
+1. Install the Pi-shaped package and load the plugin through the `./opencode`
+   entry — a project-local discovered plugin that re-exports it:
    ```ts
    // .opencode/plugins/fusion.ts
    export { default } from "pi-fusion-extension/opencode";
@@ -126,9 +185,13 @@ be declared supported. This boundary is deliberate honesty, not a bug.
    - `fusion-executor.md` — subagent that implements the decided brief and is
      denied every Fusion control except its tool surface.
    - `fusion-scout.md` — read-only investigation subagent.
-   The agent files ship in the published package
-   (`node_modules/pi-fusion-extension/examples/opencode/agents/` in an
-   install; `examples/opencode/agents/` in this checkout).
+   The agent files are generated from the same definitions the plugin
+   contributes natively (`src/opencode/agents.ts`; regenerate with
+   `bun run generate:agent-markdown`, kept in sync by
+   `test/opencode-agents.test.ts`) and ship in both packages
+   (`node_modules/pi-fusion-extension/examples/opencode/agents/` or
+   `node_modules/fusion-opencode/examples/opencode/agents/` in an install;
+   `examples/opencode/agents/` in this checkout).
    These are the exact agent files the live parity fixture ran with
    (`opencode-go/glm-5.3-flash`, OpenCode v2.2.5). Other permission
    inheritance shapes remain unverified.
@@ -144,10 +207,18 @@ be declared supported. This boundary is deliberate honesty, not a bug.
 | --- | --- | --- |
 | `FUSION_OWNERSHIP_DIR` | Directory of the cross-process workspace-claim registry (SQLite). Must be a private directory owned by the current user (mode 0700), and **the same for every Pi and OpenCode process working on the same workspaces** | `~/.local/state/fusion/ownership` |
 
-Model/variant selection is not an env var: `fusion_configure` (OpenCode
-plugin tool) and `fusion-config` (Pi command) validate a model against the
-live catalog of the installed host and apply it, shared price/cohort metadata
-reported. Configure also reaches the scout and executor submissions.
+Model/variant selection is not an env var: on OpenCode, the `/fusion-config`
+command (`/fusion-config` shows the saved preference and syntax;
+`/fusion-config list [filter]` lists catalog choices with variants, bounded to
+40 lines; `/fusion-config <provider>/<model> [variant]` selects — split on the
+first slash so model IDs containing slashes work) and the `fusion_configure`
+tool the supervisor can call share one serialized operation that validates
+against the live host catalog before mutating anything, persists the
+preference across restarts, and applies it to the current run only while no
+executor/scout work has started (otherwise it is saved for the next run).
+Invalid input changes nothing. On Pi, `fusion-config` is the equivalent
+command. The executor and the scout share the chosen model; the supervisor's
+model stays the host's own selector.
 
 ## Operating
 
@@ -213,9 +284,8 @@ bunx --bun fusion-resolve <workspace> <run-id> <request-id|--no-request-id> --co
 ```
 
 (The bin has a `#!/usr/bin/env bun` shebang, so the TypeScript executes
-under bun in both forms.) Honest limitation: the text quoted inside the
-tool presentation assumes the checkout install — the only live-verified
-shape so far; on a package install, follow the presented arguments through
+under bun in both forms.) The text quoted inside the tool presentation
+assumes the checkout install; on a package install, follow the presented arguments through
 one of the bin invocations above.
 
 Pass the run's pending request id when one exists; pass `--no-request-id`
@@ -240,10 +310,28 @@ Model-free (always safe to run):
 | Types | `bun run typecheck` |
 | OpenCode registration/catalog/configure/run-start smoke (v2.2.x host) | `bun run test:opencode-smoke` |
 | Pi extension install-shim load | `bun run test:pi-load` |
+| Native agent/command surfaces, reload, and isolated package-manager removal/reinstall (OpenCode v2.2.5) | `bun run test:opencode-native` |
+| Dedicated package load, configuration persistence across restart, recovery CLI, and legacy-agent coexistence | `bun run test:opencode-package-load` |
 | Real cross-process workspace-claim hold | `bun run test:ownership-cross-process` |
 | Dependency contract (entrypoints, closure isolation, consumer pins) | `bun test test/package-isolation.test.ts` |
 | Clean-install smoke (local tarball, model-free, registry-free): bare consumer installs no Pi SDK, loads `./opencode`, Pi entry honestly refused | `bun run test:clean-install` |
 | Parse-only syntax gate (Bun-native, replaces `node --check`) | `bun run test:syntax` |
+
+To verify one dedicated artifact throughout acceptance, build and pack it once:
+
+```sh
+bun run build:opencode-package
+npm pack ./dist/fusion-opencode --pack-destination dist
+export FUSION_OPENCODE_TARBALL="$PWD/dist/fusion-opencode-$(bun -p 'require("./package.json").version').tgz"
+bun run test:opencode-package-load
+```
+
+Keep that variable set for `bun run test:opencode-parity` below. Both reports
+record its SHA-256, so the model-free and live results can be matched to the
+same tarball. Parity uses existing provider credentials in an isolated test
+workspace and consumes model usage. The native package-manager fixture uses
+a throwaway Git probe package; direct Git installation of this repository
+remains deferred.
 
 Network/opt-in (consumes something — registry or model usage):
 
