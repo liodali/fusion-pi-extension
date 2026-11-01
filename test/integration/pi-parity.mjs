@@ -38,6 +38,7 @@ import { homedir, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { writeArtifact } from "./artifact.mjs";
 
 const repo = resolve(import.meta.dir, "../..");
 const args = process.argv.slice(2);
@@ -336,10 +337,14 @@ try {
 
 	result.ok = true;
 	result.sessionHash = createHash("sha256").update(JSON.stringify(result.phases)).digest("hex").slice(0, 12);
+	const piSdk = JSON.parse(await readFile(join(repo, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version;
+	result.versions = { "pi-coding-agent": piSdk, bun: Bun.version };
+	result.artifact = await writeArtifact("pi-parity", result);
 	console.log(JSON.stringify(result, null, 2));
 } catch (error) {
 	result.ok = false;
 	result.error = String(error?.stack ?? error);
+	try { result.artifact = await writeArtifact("pi-parity", result); } catch {}
 	console.log(JSON.stringify(result, null, 2));
 	process.exitCode = 1;
 } finally {

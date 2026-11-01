@@ -10,6 +10,7 @@ import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { writeArtifact } from "./artifact.mjs";
 import { setTimeout as delay } from "node:timers/promises";
 import { Database } from "bun:sqlite";
 
@@ -40,8 +41,9 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   // Every recorded entry carries a shared monotonic sequence number: the
   // fixture scopes summary text and review/audit evidence to run windows by
   // sequence, so a reused session can never serve a previous run's evidence.
-  const record = { n: 0, configure: null, sessionSurface: { prompt: "missing", switchAgent: "missing", synthetic: "missing" }, timeline: [], failedCalls: [], textsEntries: [], terminals: [], usageEvents: 0, failed: [] };
+  const record = { n: 0, configure: null, appVersion: null, sessionSurface: { prompt: "missing", switchAgent: "missing", synthetic: "missing" }, timeline: [], failedCalls: [], textsEntries: [], terminals: [], usageEvents: 0, failed: [] };
   let seq = 0;
+  record.appVersion = ctx.app?.version ?? null;
   record.sessionSurface = { prompt: typeof ctx.session.prompt, switchAgent: typeof ctx.session.switchAgent, synthetic: typeof ctx.session.synthetic };
   const write = async () => { record.n = seq; await writeFile(join(ctx.location.directory, "parity-observer.json"), JSON.stringify(record)); };
   await ctx.tool.hook("execute.after", async (event) => {
@@ -161,6 +163,13 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   const get = (path) => fetch(`${url}${path}`, { headers: { authorization: authHeader }, signal: AbortSignal.timeout(15000) });
   const activated = await get("/api/location");
   assert.equal(activated.status, 200, `Location activation failed (${activated.status})`);
+  // Host version for the sanitized artifact: the in-host observer records
+  // ctx.app.version; the serve API is tried as a fallback; "unknown" is the
+  // honest floor.
+  let hostVersion = "unknown";
+  try { const versionResponse = await get("/api/version"); if (versionResponse.ok) hostVersion = (await versionResponse.json())?.version ?? hostVersion; } catch {}
+  if (hostVersion === "unknown") { const banner = startup.match(/\bv2\.\d+\.\d+\b/); if (banner) hostVersion = banner[0]; }
+  result.versions = { opencodeHost: hostVersion, bun: Bun.version };
   observerPath = join(project, "parity-observer.json");  const readObserver = async () => { try { return JSON.parse(await readFile(observerPath, "utf8")); } catch { return null; } };
   {
     const observerDeadline = Date.now() + 30000;
@@ -171,6 +180,8 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
     assert.equal(observer.configure.applied, "now", `Configure did not apply to the run handle: ${JSON.stringify(observer.configure)}`);
     result.configure = observer.configure;
     result.sessionSurface = observer.sessionSurface;
+    if (hostVersion === "unknown" && observer.appVersion) hostVersion = observer.appVersion;
+    result.versions = { opencodeHost: hostVersion, bun: Bun.version };
   }
   const created = await post("/api/session", { model: { providerID: provider, id: modelId }, ...(variant ? { variant } : {}) });
   assert.equal(created.status, 200, `Session create failed (${created.status})`);
@@ -417,13 +428,18 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   assert.ok(clean2.includes("Released Fusion resources for this session.") || clean2.includes("Released settled Fusion ownership for this workspace."), `Run 2 clean said ${clean2}`);
   const secrets = [...Object.values(auth[provider] ?? {}), goKey].filter((value) => typeof value === "string" && value.length > 12);
   const redact = (value) => secrets.reduce((text, secret) => text.split(secret).join("[redacted]"), value);
-  console.log(JSON.stringify(JSON.parse(redact(JSON.stringify(result)))));
+  const redactedResult = JSON.parse(redact(JSON.stringify(result)));
+  redactedResult.ok = true;
+  redactedResult.artifact = await writeArtifact("opencode-parity", redactedResult);
+  console.log(JSON.stringify(redactedResult));
 } catch (error) {
   // Evidence first: dump everything in-flight before the disposable root goes.
   try {
     const observer = observerPath ? JSON.parse(await readFile(observerPath, "utf8")) : null;
     console.error(`PARITY FAILURE: ${String(error?.message ?? error)}`);
     console.error(JSON.stringify({ result, observer, serverLog: startup.slice(-4000) }, null, 1).slice(0, 16000));
+    result.ok = false;
+    await writeArtifact("opencode-parity", result);
   } catch {}
   throw error;
 } finally {

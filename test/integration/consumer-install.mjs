@@ -44,6 +44,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { writeArtifact } from "./artifact.mjs";
 
 const repo = resolve(import.meta.dirname, "../..");
 
@@ -223,6 +224,8 @@ const run = async () => {
 };
 
 const result = await run();
+result.tools = { bun: Bun.version, npm: spawnSync("npm", ["--version"], { encoding: "utf8" }).stdout?.trim() ?? "unavailable" };
+try { result.artifact = await writeArtifact("consumer-install", result); } catch {}
 const outPath = process.argv[2];
 if (outPath) await writeFile(outPath, `${JSON.stringify(result, null, 2)}\n`);
 console.log(JSON.stringify(result, null, 2));

@@ -219,6 +219,7 @@ Model-free (always safe to run):
 | Pi extension install-shim load | `bun run test:pi-load` |
 | Real cross-process workspace-claim hold | `bun run test:ownership-cross-process` |
 | Dependency contract (entrypoints, closure isolation, consumer pins) | `bun test test/package-isolation.test.ts` |
+| Clean-install smoke (local tarball, model-free, registry-free): bare consumer installs no Pi SDK, loads `./opencode`, Pi entry honestly refused | `bun run test:clean-install` |
 | Parse-only syntax gate (Bun-native, replaces `node --check`) | `bun run test:syntax` |
 
 Network/opt-in (consumes something — registry or model usage):
@@ -229,6 +230,17 @@ Network/opt-in (consumes something — registry or model usage):
 | Full OpenCode parity workflow live (`opencode-go/glm-5.3-flash`, two runs) | `bun run test:opencode-parity` |
 | Full Pi acceptance workflow live (real Pi SDK executor/scout sessions; supervisor fixture-driven — real-worker integration, not native supervisor acceptance; `--model zai/glm-5.3-flash`, `--supervisor opencode-go/gemini-4-argon` defaults) | `bun run test:pi-parity` |
 
-The parity fixture writes its observation record (versions, model, timeline,
-scoped assertions, usage totals) next to its session directory; sanitized,
-formalized integration artifacts arrive with M7.4.
+### Integration artifacts
+
+Every integration fixture writes a **sanitized artifact** to `artifacts/`
+under the repository root (local-only, gitignored; override with
+`FUSION_ARTIFACT_DIR`): `test:clean-install`, `test:consumer-install`,
+`test:opencode-parity`, and `test:pi-parity` each emit
+`artifacts/<fixture>-<timestamp>.json` on success and failure. Artifacts use
+one schema (`fusion-integration-artifact/1`) and carry the fixture name,
+generation time, tool versions (bun/node; manager versions for consumer
+installs; `pi-coding-agent` for Pi runs; the OpenCode host version for
+parity runs), the model(s) used, run/request/child identities, the scoped
+assertions, and the outcomes. Sanitization: absolute user and temp paths are
+reduced to markers, the parity fixtures redact credential material before
+writing, and artifacts never contain transcript bodies or prompt text.
