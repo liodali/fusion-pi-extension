@@ -31,9 +31,10 @@ let observerPath;
 // console dumps and artifact writes alike — passes through redactAll.
 let collectedSecrets = [];
 const knownSecrets = () => [...new Set(collectedSecrets)].filter((value) => typeof value === "string" && value.length > 0);
+const redactText = (text) => knownSecrets().reduce((accumulated, secret) => accumulated.split(secret).join("[redacted]"), String(text));
 const redactAll = (value) => JSON.parse(JSON.stringify(value, (_key, item) => {
   if (typeof item !== "string") return item;
-  return knownSecrets().reduce((text, secret) => text.split(secret).join("[redacted]"), item);
+  return redactText(item);
 }));
 try {
   const project = join(root, "project");
@@ -461,19 +462,42 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   // goes — through the same credential redaction as the success path, so
   // the boot banner's announced password, the provider key, and the derived
   // authorization header can never leak through failure diagnostics.
+  // Observer loading is BEST-EFFORT and isolated: a missing or malformed
+  // observer record must not skip the console dump or the failure artifact.
+  let observer = null;
+  let observerNote = null;
+  if (observerPath) {
+    try {
+      observer = JSON.parse(await readFile(observerPath, "utf8"));
+    } catch (observerError) {
+      observerNote = String(observerError?.message ?? observerError);
+    }
+  }
   try {
-    const observer = observerPath ? JSON.parse(await readFile(observerPath, "utf8")) : null;
-    console.error(`PARITY FAILURE: ${String(error?.message ?? error)}`);
-    console.error(JSON.stringify(redactAll({ result, observer, serverLog: startup.slice(-4000) }), null, 1).slice(0, 16000));
-    result.ok = false;
+    console.error(`PARITY FAILURE: ${redactText(String(error?.message ?? error))}`);
+    console.error(JSON.stringify(redactAll({ result, observer, observerNote, serverLog: startup.slice(-4000) }), null, 1).slice(0, 16000));
+  } catch {}
+  result.ok = false;
+  try {
     await writeArtifact("opencode-parity", result, { secrets: knownSecrets() });
   } catch {}
-  throw error;
+  // The terminal failure output is redacted too, and the original error is
+  // never rethrown: an error message can embed credentials (a boot-timeout
+  // message quotes the boot log, which carries the announced password), and
+  // an uncaught rethrow would print it raw on the way out.
+  console.error(redactText(error?.stack ?? error));
+  process.exitCode = 1;
 } finally {
   if (child && child.exitCode === null) {
     child.kill("SIGTERM");
     await Promise.race([new Promise((resolve) => child.once("exit", resolve)), delay(2000)]);
-    if (child.exitCode === null) { child.kill("SIGKILL"); await new Promise((resolve) => child.once("exit", resolve)); }
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      // Bounded too: a child that failed to spawn never emits "exit", and
+      // an unbounded wait here would hang the fixture forever (observed
+      // live on the ENOENT failure path).
+      await Promise.race([new Promise((resolve) => child.once("exit", resolve)), delay(2000)]);
+    }
   }
   await rm(root, { recursive: true, force: true });
 }
