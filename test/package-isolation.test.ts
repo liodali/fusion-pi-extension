@@ -81,6 +81,7 @@ test("published entrypoints pi and opencode exist and stay on their own side of 
 	expect(pkg.exports["."]).toBe("./src/index.ts");
 	expect(pkg.exports["./pi"]).toBe("./src/index.ts");
 	expect(pkg.exports["./opencode"]).toBe("./src/opencode/index.ts");
+	expect(pkg.exports["./server"]).toBe(pkg.exports["./opencode"]);
 	for (const [key, target] of Object.entries(pkg.exports)) {
 		if (key === "./package.json") continue;
 		expect(existsSync(resolve(root, target))).toBe(true);

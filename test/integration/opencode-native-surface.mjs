@@ -13,9 +13,9 @@
 // No model is called and no session prompt is sent.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { writeArtifact } from "./artifact.mjs";
 
 const bin = process.env.FUSION_OPENCODE_BIN || "opencode";
@@ -165,7 +165,8 @@ export default {
 	// ---------- Phase B: native package manager over a Git source ----------
 	const pkgSrc = join(root, "b-pkg");
 	await mkdir(pkgSrc, { recursive: true });
-	await writeFile(join(pkgSrc, "package.json"), `${JSON.stringify({ name: "fusion-native-surface-pkg", version: "0.0.1", type: "module", exports: { ".": "./index.ts" } }, null, 2)}\n`);
+	await writeFile(join(pkgSrc, "package.json"), `${JSON.stringify({ name: "fusion-native-surface-pkg", version: "0.0.1", type: "module", exports: { ".": "./other-harness.ts", "./server": "./index.ts" } }, null, 2)}\n`);
+	await writeFile(join(pkgSrc, "other-harness.ts"), 'throw new Error("OpenCode must prefer ./server over the other harness default");\n');
 	await writeFile(join(pkgSrc, "index.ts"), `export default {
 	id: "probe-package",
 	async setup(ctx) {
@@ -247,6 +248,37 @@ export default {
 			const reinstalledCommands = commandsOf(await reinstalledServer.get("/api/command"));
 			check("reinstall restores exactly one package agent and command", reinstalledAgents.filter((agent) => agent?.id === "pkg-created").length === 1 && reinstalledCommands.filter((command) => command?.name === "pkg-command").length === 1);
 		}
+	}
+	// ---------- Phase C: Fusion's real dual-harness Git package ----------
+	// Snapshot the package assets into a throwaway Git repository. Keep the
+	// exact root manifest (including the Pi default and optional peers), so
+	// this checks the shape a remote Git install actually receives.
+	const repo = resolve(import.meta.dirname, "../..");
+	const fusionSource = join(root, "fusion-source");
+	await mkdir(fusionSource, { recursive: true });
+	for (const asset of ["package.json", "src", "examples", "docs/install.md", ".pi/extensions/fusion.ts"]) {
+		await mkdir(join(fusionSource, asset, ".."), { recursive: true });
+		await cp(join(repo, asset), join(fusionSource, asset), { recursive: true });
+	}
+	assert.equal(git(["init", "-b", "main"], { cwd: fusionSource }).status, 0, "Fusion snapshot git init");
+	assert.equal(git(["-C", fusionSource, "add", "-A"]).status, 0, "Fusion snapshot git add");
+	assert.equal(git(["-C", fusionSource, "-c", "user.email=probe@example.com", "-c", "user.name=probe", "commit", "-m", "Fusion package snapshot"]).status, 0, "Fusion snapshot git commit");
+	const fusionSpec = `git+file://${fusionSource}#main`;
+	const envC = isolatedEnv({ XDG_CONFIG_HOME: join(root, "fusion-config"), XDG_DATA_HOME: join(root, "fusion-data"), XDG_STATE_HOME: join(root, "fusion-state"), XDG_CACHE_HOME: join(root, "fusion-cache"), FUSION_OWNERSHIP_DIR: join(root, "fusion-ownership") });
+	const fusionAdd = spawnSync(bin, ["plugin", "add", fusionSpec], { env: envC, cwd: root, encoding: "utf8", timeout: 120000 });
+	check("Fusion's real Git package installs", fusionAdd.status === 0, `${fusionAdd.stdout ?? ""}${fusionAdd.stderr ?? ""}`.split("\n").slice(-4).join(" | "));
+	result.phaseC = { addExit: fusionAdd.status };
+	if (fusionAdd.status === 0) {
+		const fusionProject = join(root, "fusion-project");
+		await mkdir(fusionProject, { recursive: true });
+		const fusionServer = await start(fusionProject, envC);
+		const fusionAgents = agentsOf(await fusionServer.get("/api/agent"));
+		const fusionCommands = commandsOf(await fusionServer.get("/api/command"));
+		const fusionPlugins = agentsOf(await fusionServer.get("/api/plugin"));
+		check("Git Fusion contributes all three agents without copied Markdown", ["fusion", "fusion-executor", "fusion-scout"].every((id) => fusionAgents.filter((agent) => agent?.id === id).length === 1));
+		check("Git Fusion registers its configuration command", fusionCommands.some((command) => command?.name === "fusion-config"));
+		check("Git Fusion loads the server export as an active package plugin", fusionPlugins.some((plugin) => plugin?.id === "fusion" && plugin?.state?.status === "active" && plugin?.source?.type === "package"));
+		result.phaseC.version = JSON.parse(await readFile(join(fusionSource, "package.json"), "utf8")).version;
 	}
 	result.ok = failures.length === 0;
 	result.failures = failures;

@@ -40,7 +40,17 @@ flowchart LR
 
 ### OpenCode quick start
 
-Use OpenCode **2.2.3–2.2.5** and Bun. To get an installable package:
+For Fusion **0.1.1+**, use OpenCode **2.2.5** and Bun for native Git installation:
+
+```sh
+opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.1'
+```
+
+Restart OpenCode, then use `/fusion-config` and `/fusion-run <task>`. The
+plugin registers all three agents automatically. The version tag must exist
+on GitHub; older tags lack the OpenCode server export.
+
+Alternatively, download a package artifact (OpenCode **2.2.3–2.2.5**):
 
 1. Open this repository's **Actions → Package OpenCode plugin** workflow.
 2. Select **Run workflow**, or open a successful run for a `v*` tag or relevant pull request.
@@ -54,7 +64,7 @@ replacing the tarball path with your download:
 
 ```sh
 cd /path/to/your/project
-bun add /path/to/fusion-opencode-0.1.0.tgz
+bun add /path/to/fusion-opencode-0.1.1.tgz
 ```
 
 Then add the plugin to your project's `opencode.json(c)`. **Append to the

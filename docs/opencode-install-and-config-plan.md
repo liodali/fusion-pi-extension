@@ -3,10 +3,10 @@
 Status: steps 1-5 complete. Step 1 live-probed on OpenCode v2.2.5; steps 2-4
 implemented and covered by unit tests and model-free host fixtures; step 5's
 integrated acceptance passed, including the opt-in model workflow on the
-installed package. The step-2 Git-source install bullet remains explicitly
-deferred (npm publication enables registry installation, not Git installation).
-The version bump and tag are pending
-release actions — v0.1.0 is not retagged.
+installed package. Git-source installation is now verified through the root
+package's explicit `./server` export on OpenCode v2.2.5. Version 0.1.1 is
+prepared; commit/push, tagging, and publication remain release actions.
+v0.1.0 is not retagged.
 
 ## Outcome
 
@@ -149,21 +149,14 @@ Implications carried into steps 2-4:
   OpenCode or install the Pi stack for OpenCode users.
 - [x] Include the full shared import closure and required agent resources;
   resolve resources relative to the installed module, never the caller's cwd.
-- [ ] Provide native Git-install packaging if a repository subdirectory is used:
-  the committed package or its preparation step must work outside this checkout.
-  **Deferred** — no committed subdirectory exists and the repository is not
-  Git-installable as a Fusion package today. Live experiments on OpenCode
-  v2.2.5 (bun-based installer, 2026-11-01): a thin committed subpackage whose
-  entry re-exports a `file:../..` root dependency installs but the dependency
-  is not packed, so the plugin cannot load; the same subpackage with a
-  `prepare` script fails outright ("git dep preparation failed" — the script
-  never runs); only a self-contained package in the Git source installs and
-  contributes (proven in step 1). A committed self-contained
-  `packages/fusion-opencode` would work but duplicates the shared `src` tree
-  (drift risk; needs a CI sync check). Unblocked by npm publication —
-  `opencode plugin add fusion-opencode` from the registry uses the same
-  installer path proven in step 1 — or by committing a generated package
-  directory if Git-from-GitHub installs are wanted before publication.
+- [x] Provide native Git-install packaging. The root package now exports
+  `./server` → `src/opencode/index.ts`, which OpenCode v2.2.5 prefers over
+  the Pi default export. No generated subdirectory or preparation hook is
+  needed. The earlier thin-subpackage/prepare experiments failed; this
+  explicit server export supersedes that approach. The native fixture tests
+  export precedence with a deliberately failing default, then installs a
+  Git snapshot of Fusion's actual manifest/assets and discovers all three
+  agents and `/fusion-config` from the active package plugin.
 - [x] Update Actions to build the dedicated tarball, checksums, and install
   evidence. Test the exact tarball uploaded, not a separately repacked copy.
 
@@ -172,17 +165,16 @@ SDKs; the legacy Pi and OpenCode entrypoints retain their current behavior.
 The native loader installs and loads the package from the supported source.
 Npm publication and release creation are separate actions from artifact builds.
 
-**Status: implemented and verified; Git-source install deferred** —
+**Status: implemented and verified, including root Git-source installation** —
 `scripts/build-opencode-package.mjs` materializes `dist/fusion-opencode`
 (shared `src` closure, generated agent Markdown, install guide, the
 `fusion-resolve` bin; `exports["."]` → `src/opencode/index.ts`; no
 dependencies). `fusion-opencode` is unclaimed on npm (checked 2026-11-01).
 No repository subdirectory is committed: the preparation step
 (`build:opencode-package` + `npm pack ./dist/fusion-opencode`) works outside
-this checkout. Git installs of this repository are **not** available until
-a self-contained package directory is committed; publishing enables npm
-installation instead — see
-the deferred bullet above for the live experiment record. The workflow builds
+this checkout. The root Git package loads through its explicit server export;
+the remote GitHub install becomes available after these changes are pushed.
+The workflow builds
 and checksums both tarballs and runs `test:opencode-package-load` against the
 exact uploaded tarball (`FUSION_OPENCODE_TARBALL`). Verified live on v2.2.5:
 bare consumer install pulls no Pi SDKs, the package loads through the native
@@ -353,9 +345,30 @@ release actions, not taken here.
   The workflow changes were validated locally; a hosted Actions run is still
   part of delivery after commit/push. Model-consuming parity remains opt-in.
 
-Git-source installation of this Fusion repository stays deferred; the native
-manager probe verifies its host mechanism with a self-contained throwaway
-package. No npm publication, version change, tag, commit, or push was made.
+At this revalidation, Git-source installation was still deferred and no
+release actions were taken. The subsequent 0.1.1 preparation below resolves
+the Git-source packaging gap.
+
+### Version 0.1.1 preparation
+
+- Root version bumped to 0.1.1; the dedicated package inherits that version.
+- The root keeps the Pi default and adds `./server` for OpenCode. Package
+  isolation asserts the alias, and Pi load still passes.
+- The native fixture proves OpenCode v2.2.5 prefers `./server` over a failing
+  default, installs Fusion's actual package assets from a temporary Git
+  repository, and discovers its agents/configuration command.
+- Documented the version-pinned GitHub command for use after the release
+  tag exists: `opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.1'`.
+- No model runtime changed in this preparation; the previous live workflow
+  remains the runtime acceptance evidence. The new package version receives
+  fresh model-free package and Git-install checks. No commit/push, tag, or
+  npm publication is performed by version preparation.
+- 0.1.1 validation: 404 tests and typecheck passed; Pi loading and package
+  isolation passed. Native Git evidence:
+  `artifacts/opencode-native-surface-2026-11-01T204920-930Z.json`
+  (`phaseC.addExit: 0`, `phaseC.version: 0.1.1`). Dedicated-tarball evidence:
+  `artifacts/opencode-package-load-2026-11-01T205026-327Z.json` (`ok: true`).
+  Both versioned tarballs and `SHA256SUMS` are available in `dist/`.
 
 ## References
 

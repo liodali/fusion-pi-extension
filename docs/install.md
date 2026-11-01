@@ -81,6 +81,25 @@ the host; the ownership registry is shared across harnesses (below).
 
 ## Installing for OpenCode
 
+### Native Git install (Fusion 0.1.1+, OpenCode v2.2.5)
+
+```sh
+opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.1'
+```
+
+This installs into OpenCode's global plugin configuration. Restart OpenCode
+in your workspace, then use `/fusion-config` and `/fusion-run <task>`.
+All three agents are registered automatically; no wrapper or Markdown copy
+is needed. Remove any previous Fusion wrapper before enabling the package.
+The referenced release tag must exist on GitHub. To use the development
+branch after these changes are pushed, replace `#v0.1.1` with `#main`.
+
+The Git package preserves its Pi default export and supplies OpenCode through
+`exports["./server"]`, which OpenCode v2.2.5 prefers over `exports["."]`.
+The model-free native fixture verifies this with Fusion's actual package
+assets in a throwaway Git repository, in addition to the Pi load checks.
+The dedicated artifact/npm package below remains supported.
+
 There are two supported shapes: the **dedicated `fusion-opencode` package**
 (preferred — the plugin contributes its agents itself, nothing to copy) and
 the **legacy manual install** (copy the agent Markdown files yourself). Do
@@ -148,13 +167,10 @@ uploads `fusion-opencode-<commit>` containing both package tarballs
 (`pi-fusion-extension` and `fusion-opencode`) plus `SHA256SUMS`.
 
 This workflow uploads build artifacts; it does not publish to npm or create a
-GitHub release. `opencode plugin add` needs a published npm package; installing
-this plugin directly from this repository's Git source is **not** supported
-(subpath Git packages that reference the repository root do not install on
-OpenCode's bun-based installer — the live experiments are recorded in
-`docs/opencode-install-and-config-plan.md`, step 2). Until the package is
-published, the artifact path above configures the local `node_modules`
-directory through `opencode.json` instead.
+GitHub release. `opencode plugin add` accepts Git sources as shown above and
+published npm packages; it does not accept the downloaded tarball directly.
+The artifact path configures the installed local `node_modules` directory
+through `opencode.json` instead.
 
 **Supported versions: OpenCode v2.2.3 – v2.2.5.** The plugin API is
 hand-mirrored in `src/opencode/index.ts` — there is no `@opencode-ai`
@@ -330,8 +346,8 @@ Keep that variable set for `bun run test:opencode-parity` below. Both reports
 record its SHA-256, so the model-free and live results can be matched to the
 same tarball. Parity uses existing provider credentials in an isolated test
 workspace and consumes model usage. The native package-manager fixture uses
-a throwaway Git probe package; direct Git installation of this repository
-remains deferred.
+a throwaway Git probe package and a snapshot of Fusion's real dual-harness
+package; neither check changes your global OpenCode configuration.
 
 Network/opt-in (consumes something — registry or model usage):
 
