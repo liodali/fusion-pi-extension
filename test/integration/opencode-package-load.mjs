@@ -139,7 +139,7 @@ export default { id: "fusion-load-probe", async setup(ctx) {
 			if (!(invoked.status >= 200 && invoked.status < 300)) return { status: invoked.status, text: null };
 			for (let i = 0; i < 40; i++) {
 				const inbox = await get(`/api/session/${sessionID}/inbox`);
-				const entry = (inbox?.data ?? []).find((candidate) => candidate?.type === "synthetic" && candidate?.payload?.description === description && typeof candidate?.payload?.text === "string");
+				const entry = (inbox?.data ?? []).find((candidate) => candidate?.type === "synthetic" && candidate?.payload?.description === `${description}\n${candidate?.payload?.text}` && typeof candidate?.payload?.text === "string");
 				if (entry) return { status: invoked.status, text: entry.payload.text };
 				await new Promise((resolve) => setTimeout(resolve, 300));
 			}

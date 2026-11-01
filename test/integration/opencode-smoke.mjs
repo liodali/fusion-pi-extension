@@ -142,7 +142,7 @@ export default {
 		const response = await fetch(`${url}/api/session/${commandSessionID}/inbox`, { headers: { authorization: authHeader2 } });
 		assert.equal(response.status, 200, "Could not inspect the command output inbox");
 		const inbox = await response.json();
-		return (inbox.data ?? []).find((entry) => entry.type === "synthetic" && entry.payload?.description === description && typeof entry.payload?.text === "string") ?? null;
+		return (inbox.data ?? []).find((entry) => entry.type === "synthetic" && entry.payload?.description === `${description}\n${entry.payload?.text}` && typeof entry.payload?.text === "string") ?? null;
 	};
 	await runCommand("fusion-status", "");
 	let statusEntry = null;

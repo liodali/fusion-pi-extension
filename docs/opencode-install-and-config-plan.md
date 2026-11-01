@@ -370,6 +370,22 @@ the Git-source packaging gap.
   `artifacts/opencode-package-load-2026-11-01T205026-327Z.json` (`ok: true`).
   Both versioned tarballs and `SHA256SUMS` are available in `dist/`.
 
+## Post-release command display correction
+
+The v0.1.1 TUI displayed only the labels "Fusion config" / "Fusion config
+models". OpenCode v2.2.5's `SessionNoticeMessageV2` renders a synthetic
+message's `description`, not its `text`. Inbox-only assertions missed this.
+The shared command reporter now puts the full report in both fields (title
+plus body in `description`) and still uses `resume: false`. Tests require
+the body in the visible field for configuration, catalog, and other command
+reports. Verified with 75 plugin tests, typecheck, installed-package checks,
+and a private native TUI session showing configuration details and model IDs
+with variants from `/fusion-config list`, without model execution. Evidence
+is recorded under `artifacts/opencode-command-display-*.json`.
+
+This correction is prepared as version 0.1.2, with installation examples
+updated to the new tag. v0.1.1 remains unchanged.
+
 ## References
 
 - Native installation and package sources: https://dev.opencode.ai/v2/docs/plugins/

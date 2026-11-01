@@ -254,7 +254,7 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   };
   const latestPayloadOn = async (sid, description) => {
     const inbox = await (await get(`/api/session/${sid}/inbox`)).json();
-    const entries = (inbox.data ?? []).filter((entry) => entry.type === "synthetic" && entry.payload?.description === description);
+    const entries = (inbox.data ?? []).filter((entry) => entry.type === "synthetic" && entry.payload?.description === `${description}\n${entry.payload?.text}`);
     return entries.length ? entries[entries.length - 1].payload : undefined;
   };
   const commandPayloadOn = async (sid, name, description, text = "") => {

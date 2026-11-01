@@ -84,7 +84,7 @@ the host; the ownership registry is shared across harnesses (below).
 ### Native Git install (Fusion 0.1.1+, OpenCode v2.2.5)
 
 ```sh
-opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.1'
+opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.2'
 ```
 
 This installs into OpenCode's global plugin configuration. Restart OpenCode
@@ -92,7 +92,7 @@ in your workspace, then use `/fusion-config` and `/fusion-run <task>`.
 All three agents are registered automatically; no wrapper or Markdown copy
 is needed. Remove any previous Fusion wrapper before enabling the package.
 The referenced release tag must exist on GitHub. To use the development
-branch after these changes are pushed, replace `#v0.1.1` with `#main`.
+branch after these changes are pushed, replace `#v0.1.2` with `#main`.
 
 The Git package preserves its Pi default export and supplies OpenCode through
 `exports["./server"]`, which OpenCode v2.2.5 prefers over `exports["."]`.

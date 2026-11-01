@@ -1,6 +1,6 @@
 {
   "name": "pi-fusion-extension",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Supervisor-executor orchestration extension for Pi and OpenCode",
   "type": "module",
   "keywords": [

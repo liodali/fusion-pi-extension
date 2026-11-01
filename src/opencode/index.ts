@@ -1349,7 +1349,10 @@ export default {
 		// prompt is injected through session.prompt).
 		async function reportCommand(sessionID: string, description: string, content: string): Promise<string> {
 			if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output; use the Fusion status or stats tool.");
-			await ctx.session.synthetic({ sessionID, text: content, description, resume: false });
+			// OpenCode 2.2.5's TUI renders synthetic messages from `description`
+			// only (SessionNoticeMessageV2); `text` alone is model/inbox content.
+			// Keep the full report visible without submitting a model turn.
+			await ctx.session.synthetic({ sessionID, text: content, description: `${description}\n${content}`, resume: false });
 			return content;
 		}
 		const commandRegistration = await ctx.command?.transform?.((editor) => {

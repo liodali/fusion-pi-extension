@@ -210,7 +210,7 @@ describe("OpenCode Fusion plugin", () => {
 		fusionTurn("evt-turn-2", "Still investigating.");
 		await settle();
 		expect(nudges).toHaveLength(1);
-		expect(published.some((entry) => entry.description === "Fusion settlement issue")).toBe(true);
+		expect(published.some((entry) => entry.description?.startsWith("Fusion settlement issue\n"))).toBe(true);
 		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.nudgeDelivery).toBe("pending");
 		nudgeDeliveryFails = false;
@@ -367,13 +367,13 @@ describe("OpenCode Fusion plugin", () => {
 		failPrompt = true;
 		await settle("evt-2", "Still working.");
 		expect(nudges).toHaveLength(1);
-		expect(published.some((entry) => entry.description === "Fusion settlement issue")).toBe(true);
+		expect(published.some((entry) => entry.description?.startsWith("Fusion settlement issue\n"))).toBe(true);
 		expect(JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content).nudgeDelivery).toBe("pending");
 		// A retry while persistence is failing does not deliver an unrecorded nudge.
 		failPersist = true;
 		await settle("evt-3");
 		expect(nudges).toHaveLength(1);
-		expect(published.filter((entry) => entry.description === "Fusion settlement issue").length).toBeGreaterThanOrEqual(2);
+		expect(published.filter((entry) => entry.description?.startsWith("Fusion settlement issue\n")).length).toBeGreaterThanOrEqual(2);
 		// Persistence and transport recover: the retry delivers without consuming the budget twice.
 		failPersist = false;
 		failPrompt = false;
@@ -559,13 +559,13 @@ describe("OpenCode Fusion plugin", () => {
 		let status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.settlementWrite).toBe("pending");
 		expect(status.runActive).toBe(false);
-		expect(published.some((entry) => entry.description === "Fusion settlement issue")).toBe(true);
+		expect(published.some((entry) => entry.description?.startsWith("Fusion settlement issue\n"))).toBe(true);
 		// The next settlement retries the write and recovers.
 		failPersist = false;
 		await settle("evt-next");
 		status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
 		expect(status.settlementWrite).toBe("saved");
-		expect(published.filter((entry) => entry.description === "Fusion settlement issue")).toHaveLength(1);
+		expect(published.filter((entry) => entry.description?.startsWith("Fusion settlement issue\n"))).toHaveLength(1);
 	});
 
 	test("the nudge budget survives a reload", async () => {
@@ -705,7 +705,7 @@ describe("OpenCode Fusion plugin", () => {
 		});
 		await commands[3].execute({ sessionID: "one" });
 		await commands[4].execute({ sessionID: "one" });
-		expect(published).toEqual([{ sessionID: "one", description: "Fusion status", text: "No Fusion run in this session.", resume: false }, { sessionID: "one", description: "Fusion stats", text: "No Fusion run in this session.", resume: false }]);
+		expect(published).toEqual([{ sessionID: "one", description: "Fusion status\nNo Fusion run in this session.", text: "No Fusion run in this session.", resume: false }, { sessionID: "one", description: "Fusion stats\nNo Fusion run in this session.", text: "No Fusion run in this session.", resume: false }]);
 	});
 
 	test("persistent mode gates fusion tools per session until a run is active", async () => {
@@ -2202,7 +2202,7 @@ describe("/fusion-config command", () => {
 		await config.execute({ sessionID: "one" });
 		expect(published).toHaveLength(2);
 		for (const entry of published) {
-			expect(entry.description).toBe("Fusion config");
+			expect(entry.description).toBe(`Fusion config\n${entry.text}`);
 			expect(entry.text).toContain("Saved preference: none.");
 			expect(entry.text).toContain("no run in this session");
 			expect(entry.text).toContain("/fusion-config <provider>/<model> [variant]");
@@ -2217,7 +2217,7 @@ describe("/fusion-config command", () => {
 		const { config, published } = await harness(many);
 		await config.execute({ sessionID: "one", prompt: { text: "list" } });
 		const listing = published.at(-1)!;
-		expect(listing.description).toBe("Fusion config models");
+		expect(listing.description).toBe(`Fusion config models\n${listing.text}`);
 		expect(listing.text).toContain("showing the first 40");
 		expect(listing.text).toContain("Narrow the output with /fusion-config list <filter>");
 		await config.execute({ sessionID: "one", prompt: { text: "list slash" } });
