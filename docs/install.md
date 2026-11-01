@@ -81,6 +81,29 @@ the host; the ownership registry is shared across harnesses (below).
 
 ## Installing for OpenCode
 
+### Downloading a GitHub Actions package
+
+Run **Package OpenCode plugin** from the repository's Actions tab (Run
+workflow). The workflow also runs for `v*` tags and relevant pull requests.
+It checks package isolation and a clean consumer install, then uploads
+`fusion-opencode-<commit>` containing the package tarball and `SHA256SUMS`.
+Download and extract that artifact, then install it from your project:
+
+```sh
+sha256sum -c /path/to/extracted-artifact/SHA256SUMS # run from the extracted directory
+cd /path/to/your/project
+bun add /path/to/extracted-artifact/pi-fusion-extension-0.1.0.tgz
+mkdir -p .opencode/plugins .opencode/agents
+printf '%s\n' 'export { default } from "pi-fusion-extension/opencode";' > .opencode/plugins/fusion.ts
+cp node_modules/pi-fusion-extension/examples/opencode/agents/*.md .opencode/agents/
+```
+
+Use the tarball filename from your downloaded artifact if its version differs.
+Restart OpenCode in that project and start with `/fusion-run <task>`.
+This workflow uploads build artifacts; it does not publish to npm or create a
+GitHub release. The package contains both harness entrypoints; loading
+`/opencode` requires no Pi dependencies.
+
 **Supported versions: OpenCode v2.2.3 – v2.2.5.** The plugin API is
 hand-mirrored in `src/opencode/index.ts` — there is no `@opencode-ai`
 dependency — so an OpenCode release outside this range must be re-pinned and
