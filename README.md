@@ -1,62 +1,40 @@
 # Fusion for Pi and OpenCode
 
-A supervisor/executor orchestration extension for Pi and plugin for OpenCode, inspired by the Fusion architecture. The interactive session becomes a supervisor that plans, briefs, and reviews, while implementation and verification are delegated to a separate executor session. Both harnesses share the workflow policy, run manifests, workspace ownership, and report handling. Pi additionally offers price-tiered model selection and a curated cohort of recent coding models.
+Plan with a supervisor. Delegate implementation to an executor. Review the actual changes before finishing.
 
-This is an independent community project. It is not an official Cognition or Devin product and is not affiliated with either.
-
-## Install and operating guide
-
-Pi and OpenCode installation, agent setup, credentials, operating commands, and
-recovery directions are consolidated in [docs/install.md](docs/install.md): the
-package entrypoints (`pi-fusion-extension/opencode` for the OpenCode plugin,
-`pi-fusion-extension` / `/pi` for the Pi extension), what a consumer install
-pulls, supported OpenCode versions (v2.2.3–v2.2.5), the OpenCode agent files,
-the gateway credential pair, `FUSION_OWNERSHIP_DIR`, and the automatic /
-operator / blocked-boundary split of recovery (including the `fusion-resolve`
-operator CLI and the upstream restart deadline).
+Fusion runs as a **Pi extension** or an **OpenCode plugin**. Each agent has its own conversation and works in the same project directory.
 
 ## How it works
 
-The detailed UI and session descriptions below describe the Pi integration.
-OpenCode uses its native subagent executor and the commands in the
-[OpenCode quick start](#opencode-quick-start).
-
 ```mermaid
 flowchart LR
-    U[User] --> S[Supervisor<br/>interactive session]
-    S -->|fusion_delegate: execute brief| E[Executor<br/>in-memory Pi session]
-    E -->|reads, edits, checks| W[Shared working tree]
-    W -->|actual diff review| S
-    S -->|fusion_delegate: revise feedback, max 3| E
-    S -->|fusion_delegate: final_fix after acceptance audit, once| E
-    S -->|final summary| U
+    U[Your task] --> S[Supervisor: plan and review]
+    S -->|Self-contained brief| E[Executor: implement and verify]
+    S -->|Read-only questions| C[Scout: investigate]
+    C -->|Findings and file references| S
+    E --> W[Shared working tree]
+    W -->|Review actual changes| S
+    S -->|Revise when needed| E
+    S --> F[Final acceptance check and summary]
 ```
 
-The supervisor and executor are two separate model sessions. They do not share conversation context: everything the executor needs travels through the `fusion_delegate` tool as a self-contained brief, and everything it returns travels back as a report. What they share is the working directory — the executor runs its own Pi SDK session in the same `cwd`, so its file edits are immediately visible to the supervisor, which inspects the real working tree and diff rather than trusting the summary.
+## What you get
 
-No temporary Markdown files, `/tmp` files, or other on-disk communication channels are created. Coordination happens entirely through the tool call boundary.
+- **Separate roles:** the supervisor plans and reviews; the executor edits and runs checks.
+- **Independent model choices:** use a stronger supervisor and a cheaper executor. The scout uses the executor model.
+- **Read-only scouting:** investigate the codebase without filling the supervisor's context with search output.
+- **Review based on evidence:** structured worker reports, actual Git changes, check results, and blockers.
+- **Bounded revisions:** up to three revisions and one final fix before the closing summary.
+- **Visibility:** run status, token/cost accounting, and Pi progress displays. Missing usage is reported as incomplete.
+- **Recovery controls:** persisted run records and workspace ownership guard against conflicting work after an interruption.
 
-While the executor works, the Fusion widget and the `fusion_delegate` tool display show a bounded chronological work transcript: brief progress notes, tool calls with their targets, completion/failure entries, and truncated text results. Hidden thinking streams are never displayed — a `reasoning` status entry is all that surfaces. The transcript lives in the tool's display details and is not prepended to the model-facing result content, so it does not inflate the supervisor's context. Token and cost usage is tracked separately for the supervisor and the executor; the executor total covers the whole run, including revisions.
-
-The executor ends its final message with a fenced JSON report (`status`, `summary`, `files_changed`, `checks`, `blockers`). Fusion parses it leniently — the last ```json block wins, malformed entries are dropped, and missing or invalid output degrades to an `unknown` status with the raw prose kept. The model-facing tool result is a compact rendering of that report plus a diff stat computed by the extension: `git status --porcelain=v1 -z -uall` snapshots taken before and after the delegation are compared (files that were already dirty are also content-hashed, so untouched pre-existing edits are not attributed to the executor), `git diff HEAD --stat` runs over the modified and still-dirty touched paths so staged changes are included, untracked or staged-new files are listed as `new:` lines, and paths that were already dirty before the delegation are listed on a `pre-existing changes` line. A final `Review: light` or `Review: full (reasons)` line is computed by Fusion: light only when the report is `done`, every check passed, there are no blockers, and the diff is small — anything else gets a full review. The raw prose lives in the tool details, and the rendered row shows a color-coded report above the last lines of the transcript.
-
-A run only completes when the supervisor finishes its protocol: if it settles early — for example to ask the user a question — Fusion injects a continuation nudge (at most 2 per run) that points it back at the protocol instead of ending the run. The supervisor is instructed never to stop for user questions and to end the run with a final summary starting with the exact heading `## Fusion summary`, which is what lets the run settle cleanly.
-
-While planning or reviewing, the supervisor can also call `fusion_scout` with 1–5 read-only questions (at most 4 calls per run, and at most 20 tool calls per invocation — a capped scout returns whatever partial answer it produced). The scout runs on the executor model with its own configurable thinking level (default `low`, or the lowest supported level) in a disposable session restricted to `read`, `grep`, `find`, and `ls`, and answers with `path:line` citations, truncated to ~3000 characters. Scout usage is tracked separately and shown in the widget and `/fusion-status`.
-
-The `fusion_delegate` and `fusion_scout` tools are only exposed to the model while a Fusion run or Fusion mode is active; the extension syncs the active tool list on run start, run completion, mode toggles, `/fusion-clean`, and session lifecycle events.
-
-## Model tiers
-
-Selection is driven by each model's `cost.output` metadata: USD per million output tokens, as reported by Pi's model catalog.
-
-- Supervisor models must have a known output price at least $10/M.
-- Executor models must have an output price at or below $10/M.
-- A model priced at exactly $10/M appears in both selectors.
-- Models with missing, invalid, or unknown pricing qualify for the executor tier only.
-- On top of pricing, both tiers are restricted to a curated cohort of recent (2025–2026) coding model families. Pi exposes no release-date metadata, so the cohort is a maintained allowlist of patterns; older or undated models are hidden from selection entirely.
-
-The price threshold lives in `FUSION_OUTPUT_PRICE_THRESHOLD` in `src/pricing.ts`; the cohort patterns live in `RECENT_MODEL_PATTERNS` in `src/recent-models.ts`.
+| | Pi | OpenCode |
+| --- | --- | --- |
+| Worker runtime | Pi SDK sessions; optional Durable backend | Native subagent sessions |
+| Model selection | Price-tiered picker and curated model cohort | Host catalog through `fusion_configure` |
+| Start a task | `/fusion <task>` | `/fusion-run <task>` |
+| Persistent mode | `/fusion-mode` toggle | `/fusion-mode on` / `off` |
+| Dependencies | Compatible Pi host packages | No Pi SDK dependencies |
 
 ## Installation
 
@@ -123,119 +101,48 @@ The `pi.extensions` field in `package.json` points Pi at `./src/index.ts`.
 pi --extension ./src/index.ts
 ```
 
-## Pi commands
+## Commands at a glance
 
-| Command | Behavior |
-|---------|----------|
-| `/fusion-config` | Select the price-tiered supervisor and executor models from a searchable picker. For an already-configured role, a first step offers `Skip (keep …)` — reusing the existing model and thinking levels without further prompts — or `Change model`; unconfigured roles go straight to the picker. The picker names the current model in its title, lists it first with a `(current)` tag, shows the first five matching recent models with their output pricing, and filters the full cohort live as you type (matching provider, model name, or ID). After a newly chosen model, a second picker offers the thinking levels that model supports, highest first, with the top entry marked `(default)`; models that cannot reason skip the picker and use `off`. The executor model gets a third picker for the scout thinking level (default `low`, falling back to the lowest supported non-`off` level). Each resolved role is confirmed with a summary notification. In the TUI the picker shows at most 10 rows and scrolls with Up/Down; other frontends prompt for search text first, then use the standard select dialog. The pair and its thinking levels are remembered and reused by `/fusion` and `/fusion-mode`. |
-| `/fusion [task]` | Run one task through the protocol. Prompts for the task in an editor when omitted, sets the supervisor model and thinking level with `pi.setModel`/`pi.setThinkingLevel`, starts a fresh run, warms up the executor session in the background, and sends the supervisor prompt. Reuses the configured pair when present. |
-| `/fusion-mode` | Toggle persistent mode. When enabled, ordinary interactive text prompts are transformed into the supervisor protocol automatically and the supervisor thinking level is reapplied to each intercepted prompt. When disabled, the active executor is disposed and the widget cleared. |
-| `/fusion-status` | Show mode, cohort, supervisor/executor labels with output pricing and thinking levels, scout thinking level, current phase, revision and final-fix counts, per-run supervisor, executor, and scout usage totals, current executor activity, and the last delegation timings (session-ready wait, first executor event, total). |
-| `/fusion-stats [N]` | Show per-run metrics (newest N, default 10) for this directory: wall time split into executor, scout, and supervisor+review time, brief size, delegation and revision counts, and total cost, plus medians and averages across the listed runs. Only runs recorded since metrics tracking was added appear. |
-| `/fusion-resume` | Reopen an interrupted Durable run with a saved request ID. The `resume` delegation looks up that exact submission and waits for its result. |
-| `/fusion-resolve` | After verifying that an interrupted worker and its commands have stopped and reviewing the workspace, explicitly resolve the run. Its manifest and transcript are retained. |
-| `/fusion-clean` | Wait for the agent to go idle, dispose the executor session, and clear run data (task, revisions, phase). Model configuration and mode are preserved. Creates no temporary files. |
+| Goal | Pi | OpenCode |
+| --- | --- | --- |
+| Configure models | `/fusion-config` | Ask the supervisor to call `fusion_configure` |
+| Start a task | `/fusion <task>` | `/fusion-run <task>` |
+| Inspect current work | `/fusion-status` | `/fusion-status` |
+| Inspect usage | `/fusion-stats [N]` | `/fusion-stats` |
+| Inspect recovery options | `/fusion-resume` | `/fusion-resume` |
+| Release resources after work settles | `/fusion-clean` | `/fusion-clean` |
 
-Quick start:
+## Know before using
 
-```
-/fusion-config          # skip or change supervisor (>= $10/M) and executor (<= $10/M); type to filter
-/fusion refactor the retry logic in src/api.ts
-/fusion-status          # inspect phase and revision count
-/fusion-mode            # make every prompt go through Fusion
-/fusion-mode            # toggle it back off
-/fusion-clean           # drop executor context and run state
-```
+- Workers edit your real working tree and run with the host's permissions. Review changes before committing.
+- Pi and OpenCode processes sharing workspaces must use the same `FUSION_OWNERSHIP_DIR` (the default is `~/.local/state/fusion/ownership`).
+- Recovery depends on the backend and available completion evidence. Interrupted work may need manual inspection and explicit operator resolution; commands can have side effects even when their outcome is uncertain.
+- Pi Durable is experimental. Native Pi supervisor acceptance still has open cases; OpenCode restart completion delivery has an upstream limitation.
+- Pi model tiers depend on catalog pricing and a maintained model-family allowlist.
 
-## Workflow
-
-1. Configure once with `/fusion-config`, or let `/fusion` / `/fusion-mode` prompt for a pair on first use.
-2. The supervisor investigates through `fusion_scout` for broad searches and file discovery, reads the few design-deciding files itself, and writes a self-contained brief: objective, files, constraints, edge cases, exact verification checks — plus the relevant scout findings so the executor does not search again.
-3. `fusion_delegate` with `action: "execute"` drives a persistent in-memory Pi SDK `AgentSession` for the executor: its own system prompt, project skills and context files, the configured executor thinking level, and the standard read/edit/bash tool set. Extensions and prompt templates are disabled on the executor so it cannot re-enter Fusion. Session creation is warmed up in the background when a run starts — the `DefaultResourceLoader` is loaded once per working directory and reused — so the executor is usually ready before the supervisor finishes planning, and an unused warm session is carried into the next task instead of being rebuilt.
-4. The executor works the brief directly in the shared working tree and finishes with a structured JSON report. The tool result is its compact rendering plus a real diff stat (from before/after `git status` snapshots and the executor's touched paths), per-invocation token and cost usage, the cumulative executor total for the run, and a one-line timing breakdown (`ready`, `first event`, `total` milliseconds). Widget and transcript updates are throttled to one render per ~150 ms while the executor streams.
-5. The supervisor reviews the actual working tree and diff — never the summary alone. The tool result ends with a Fusion-computed `Review` line: `Review: light` means the report is `done`, every check passed, there are no blockers, and the diff stat is small (≤5 files, ≤200 changed lines, no pre-existing changes), so the supervisor reviews only the changed hunks (`git diff HEAD`); `Review: full` lists its reasons and sends the supervisor through a full working-tree review with the checks re-run.
-6. Defects are batched into one consolidated revision brief per `fusion_delegate` `action: "revise"` call, up to 3 revisions per task.
-7. Before summarizing, the supervisor runs a final acceptance audit against the original user task (not its brief): every requirement is marked met, partial, or missing with concrete evidence, and bugs (unhandled edge cases, regressions, missing tests, checks never run) are hunted down. Any gaps go back to the executor as one consolidated `fusion_delegate` `action: "final_fix"` call — allowed once per run, separate from the 3 revisions — and its diff is reviewed the same way.
-8. The supervisor takes over only if the executor is blocked, then delivers a final user-facing summary with the checks that passed and the acceptance checklist, including anything still unresolved.
-
-## Executor backend
-
-Fusion can run the executor and scout on one of two backends, selected in `/fusion-config`:
-
-- **`session`** (default): the executor is a Pi SDK `AgentSession` persisted under `<agentDir>/fusion/sessions`, and the scout is a disposable in-memory session. Interrupted turns cannot be reattached automatically; inspect the session and workspace, verify the worker has stopped, and use `/fusion-resolve`.
-- **`durable`** (experimental): the executor and scout run on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable), persisted in a SQLite database at `<agentDir>/fusion/durable.sqlite`. The package is an optional peer dependency — Fusion only offers the durable option when it can be loaded, and falls back to `session` with a warning otherwise.
-
-Pi Durable is specific to the Pi harness. OpenCode uses its native subagent
-sessions and does not require `pi-durable`.
-
-The OpenCode entrypoint's current capabilities,
-local test setup, and remaining parity work are documented in
-[OpenCode readiness and testing](docs/opencode-testing.md).
-
-The durable backend supports:
-
-- For a run with a saved request ID, `/fusion-resume` looks up the exact durable submission and waits for its terminal result. Missing or ambiguous evidence keeps the run blocked. A resumed report requires a full working-tree review.
-- The scout tool-call cap is stored inside the durable conversation, so it still holds if the process restarts mid-scout.
-
-Limitations:
-
-- Only the executor turn is durable. The supervisor is the interactive Pi session — a crash loses its in-memory state, and after `/fusion-resume` it rebuilds context from the run record and the working tree.
-- Commands cut off by a crash may still have completed their side effects, so after a durable resume the supervisor reviews the full working tree with `git diff` rather than trusting the report alone.
-- Scout answers are not delivered after a crash; the supervisor simply calls `fusion_scout` again.
-- Legacy interrupted runs without an original request ID, interrupted session runs, and runs without matching Durable evidence need manual inspection and `/fusion-resolve`. No exactly-once side-effect guarantee is implied.
-- Older Fusion versions do not enforce the new interrupted-run guard. Resolve an interrupted run before switching to an older version or running mixed versions in the same workspace.
-
-## Session and data handling
-
-- With the session backend the executor session is persisted under `<agentDir>/fusion/sessions` for inspection; the scout uses `SessionManager.inMemory(cwd)` and leaves nothing behind.
-- The executor session is disposed when a new task starts, when Fusion mode is disabled, on `session_shutdown`, and via `/fusion-clean`.
-- The selected supervisor/executor pair and mode flag live only in extension memory; they reset when Pi exits or the extension reloads.
-- Because both agents share the filesystem, executor edits are visible to the supervisor immediately.
-- Usage is tracked per run and per role: supervisor tokens are aggregated from the main session's assistant turns, executor tokens from each `fusion_delegate` invocation (initial execution plus revisions). Totals reset on a new task, mode disable, session shutdown, and `/fusion-clean`.
-- Run manifests persist the original user task separately from the executor brief (plus the revision and final-fix state) so `/fusion-resume` can restore the acceptance audit context after an interruption.
-- The extension writes no prompts, briefs, or secrets to temporary files.
-
-## Safety and limitations
-
-- Extensions run with the full permissions of the Pi process. Only install this package from sources you trust, and only enable project-local extensions in trusted repositories.
-- The executor can read, edit, and run tools in the working directory under the same project instructions and Pi permissions as a normal session.
-- Fusion mode is text-only: image attachments in intercepted prompts are rejected with a warning.
-- Tiering depends on provider/model catalog pricing metadata. Models without trustworthy pricing are executor-only by design.
-- The recent-model cohort is a hand-maintained pattern list: a selection heuristic, not authoritative release dates, and it needs occasional updates as new model families ship.
-- Only one Fusion run is active at a time, and a run allows one initial execution, at most 3 revisions, and one final fix.
-- The supervisor is not durable across process restarts. Interrupted run manifests block new work in the same workspace until exact recovery evidence or explicit manual resolution (see [Executor backend](#executor-backend)). Pi and OpenCode processes sharing workspaces must use the same `FUSION_OWNERSHIP_DIR`; see the [operating guide](docs/install.md).
+See the [install and operating guide](docs/install.md) for credentials, dependency versions, configuration, and recovery. The [OpenCode readiness report](docs/opencode-testing.md) records verified behavior and remaining limitations.
 
 ## Development
 
-| Path | Purpose |
-|------|---------|
-| `src/git-changes.ts` | `git status --porcelain=v1 -z` parsing, content hashing, and before/after change detection for the diff stat. |
-| `src/index.ts` | Extension entry point: tool, commands, input interception, widget, executor lifecycle. |
-| `src/core/controller.ts` | Shared delegation and scout state transitions. |
-| `src/opencode/` | Experimental OpenCode server plugin and native subagent adapter. |
-| `src/workspace/` | Harness-independent Git snapshots and diff evidence, plus the Node process adapter. |
-| `src/pi/durable/` | Pi-only durable executor, scout tools, event mapping, and recovery. |
-| `src/limits.ts` | Central run limits and tuning constants (revisions, scout caps, throttle, timeouts). |
-| `src/prompts.ts` | Supervisor/executor/scout prompt construction. |
-| `src/pricing.ts` | Output-price tier logic and priced model labels. |
-| `src/progress.ts` | Bounded chronological executor transcript and tool-result summaries. |
-| `src/recent-models.ts` | Curated recent-model cohort matching and search. |
-| `src/report.ts` | Lenient parsing and compact rendering of the executor's JSON report, plus the computed `Review: light`/`full` tier. |
-| `src/settle.ts` | Completion gate: decides whether a settling run needs a continuation nudge. |
-| `src/scrollable-select.ts` | TUI picker capped at 10 visible rows; falls back to the standard select dialog outside TUI. |
-| `src/thinking.ts` | Thinking-level ordering (highest first), supervisor/executor and scout defaults, and agent-level conversion. |
-| `src/throttle.ts` | Trailing-edge `createThrottle` used to coalesce executor render updates. |
-| `src/usage.ts` | Incremental `Usage` aggregation for executor invocations. |
-| `.pi/extensions/fusion.ts` | Project-local shim re-exporting `src/index.ts` for auto-discovery. |
-| `test/*.test.ts` | `bun:test` unit tests for prompts, pricing, cohort matching/search, git change detection, progress transcript, report parsing and review tiering, settle gating, thinking levels, throttle, and usage aggregation. |
-
-```bash
+```sh
+bun install
 bun test
 bun run typecheck
+bun run test:clean-install
 ```
 
-The `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox` host packages are peer dependencies supplied by Pi at runtime; they do not need to be installed into this repository for normal use.
+| Location | Purpose |
+| --- | --- |
+| `src/core/` | Shared workflow, worker contracts, and run manifests |
+| `src/index.ts`, `src/pi/` | Pi entrypoint and runtime adapters |
+| `src/opencode/` | OpenCode plugin and native subagent adapter |
+| `src/workspace/` | Git evidence and workspace ownership |
+| `examples/opencode/agents/` | Supervisor, executor, and scout definitions |
+| `test/` | Unit tests and opt-in native integration fixtures |
+| `.github/workflows/package-opencode.yml` | Package checks and downloadable build artifacts |
+
+Model-consuming integration checks are opt-in; commands are listed in the [operating guide](docs/install.md#verifying-your-install).
 
 ## License
 
-MIT
+MIT. Independent community project; not affiliated with Cognition or Devin.
