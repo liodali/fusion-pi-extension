@@ -57,13 +57,27 @@ try {
 		catch { result.shippedAssets[label] = false; check(`published asset ${label}`, false); }
 	}
 
-	// No Pi SDK may be installed in this bare consumer.
-	for (const sdk of ["pi-coding-agent", "pi-ai", "pi-durable", "pi-agent-core", "pi-codemode", "pi-tui", "typebox"]) {
+	// No Pi SDK may be installed in this bare consumer — each package is
+	// checked at its actual install path (scoped packages under
+	// @earendil-works/, typebox unscoped at the root).
+	const prohibited = {
+		"pi-coding-agent": "@earendil-works/pi-coding-agent",
+		"pi-ai": "@earendil-works/pi-ai",
+		"pi-durable": "@earendil-works/pi-durable",
+		"pi-agent-core": "@earendil-works/pi-agent-core",
+		"pi-codemode": "@earendil-works/pi-codemode",
+		"pi-tui": "@earendil-works/pi-tui",
+		typebox: "typebox",
+	};
+	result.prohibitedInstalls = {};
+	for (const [name, relativePath] of Object.entries(prohibited)) {
+		let present = false;
 		try {
-			await stat(join(consumerDir, "node_modules/@earendil-works", sdk));
-			check(`bare install must not install ${sdk}`, false);
-			result[`installed_${sdk}`] = true;
-		} catch { result[`installed_${sdk}`] = false; }
+			await stat(join(consumerDir, "node_modules", relativePath));
+			present = true;
+			check(`bare install must not install ${name}`, false);
+		} catch {}
+		result.prohibitedInstalls[name] = present;
 	}
 
 	// The OpenCode entry loads in the bare install — the runtime proof of
@@ -85,6 +99,29 @@ try {
 	result.piEntryFailureHead = piOutput.split("\n").find((line) => /Cannot find module|error/i.test(line))?.slice(0, 160) ?? piOutput.slice(0, 160);
 	check("the Pi entry honestly fails in a bare install (host stack required)", result.piEntryRefusedInBareInstall, result.piEntryFailureHead);
 
+	// The installed operator CLI must actually execute from the consumer
+	// directory: the generated bin shim exists, carries the bun shebang, and
+	// invoking it with invalid arguments runs the script's argument
+	// validation (usage text + exit 2) — proving the shipped TypeScript CLI
+	// and its imports load from an installed copy.
+	const binPath = join(consumerDir, "node_modules/.bin/fusion-resolve");
+	result.operatorCli = {};
+	try {
+		const binStat = await stat(binPath);
+		result.operatorCli.binPresent = binStat.isFile();
+	} catch {
+		result.operatorCli.binPresent = false;
+	}
+	if (result.operatorCli.binPresent) {
+		result.operatorCli.shebang = (await readFile(binPath, "utf8")).split("\n")[0];
+		const usage = spawnSync(binPath, [], { cwd: consumerDir, encoding: "utf8" });
+		result.operatorCli.usageExit = usage.status;
+		result.operatorCli.usageStderr = (usage.stderr ?? "").split("\n").find((line) => line.includes("Usage:"))?.slice(0, 160) ?? "";
+	}
+	check("the operator CLI bin shim exists after install", result.operatorCli.binPresent === true);
+	check("the operator CLI runs under its bun shebang", result.operatorCli.shebang === "#!/usr/bin/env bun", String(result.operatorCli.shebang));
+	check("invalid CLI arguments produce the usage response", result.operatorCli.usageExit === 2 && result.operatorCli.usageStderr.includes("Usage: fusion-resolve"), `exit=${result.operatorCli.usageExit} stderr=${result.operatorCli.usageStderr}`);
+
 	result.ok = failures.length === 0;
 	result.failures = failures;
 	result.sanitized = { tarball: "fusion.tgz (packed from this checkout)" };
@@ -95,6 +132,9 @@ try {
 	result.ok = false;
 	result.failures = failures;
 	result.error = String(error?.stack ?? error);
+	// Failures preserve evidence too: the artifact is written on every exit
+	// path, not only on success.
+	try { result.artifact = await writeArtifact("clean-install", result); } catch {}
 	console.log(JSON.stringify(result, null, 2));
 	process.exitCode = 1;
 } finally {

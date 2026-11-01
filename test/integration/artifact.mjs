@@ -38,7 +38,23 @@ export function sanitize(value) {
 	return value;
 }
 
-export async function writeArtifact(name, payload, { directory } = {}) {
+// Credential redaction, centralized so every output and artifact write goes
+// through the same choke point: each secret string (and any string embedding
+// it, e.g. an authorization header) becomes "[redacted]". Path sanitization
+// alone does not protect credentials — fixtures must pass their secrets here.
+export function redactSecrets(value, secrets) {
+	const apply = (text) => secrets.reduce((accumulated, secret) => accumulated.split(secret).join("[redacted]"), text);
+	if (typeof value === "string") return apply(value);
+	if (Array.isArray(value)) return value.map((item) => redactSecrets(item, secrets));
+	if (value && typeof value === "object") {
+		const out = {};
+		for (const key of Object.keys(value)) out[key] = redactSecrets(value[key], secrets);
+		return out;
+	}
+	return value;
+}
+
+export async function writeArtifact(name, payload, { directory, secrets = [] } = {}) {
 	const dir = directory ?? process.env.FUSION_ARTIFACT_DIR ?? join(resolve(import.meta.dirname, "../.."), "artifacts");
 	const stamp = new Date().toISOString().replaceAll(":", "").replaceAll(".", "-");
 	const artifact = {
@@ -46,7 +62,7 @@ export async function writeArtifact(name, payload, { directory } = {}) {
 		name,
 		generatedAt: new Date().toISOString(),
 		tools: { bun: Bun.version, node: process.versions.node },
-		...sanitize(payload),
+		...sanitize(redactSecrets(payload, secrets.filter((secret) => typeof secret === "string" && secret.length > 0))),
 	};
 	const file = join(dir, `${name}-${stamp}.json`);
 	await mkdir(dir, { recursive: true });

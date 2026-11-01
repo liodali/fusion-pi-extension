@@ -24,6 +24,17 @@ const result = { model, steps: [], usageEvents: 0, configure: null, runs: [], er
 let child;
 let startup = "";
 let observerPath;
+// Credential redaction state, hoisted so the FAILURE path shares the
+// success path's strength: secrets are collected the moment they exist
+// (provider credentials and the go key after credential seeding, the serve
+// password and derived authorization header after boot) and every output —
+// console dumps and artifact writes alike — passes through redactAll.
+let collectedSecrets = [];
+const knownSecrets = () => [...new Set(collectedSecrets)].filter((value) => typeof value === "string" && value.length > 0);
+const redactAll = (value) => JSON.parse(JSON.stringify(value, (_key, item) => {
+  if (typeof item !== "string") return item;
+  return knownSecrets().reduce((text, secret) => text.split(secret).join("[redacted]"), item);
+}));
 try {
   const project = join(root, "project");
   await mkdir(join(project, ".opencode/plugins"), { recursive: true });
@@ -117,7 +128,17 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
     let bootError;
     let bootLog = "";
     child.on("error", (error) => { bootError = error; });
-    for (const stream of [child.stdout, child.stderr]) stream.on("data", (data) => { const text = data.toString(); bootLog = (bootLog + text).slice(-8192); startup = (startup + text).slice(-16384); });
+    for (const stream of [child.stdout, child.stderr]) stream.on("data", (data) => {
+      const text = data.toString();
+      bootLog = (bootLog + text).slice(-8192);
+      startup = (startup + text).slice(-16384);
+      // Every boot attempt announces a NEW server password; harvest each
+      // from the ACCUMULATED buffers — a per-chunk scan misses announcements
+      // or tokens split across chunk boundaries (observed live: a retried
+      // boot's password split mid-token and leaked through the failure
+      // dump). Re-scanning the accumulated buffer heals both cases.
+      for (const match of `${bootLog}\n${startup}`.matchAll(/server password (\S+)/g)) collectedSecrets.push(match[1]);
+    });
     const ready = Date.now() + 30000;
     while (Date.now() < ready) {
       if (bootError) throw bootError;
@@ -159,6 +180,11 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   }
   const { url, password } = await bootServer();
   const authHeader = `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`;
+  // MERGE into the harvested list — never reassign: the stream handler has
+  // been pushing announced passwords into the array since boot, and a
+  // reassignment would discard them (observed live: the first boot's
+  // password leaked through exactly that discard).
+  collectedSecrets.push(...[...Object.values(auth[provider] ?? {}), goKey, password, authHeader].filter((value) => typeof value === "string" && value.length > 12));
   const post = (path, body) => fetch(`${url}${path}`, { method: "POST", headers: { authorization: authHeader, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
   const get = (path) => fetch(`${url}${path}`, { headers: { authorization: authHeader }, signal: AbortSignal.timeout(15000) });
   const activated = await get("/api/location");
@@ -426,20 +452,21 @@ export default { id: "fusion-parity-observer", async setup(ctx) {
   const clean2 = (await commandPayloadOn(control2.current, "fusion-clean", "Fusion clean")).text;
   result.clean2 = clean2;
   assert.ok(clean2.includes("Released Fusion resources for this session.") || clean2.includes("Released settled Fusion ownership for this workspace."), `Run 2 clean said ${clean2}`);
-  const secrets = [...Object.values(auth[provider] ?? {}), goKey].filter((value) => typeof value === "string" && value.length > 12);
-  const redact = (value) => secrets.reduce((text, secret) => text.split(secret).join("[redacted]"), value);
-  const redactedResult = JSON.parse(redact(JSON.stringify(result)));
+  const redactedResult = redactAll(result);
   redactedResult.ok = true;
-  redactedResult.artifact = await writeArtifact("opencode-parity", redactedResult);
+  redactedResult.artifact = await writeArtifact("opencode-parity", redactedResult, { secrets: knownSecrets() });
   console.log(JSON.stringify(redactedResult));
 } catch (error) {
-  // Evidence first: dump everything in-flight before the disposable root goes.
+  // Evidence first: dump everything in-flight before the disposable root
+  // goes — through the same credential redaction as the success path, so
+  // the boot banner's announced password, the provider key, and the derived
+  // authorization header can never leak through failure diagnostics.
   try {
     const observer = observerPath ? JSON.parse(await readFile(observerPath, "utf8")) : null;
     console.error(`PARITY FAILURE: ${String(error?.message ?? error)}`);
-    console.error(JSON.stringify({ result, observer, serverLog: startup.slice(-4000) }, null, 1).slice(0, 16000));
+    console.error(JSON.stringify(redactAll({ result, observer, serverLog: startup.slice(-4000) }), null, 1).slice(0, 16000));
     result.ok = false;
-    await writeArtifact("opencode-parity", result);
+    await writeArtifact("opencode-parity", result, { secrets: knownSecrets() });
   } catch {}
   throw error;
 } finally {

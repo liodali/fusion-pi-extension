@@ -223,7 +223,14 @@ const run = async () => {
 	return result;
 };
 
-const result = await run();
+let result;
+try {
+	result = await run();
+} catch (error) {
+	// Failures preserve evidence too: even an unexpected throw from run()
+	// writes its artifact instead of exiting bare.
+	result = { ok: false, error: String(error?.stack ?? error), scenarios: [] };
+}
 result.tools = { bun: Bun.version, npm: spawnSync("npm", ["--version"], { encoding: "utf8" }).stdout?.trim() ?? "unavailable" };
 try { result.artifact = await writeArtifact("consumer-install", result); } catch {}
 const outPath = process.argv[2];
