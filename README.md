@@ -1,8 +1,8 @@
-# Pi Fusion Extension
+# Fusion for Pi and OpenCode
 
-A price-tiered supervisor/executor orchestration extension for the Pi coding agent, inspired by the Fusion architecture. The interactive Pi session becomes a supervisor that plans, briefs, and reviews, while implementation and verification are delegated to a separate executor agent running on a cheaper model in its own isolated session. Model selection is additionally restricted to a curated cohort of recent coding models, since Pi does not expose release dates.
+A supervisor/executor orchestration extension for Pi and plugin for OpenCode, inspired by the Fusion architecture. The interactive session becomes a supervisor that plans, briefs, and reviews, while implementation and verification are delegated to a separate executor session. Both harnesses share the workflow policy, run manifests, workspace ownership, and report handling. Pi additionally offers price-tiered model selection and a curated cohort of recent coding models.
 
-This is an independent community Pi extension. It is not an official Cognition or Devin product and is not affiliated with either.
+This is an independent community project. It is not an official Cognition or Devin product and is not affiliated with either.
 
 ## Install and operating guide
 
@@ -16,6 +16,10 @@ operator / blocked-boundary split of recovery (including the `fusion-resolve`
 operator CLI and the upstream restart deadline).
 
 ## How it works
+
+The detailed UI and session descriptions below describe the Pi integration.
+OpenCode uses its native subagent executor and the commands in the
+[OpenCode quick start](#opencode-quick-start).
 
 ```mermaid
 flowchart LR
@@ -56,7 +60,50 @@ The price threshold lives in `FUSION_OUTPUT_PRICE_THRESHOLD` in `src/pricing.ts`
 
 ## Installation
 
-### Project-local development
+### OpenCode quick start
+
+Use OpenCode **2.2.3–2.2.5** and Bun. To get an installable package:
+
+1. Open this repository's **Actions → Package OpenCode plugin** workflow.
+2. Select **Run workflow**, or open a successful run for a `v*` tag or relevant pull request.
+3. Download the `fusion-opencode-<commit>` artifact and extract it. It contains
+   `pi-fusion-extension-<version>.tgz` and `SHA256SUMS`.
+
+Verify the download from its extracted directory (`shasum -a 256 -c SHA256SUMS`
+on macOS, or `sha256sum -c SHA256SUMS` on Linux). Then install in your project,
+replacing the tarball path with your download:
+
+```sh
+cd /path/to/your/project
+bun add /path/to/pi-fusion-extension-0.1.0.tgz
+mkdir -p .opencode/plugins .opencode/agents
+printf '%s\n' 'export { default } from "pi-fusion-extension/opencode";' > .opencode/plugins/fusion.ts
+cp node_modules/pi-fusion-extension/examples/opencode/agents/*.md .opencode/agents/
+```
+
+Restart OpenCode in that project. Configure your provider credentials through
+OpenCode, then try:
+
+```text
+/fusion-run Implement a small improvement and verify it with the relevant checks.
+/fusion-status
+/fusion-stats
+/fusion-clean
+```
+
+`/fusion-run` starts the Fusion supervisor, which delegates to the executor and
+reviews its work. Ask the supervisor to call `fusion_configure` to select an
+executor provider/model; the scout uses that model too. OpenCode uses
+`/fusion-mode on` and `/fusion-mode off` for persistent mode. After an
+interruption, use `/fusion-resume` and follow its recovery instructions.
+
+The OpenCode entry installs no Pi SDK dependencies. The workflow uploads a
+package artifact; it does not publish to npm or create a GitHub release.
+For local packaging, run `npm pack` from this repository and install the
+resulting tarball using the same steps. See the [operating guide](docs/install.md)
+for gateway credentials, shared ownership configuration, and recovery limits.
+
+### Pi project-local development
 
 Clone or copy this repository and launch `pi` from the repository root. Pi auto-discovers `.pi/extensions/fusion.ts` after the project is trusted, and that file loads `src/index.ts`.
 
@@ -70,13 +117,13 @@ pi install ./
 
 The `pi.extensions` field in `package.json` points Pi at `./src/index.ts`.
 
-### One-off
+### Pi one-off
 
 ```bash
 pi --extension ./src/index.ts
 ```
 
-## Commands
+## Pi commands
 
 | Command | Behavior |
 |---------|----------|
@@ -118,9 +165,10 @@ Fusion can run the executor and scout on one of two backends, selected in `/fusi
 - **`session`** (default): the executor is a Pi SDK `AgentSession` persisted under `<agentDir>/fusion/sessions`, and the scout is a disposable in-memory session. Interrupted turns cannot be reattached automatically; inspect the session and workspace, verify the worker has stopped, and use `/fusion-resolve`.
 - **`durable`** (experimental): the executor and scout run on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable), persisted in a SQLite database at `<agentDir>/fusion/durable.sqlite`. The package is an optional peer dependency — Fusion only offers the durable option when it can be loaded, and falls back to `session` with a warning otherwise.
 
-Pi Durable is specific to the Pi harness. Future harness integrations use their own session and recovery capabilities and do not require `pi-durable`.
+Pi Durable is specific to the Pi harness. OpenCode uses its native subagent
+sessions and does not require `pi-durable`.
 
-An experimental OpenCode entrypoint is under development. Its current capabilities,
+The OpenCode entrypoint's current capabilities,
 local test setup, and remaining parity work are documented in
 [OpenCode readiness and testing](docs/opencode-testing.md).
 
@@ -155,7 +203,7 @@ Limitations:
 - Tiering depends on provider/model catalog pricing metadata. Models without trustworthy pricing are executor-only by design.
 - The recent-model cohort is a hand-maintained pattern list: a selection heuristic, not authoritative release dates, and it needs occasional updates as new model families ship.
 - Only one Fusion run is active at a time, and a run allows one initial execution, at most 3 revisions, and one final fix.
-- The supervisor is not durable across process restarts. Interrupted run manifests block new work in the same workspace until exact Durable recovery or explicit manual resolution (see [Executor backend](#executor-backend)). Cross-process workspace locking remains unfinished.
+- The supervisor is not durable across process restarts. Interrupted run manifests block new work in the same workspace until exact recovery evidence or explicit manual resolution (see [Executor backend](#executor-backend)). Pi and OpenCode processes sharing workspaces must use the same `FUSION_OWNERSHIP_DIR`; see the [operating guide](docs/install.md).
 
 ## Development
 
