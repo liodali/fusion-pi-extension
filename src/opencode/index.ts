@@ -12,6 +12,8 @@ import { nodeGitExec } from "../workspace/node-git.ts";
 import { OPENCODE_CAPABILITIES, type NativeSubagentExecute, type NativeToolContext } from "./native-executor.ts";
 import { createOpenCodeWorkerRuntime, type OpenCodeWorkerRuntime, type ScoutCap } from "./worker-runtime.ts";
 import { FUSION_AGENTS, fusionPermissionsEqual } from "./agents.ts";
+import { DELEGATE_INPUT, delegateInput, delegateMonitor, shortLabel } from "./delegate-presentation.ts";
+import { readExecutorStop, stopFeedback, stopWait, type ExecutorStop } from "./executor-stop.ts";
 import type { WorkerConfig, WorkerHandle, WorkerModelConfig, WorkerTurnRequest, WorkerTurnResult } from "../core/worker.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { WorkspaceSnapshot } from "../workspace/evidence.ts";
@@ -96,11 +98,11 @@ interface PluginContext {
 		get(input: { sessionID: string }): Promise<{ id: string; parentID?: string; location?: { directory?: string } }>;
 		hook(name: "context", callback: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void): Promise<unknown>;
 		/** Present in OpenCode v2 hosts; absence leaves worker abort unsupported. */
-		interrupt?(input: { sessionID: string }): Promise<unknown>;
+		interrupt?(input: { sessionID: string; resume?: boolean }): Promise<unknown>;
 		/** Present in OpenCode v2 hosts; absence leaves /fusion unable to inject the supervisor prompt. */
 		prompt?(input: { sessionID: string; id?: string; text?: string }): Promise<unknown>;
 		switchAgent?(input: { sessionID: string; agent: string }): Promise<unknown>;
-		synthetic?(input: { sessionID: string; text: string; description?: string; resume?: boolean }): Promise<unknown>;
+		synthetic?(input: { sessionID: string; text: string; description?: string; resume?: boolean; metadata?: Record<string, unknown> }): Promise<unknown>;
 	};
 	/** Pinned in OpenCode v2.2.2: options-object subscribe returning a lazy async iterable. Absence leaves worker events unsupported. */
 	event?: {
@@ -123,7 +125,7 @@ const SCOUT_AGENT = "fusion-scout";
 const SCOUT_TOOLS = new Set(["read", "grep", "glob"]);
 /** Fusion tools hidden from the fusion agent when persistent mode is off and its session has no active run. Read-only reporting tools stay visible. */
 const FUSION_GATED_TOOLS = ["fusion_start", "fusion_delegate", "fusion_scout", "fusion_reconcile", "fusion_reset", "fusion_configure"];
-const FUSION_TOOLS = [...FUSION_GATED_TOOLS, "fusion_resume", "fusion_stats", "fusion_status"];
+const FUSION_TOOLS = [...FUSION_GATED_TOOLS, "fusion_resume", "fusion_stats", "fusion_status", "fusion_stop"];
 
 interface Run {
 	controller: FusionController;
@@ -139,6 +141,11 @@ interface Run {
 	before?: WorkspaceSnapshot;
 	/** The supervisor exhausted its continuation budget on an unfinished protocol. */
 	incomplete?: boolean;
+	turnAbort?: AbortController;
+	monitor?: ReturnType<typeof delegateMonitor>;
+	stopFlight?: Promise<ExecutorStop | undefined>;
+	interruptFlight?: Promise<void>;
+	persistFlight?: Promise<void>;
 }
 /** Match OpenCode's completion notification to this specific native job generation. */
 function notificationResult(messages: readonly unknown[], childID: string, description: string): { state: "completed" | "error" | "cancelled"; output: string } {
@@ -351,7 +358,7 @@ export default {
 			// delivery time — not from locals captured at settlement start —
 			// because an interrupt can cancel the nudge and a worker can
 			// background while a settlement is paused at persistence.
-			const nudgeCancelled = (): boolean => (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state === "cancelled";
+			const nudgeCancelled = (): boolean => !!readExecutorStop(run.adapterData?.fusionStop) || (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state === "cancelled";
 			const workUnresolvedNow = (): boolean => {
 				const status = run.runtime.status(run.handle);
 				return status.backgroundPending || status.unsettled || run.reconciling || scoutInFlight || hasBackgroundScout();
@@ -387,7 +394,7 @@ export default {
 			// budget is consumed and an unfinished protocol reports incomplete.
 			const deliverPrompt = (input: { sessionID: string; id?: string; text?: string }): Promise<unknown> | undefined =>
 				typeof ctx.session.prompt === "function" ? ctx.session.prompt(input) : undefined;
-			const canDeliver = typeof ctx.session.prompt === "function";
+			const canDeliver = typeof ctx.session.prompt === "function" && !nudgeCancelled();
 			const pendingNudge = run.adapterData?.fusionNudge as { id?: unknown; text?: unknown; state?: unknown } | undefined;
 			// A settlement write left pending by an earlier terminal is retried
 			// before anything else happens this turn.
@@ -611,7 +618,7 @@ export default {
 			const runtime = createOpenCodeWorkerRuntime<ToolContext>({
 				execute: native!.execute,
 				contextFor: (request) => { const toolContext = toolContexts.get(request.worker); if (!toolContext) throw new Error("OpenCode tool context is unavailable."); return toolContext; },
-				interrupt: typeof ctx.session.interrupt === "function" ? ((childSessionID: string) => Promise.resolve(ctx.session.interrupt!({ sessionID: childSessionID }))) : undefined,
+				interrupt: typeof ctx.session.interrupt === "function" ? ((childSessionID: string) => Promise.resolve(ctx.session.interrupt!({ sessionID: childSessionID, resume: false }))) : undefined,
 				bus: busHost ? { add: (sink) => { busSinks.add(sink); return () => { busSinks.delete(sink); }; } } : undefined,
 				validateReference: async (reference) => {
 					const [parent, child] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.get({ sessionID: reference.id })]);
@@ -663,12 +670,99 @@ export default {
 				capabilities: run.runtime.capabilities, recovery: pending ? "pending" : run.controller.uncertain ? "manual" : "settled",
 				pending, lastResult: run.lastResult, model: run.model, adapterData: run.adapterData }, { harness: "opencode", workspace });
 		}
-		async function persist(_sessionID: string, run: Run): Promise<void> {
+		async function persist(_sessionID: string, run: Run, settled = false): Promise<void> {
 			if (!run.lease) throw new Error("Fusion workspace has not been claimed.");
-			const value = manifest(run);
-			await run.lease.save(value);
-			await store.save(value);
+			const operation = (run.persistFlight ?? Promise.resolve()).catch(() => {}).then(async () => {
+				const value = { ...manifest(run), ...(settled ? { recovery: "settled" as const } : {}) };
+				await run.lease!.save(value);
+				await store.save(value);
+			});
+			run.persistFlight = operation;
+			try { await operation; } finally { if (run.persistFlight === operation) run.persistFlight = undefined; }
 		}
+		async function saveStop(sessionID: string, run: Run, stop: ExecutorStop): Promise<void> {
+			if (!run.lease) return;
+			if (!await stopWait(persist(sessionID, run), 250)) stop.persistenceWarning = true;
+		}
+		async function stopNotice(sessionID: string, stop: ExecutorStop): Promise<void> {
+			if (!ctx.session.synthetic) return;
+			const text = stopFeedback(stop);
+			try { await ctx.session.synthetic({ sessionID, text, description: `Fusion executor stop\n${text}`, resume: false, metadata: { fusionStop: { ...stop } } }); } catch {}
+		}
+		async function confirmStop(sessionID: string, run: Run, stop: ExecutorStop, terminal: "completed" | "error" | "cancelled"): Promise<void> {
+			if (stop.state === "confirmed") return;
+			stop.state = "confirmed";
+			stop.terminal = terminal;
+			stop.updatedAt = Date.now();
+			await run.monitor?.finish("stopped");
+			await saveStop(sessionID, run, stop);
+			await stopNotice(sessionID, stop);
+		}
+		async function interruptExecutor(sessionID: string, run: Run, stop: ExecutorStop): Promise<void> {
+			if (run.interruptFlight) return run.interruptFlight;
+			const operation = (async () => {
+				const confirmed = () => stop.state === "confirmed";
+				const reference = run.handle.reference;
+				if (!reference || confirmed() || run.controller.pending?.requestId !== stop.requestId) return;
+				stop.childSessionID = reference.id;
+				try {
+					const child = await ctx.session.get({ sessionID: reference.id });
+					if (child.id !== reference.id || child.parentID !== sessionID || !child.location?.directory || await canonicalize(child.location.directory) !== workspace || reference.owner.supervisorId !== sessionID || reference.owner.workspace !== workspace) throw new Error("Executor ownership does not match this Fusion session.");
+					if (run.controller.pending?.requestId !== stop.requestId || confirmed()) return;
+					const interruption = run.runtime.abort(run.handle);
+					run.turnAbort?.abort(new Error("Fusion executor stop requested."));
+					await interruption;
+					if (!confirmed()) stop.state = "acknowledged";
+				} catch (error) {
+					if (!confirmed()) { stop.state = "failed"; stop.error = shortLabel(error instanceof Error ? error.message : String(error), 160); }
+				} finally {
+					run.turnAbort?.abort(new Error("Fusion executor stop requested."));
+					stop.updatedAt = Date.now();
+					await saveStop(sessionID, run, stop);
+				}
+			})();
+			run.interruptFlight = operation;
+			try { await operation; } finally { if (run.interruptFlight === operation) run.interruptFlight = undefined; }
+		}
+		async function stopExecutor(sessionID: string, reason = "User requested stop"): Promise<ExecutorStop | undefined> {
+			const run = runs.get(sessionID);
+			if (!run) {
+				if (await registry.inspect(workspace)) throw new Error("The Fusion run belongs to another session; stop it from its owning session.");
+				return;
+			}
+			if (owner && owner !== sessionID || run.handle.owner.supervisorId !== sessionID || run.handle.owner.workspace !== workspace) throw new Error("The Fusion run belongs to another session.");
+			if (run.stopFlight) return run.stopFlight;
+			const operation = (async () => {
+				const requestId = run.controller.pending?.requestId ?? `idle:${run.runId}`;
+				const existing = readExecutorStop(run.adapterData?.fusionStop);
+				if (existing?.requestId === requestId && existing.state === "confirmed") return existing;
+				const activity = run.monitor?.snapshot();
+				const stop: ExecutorStop = existing?.requestId === requestId ? existing : { requestId, requestedAt: Date.now(), updatedAt: Date.now(), state: "requested", reason: shortLabel(reason, 120), activity: activity?.activity, tools: activity?.tools };
+				run.adapterData = { ...run.adapterData, fusionStop: stop, fusionNudge: { ...(run.adapterData?.fusionNudge as object ?? {}), state: "cancelled" } };
+				run.monitor?.requestStop();
+				const saving = saveStop(sessionID, run, stop);
+				if (!run.controller.pending) stop.state = "not-submitted";
+				else if (run.handle.reference && (run.controller.submissionBegan || !run.controller.state.delegating)) await stopWait(interruptExecutor(sessionID, run, stop), 1500);
+				else run.turnAbort?.abort(new Error("Fusion executor stop requested."));
+				await saving;
+				stop.updatedAt = Date.now();
+				await saveStop(sessionID, run, stop);
+				return stop;
+			})();
+			run.stopFlight = operation;
+			try { return await operation; } finally { if (run.stopFlight === operation) run.stopFlight = undefined; }
+		}
+		const onStopBusEvent = (event: { created?: number; type: string; data?: Record<string, unknown> }): void => {
+			if (typeof event.created !== "number" || typeof event.data?.sessionID !== "string") return;
+			for (const [sessionID, run] of runs) {
+				const stop = readExecutorStop(run.adapterData?.fusionStop);
+				if (!stop || stop.state === "confirmed" || event.created <= stop.requestedAt || stop.requestId !== run.controller.pending?.requestId || run.handle.reference?.id !== event.data.sessionID) continue;
+				if (event.type === "session.execution.started") void interruptExecutor(sessionID, run, stop);
+				const terminal = event.type === "session.execution.interrupted" ? "cancelled" : event.type === "session.execution.succeeded" ? "completed" : event.type === "session.execution.failed" ? "error" : undefined;
+				if (terminal) void confirmStop(sessionID, run, stop, terminal);
+			}
+		};
+		busSinks.add(onStopBusEvent);
 		function hasUnconfirmedPrompt(run: Run): boolean {
 			const prompt = run.adapterData?.fusionPrompt;
 			return !!prompt && typeof prompt === "object" && (prompt as { state?: unknown }).state === "pending";
@@ -759,6 +853,7 @@ export default {
 			if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before starting a run.");
 			const run = await runFor(sessionID);
 			if (resetting || starting || configuring) throw new Error("A Fusion run transition is in progress.");
+			if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped. Reconcile retained work and reset before starting another run.");
 			if (run.controller.state.runActive || run.controller.state.executed || run.controller.pending || run.controller.uncertain || run.reconciling) throw new Error("Finish and reset the existing Fusion run before starting another.");
 			starting = true;
 			const priorState = structuredClone(run.controller.state);
@@ -890,6 +985,7 @@ export default {
 			const cleanable = (state: { runActive: boolean; phase: string }): boolean => state.runActive && state.phase !== "complete";
 			const run = runs.get(sessionID);
 			if (run) {
+				if (run.stopFlight || run.interruptFlight || readExecutorStop(run.adapterData?.fusionStop) && run.persistFlight) throw new Error("Executor stop or persistence is still in progress.");
 				if (hasUnconfirmedPrompt(run)) throw new Error("Fusion prompt delivery is unconfirmed. Retry /fusion-run with the same task before cleaning.");
 				if (cleanable(run.controller.state)) throw new Error("The Fusion run is still active; finish and reset it before cleaning.");
 				const error = run.controller.resetError(false, run.reconciling);
@@ -954,7 +1050,8 @@ export default {
 			const promptDelivery = run.adapterData?.fusionPrompt as { state?: unknown } | undefined;
 			const nudgeDelivery = (run.adapterData?.fusionNudge as { state?: unknown } | undefined)?.state;
 			const settlementWrite = (run.adapterData?.fusionSettlement as { state?: unknown } | undefined)?.state;
-			const nextAction = run.incomplete
+			const stopped = readExecutorStop(run.adapterData?.fusionStop);
+			const nextAction = stopped ? stopFeedback(stopped) : run.incomplete
 				? "The Fusion run is incomplete: the supervisor stopped before finishing. Take over the task yourself, or call fusion_reset to finish the run."
 				: settlementWrite === "pending"
 					? "The last Fusion settlement could not be written; it retries when this session next settles."
@@ -969,7 +1066,7 @@ export default {
 					: !run.controller.state.executed
 					? "Investigate the original task, then call fusion_delegate with action execute."
 					: "Review the working tree and audit the original task; reset when the run is finished.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, agents: await agentReport(), nextAction });
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, agents: await agentReport(), nextAction });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1041,6 +1138,19 @@ export default {
 
 		await ctx.tool.transform((editor) => {
 			editor.add({
+				name: "fusion_stop",
+				description: "Stop this supervisor's executor when the user requests it. Requests native interruption and returns bounded activity feedback. Acknowledgement is not proof of termination. Do not retry, reset, or start more work after stopping; reconcile retained results first.",
+				input: { type: "object", properties: { reason: { type: "string", maxLength: 120 } }, additionalProperties: false },
+				options: { codemode: false },
+				async execute(input, context) {
+					requireSupervisor(context);
+					const reason = input && typeof input === "object" ? (input as { reason?: unknown }).reason : undefined;
+					if (reason !== undefined && typeof reason !== "string") throw new Error("Invalid Fusion stop reason.");
+					const stop = await stopExecutor(context.sessionID, reason);
+					return { content: stop ? stopFeedback(stop) : "No Fusion run in this session.", metadata: stop ? { stop: { ...stop }, childSessionID: stop.childSessionID } : {} };
+				},
+			});
+			editor.add({
 				name: "fusion_start",
 				description: "Start a Fusion run with the user's original request before scouting or delegation. Finish and reset the previous run first.",
 				input: { type: "object", properties: { task: { type: "string", minLength: 1 } }, required: ["task"], additionalProperties: false },
@@ -1068,25 +1178,33 @@ export default {
 			});
 			editor.add({
 				name: "fusion_delegate",
-				description: "Delegate a decided implementation brief to the Fusion executor. Use execute once, then up to three revise calls and one final_fix after the acceptance audit. Review the actual working tree after each call.",
-				input: { type: "object", properties: { action: { type: "string", enum: ["execute", "revise", "final_fix"] }, brief: { type: "string", minLength: 1 }, originalTask: { type: "string" } }, required: ["action", "brief"], additionalProperties: false },
+				description: "Delegate a decided implementation brief to the Fusion executor. Supply a short title and put the full brief in details.brief so it stays collapsed in the UI. Use execute once, then up to three revise calls and one final_fix after the acceptance audit. Review the actual working tree after each call.",
+				input: DELEGATE_INPUT,
 				options: { codemode: false },
 				async execute(input, context) {
 					requireSupervisor(context);
 					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
-					if (!input || typeof input !== "object") throw new Error("Invalid Fusion delegation input.");
-					const value = input as Record<string, unknown>;
-					if ((value.action !== "execute" && value.action !== "revise" && value.action !== "final_fix") || typeof value.brief !== "string" || !value.brief.trim() || (value.originalTask !== undefined && typeof value.originalTask !== "string")) throw new Error("Invalid Fusion delegation input.");
+					const value = delegateInput(input);
 					const action = value.action;
 					const run = await runFor(context.sessionID);
 					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
+					if (context.signal.aborted) throw new Error("Fusion delegation cancelled before submission.");
 					if (run.reconciling) throw new Error("Fusion reconciliation is already in progress.");
+					if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped. Reconcile retained work and reset before further delegation.");
 					if (run.controller.uncertain) throw new Error("The executor's last turn has an unknown outcome. Review the child session and working tree before recovery; automatic retry is disabled.");
 					if (owner && owner !== context.sessionID) throw new Error("Another Fusion session owns this workspace. Finish and reset that run first.");
 					if (action === "execute" && run.controller.state.originalTask && typeof value.originalTask === "string" && value.originalTask !== run.controller.state.originalTask) throw new Error("The original task was already recorded by fusion_start and cannot be replaced.");
 					const error = run.controller.beginDelegation(action, OPENCODE_CAPABILITIES, value.brief);
 					if (error) throw new Error(error);
-					run.setContext(run.handle, context);
+					const monitor = delegateMonitor({ action, title: value.title, requestId: run.controller.pending?.requestId, streaming: !!busHost, progress: (update) => context.progress(update) });
+					run.monitor = monitor;
+					const turnAbort = new AbortController();
+					run.turnAbort = turnAbort;
+					const parentCancelled = () => { void stopExecutor(context.sessionID, "Supervisor turn cancelled").then((stop) => stop && stopNotice(context.sessionID, stop)).catch(() => {}); };
+					context.signal.addEventListener("abort", parentCancelled, { once: true });
+					// Keep the native call's ownership/request/cancellation fields. The
+					// progress overlay adds display metadata after reference persistence.
+					run.setContext(run.handle, { ...context, progress: (update) => monitor.nativeProgress(update) });
 					if (action === "execute") {
 						run.controller.startExecution(run.controller.state.originalTask ?? (typeof value.originalTask === "string" && value.originalTask.trim() ? value.originalTask : value.brief), value.brief);
 					}
@@ -1097,8 +1215,9 @@ export default {
 					const description = run.controller.pending?.requestId;
 					if (!description) throw new Error("Fusion delegation lost its pending request identity.");
 					try {
+						await monitor.start();
 						const request: WorkerTurnRequest = { runId: run.runId, requestId: description, worker: run.handle, prompt };
-						return await run.controller.performWorkerDelegation(request, { signal: context.signal, onEvent: () => {} }, {
+						return await run.controller.performWorkerDelegation(request, { signal: AbortSignal.any([context.signal, turnAbort.signal]), onEvent: monitor.onEvent }, {
 							// Authoritative in-sequence claim: the precondition above is a
 							// fast guard, this re-check wins the workspace before intent.
 							claim: async () => {
@@ -1108,11 +1227,27 @@ export default {
 							},
 							recordIntent: () => persist(context.sessionID, run),
 							snapshot: async () => {
+								if (readExecutorStop(run.adapterData?.fusionStop)?.requestId === request.requestId) throw new Error("Fusion executor stopped before submission.");
 								const before = await snapshotWorkspace(ctx.location.directory, nodeGitExec);
+								if (readExecutorStop(run.adapterData?.fusionStop)?.requestId === request.requestId) throw new Error("Fusion executor stopped before submission.");
 								run.before = before;
 								return before;
 							},
-							recordReference: () => persist(context.sessionID, run),
+							recordReference: async (reference) => {
+								// A queued stop interrupts the owned child without waiting
+								// on the reference persistence below: a stalled storage
+								// write must not delay interrupting a running child (the
+								// bus watcher would otherwise retry the interruption only
+								// on a later qualifying event). Persistence still gates
+								// the forwarded progress, and since nothing has been
+								// submitted in the pre-submission path, the idle child
+								// only needs the stop-before-submission throw.
+								const stop = readExecutorStop(run.adapterData?.fusionStop);
+								if (stop?.requestId === request.requestId && run.controller.submissionBegan) void interruptExecutor(context.sessionID, run, stop);
+								await persist(context.sessionID, run);
+								if (stop?.requestId === request.requestId && !run.controller.submissionBegan) throw new Error("Fusion executor stopped before submission.");
+								await monitor.nativeProgress({ sessionID: reference.id });
+							},
 							collect: async (result, before) => {
 								recordUsage(run, result);
 								const workspaceAfter = await snapshotWorkspaceAfter(before, nodeGitExec);
@@ -1121,19 +1256,24 @@ export default {
 								return { result, parsed: run.controller.executorReport(result.text), diffStat: await workspaceDiffStat(before, nodeGitExec) };
 							},
 							settle: async ({ result, parsed, diffStat }) => {
+								const stop = readExecutorStop(run.adapterData?.fusionStop);
+								if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
 								await run.runtime.settle(request, async () => {
 									await run.controller.persistSettlement(result.status, async () => {
 										run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: run.lastResult?.evidence ?? [] };
-										const value = { ...manifest(run), recovery: "settled" as const };
-										await run.lease!.save(value); await store.save(value);
+										await persist(context.sessionID, run, true);
 									});
 								});
 								run.before = undefined;
-								// Child tool events are unavailable, so require a full working-tree review.
-								return { content: formatCompactReport(parsed.report, diffStat, parsed.prose, ["executor tool activity unavailable; review the full working tree"]), metadata: { childSessionID: run.handle.reference?.id, action } };
+								// Display activity is advisory, not evidence of complete edits.
+								const activity = await monitor.finish(result.status === "completed" ? "completed" : "failed");
+								return { content: formatCompactReport(parsed.report, diffStat, parsed.prose, [busHost ? "review the full working tree" : "executor tool activity unavailable; review the full working tree"]), metadata: { childSessionID: run.handle.reference?.id, action, fusion: activity } };
 							},
 						});
 					} catch (error) {
+						const stop = readExecutorStop(run.adapterData?.fusionStop);
+						if (stop && !run.controller.submissionBegan) { stop.state = "not-submitted"; stop.updatedAt = Date.now(); await monitor.finish("stopped"); await stopNotice(context.sessionID, stop); }
+						await monitor.finish(run.runtime.status(run.handle).backgrounded ? "background" : run.controller.submissionBegan ? "uncertain" : "failed");
 						run.controller.failDelegation();
 						if (!run.lease) { run.controller.clearPending(); throw error; }
 						if (!run.controller.submissionBegan && !run.controller.pending) throw error;
@@ -1157,9 +1297,11 @@ export default {
 						// Save a child ID returned only in the native result as well as IDs
 						// delivered through progress. Failure keeps the run locked.
 						if (run.controller.pending) await persist(context.sessionID, run);
-						if (run.runtime.status(run.handle).backgrounded) return { content: "Fusion executor is running in the background. After OpenCode delivers its completion notification, call fusion_reconcile before reviewing or delegating again.", metadata: { childSessionID: run.handle.reference?.id, status: "running" } };
+						if (run.runtime.status(run.handle).backgrounded) return { content: "Fusion executor is running in the background. After OpenCode delivers its completion notification, call fusion_reconcile before reviewing or delegating again.", metadata: { childSessionID: run.handle.reference?.id, status: "running", fusion: monitor.snapshot() } };
 						throw error;
 					} finally {
+						context.signal.removeEventListener("abort", parentCancelled);
+						if (run.turnAbort === turnAbort) run.turnAbort = undefined;
 						run.controller.endDelegation(action);
 					}
 				},
@@ -1184,6 +1326,7 @@ export default {
 					const run = await runFor(context.sessionID);
 					if (resetting || starting || configuring) throw new Error("Fusion reset is in progress, a run is starting, or configuration is in progress.");
 					// Set synchronously so concurrent tool calls cannot double-submit.
+					if (readExecutorStop(run.adapterData?.fusionStop)) throw new Error("This Fusion run was stopped; do not start more scout work.");
 					if (scoutInFlight) throw new Error("A Fusion scout is already running; wait for it to answer before asking again.");
 					if (scoutGuards.size >= MAX_TRACKED_SCOUTS) throw new Error("Fusion scout tracking is full; wait for an existing scout to stop.");
 					scoutInFlight = true;
@@ -1197,7 +1340,7 @@ export default {
 						// The invocation counter is advisory budget state; a failed advisory
 						// write must not block a read-only scout. Settlement writes keep
 						// their strict fault guarantees.
-						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
+						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						handle = await run.runtime.create(run.handle.owner, { role: "scout", maxToolCalls: MAX_SCOUT_TOOL_CALLS, ...(run.model ? { model: run.model } : {}) });
 						run.setContext(handle, context);
 						cap = run.runtime.scoutCap(handle, MAX_SCOUT_TOOL_CALLS);
@@ -1217,7 +1360,7 @@ export default {
 						// The accumulated totals are advisory: they ride the next strict
 						// settlement write, with a best-effort persist here so a claimed
 						// run keeps them across reloads without ever blocking the answer.
-						if (run.lease) { try { await persist(context.sessionID, run); } catch {} }
+						if (run.lease && !run.persistFlight) { try { await persist(context.sessionID, run); } catch {} }
 						const capped = result.role === "scout" ? (cap.refused || result.capped) : false;
 						const { text } = formatScoutResponse({ status: result.status, text: result.text, errorMessage: result.errorMessage, capped, usage: result.usage });
 						response = { content: text, metadata: { childSessionID: handle.reference?.id, status: result.status, capped, questions: questions.length } };
@@ -1266,6 +1409,14 @@ export default {
 						const unresolvedStatus = run.runtime.status(run.handle);
 						const unsettled = unresolvedStatus.unsettled;
 						const persistResult = async (result: import("../core/worker.ts").WorkerTurnResult) => {
+							// The proven terminal result updates a matching stop record
+							// before the settlement clears the pending intent: after a
+							// successful cancelled-work reconciliation, stop feedback
+							// must read confirmed termination instead of a still
+							// unconfirmed interrupt. confirmStop is idempotent and
+							// bounded-wait on its persistence, like on the bus path.
+							const stop = readExecutorStop(run.adapterData?.fusionStop);
+							if (stop?.requestId === result.requestId) await confirmStop(context.sessionID, run, stop, result.status);
 							await run.controller.persistSettlement(result.status, async () => {
 								// The reconciled turn's usage is recorded inside the
 								// persisted settlement itself, so a reload before
@@ -1282,8 +1433,7 @@ export default {
 								// collected for; anything else gets empty evidence.
 								const retained = run.lastResult;
 								run.lastResult = { requestId: result.requestId, status: result.status, text: result.text, evidence: retained?.requestId === result.requestId ? retained.evidence ?? [] : [] };
-								const value = { ...manifest(run), recovery: "settled" as const };
-								await run.lease!.save(value); await store.save(value);
+								await persist(context.sessionID, run, true);
 							});
 						};
 						const result = unsettled
@@ -1302,8 +1452,8 @@ export default {
 						const parsed = run.controller.executorReport(result.text);
 						const stat = await workspaceDiffStat(run.before, nodeGitExec);
 						run.before = undefined;
-						if (terminalState !== "completed") return { content: `Fusion executor ${terminalState}: ${result.text}\nReview the full working tree before deciding whether to revise.`, metadata: { childSessionID: run.handle.reference?.id, action: pending.action, status: terminalState } };
-						return { content: formatCompactReport(parsed.report, stat, parsed.prose, ["reconciled background turn; review the full working tree"]), metadata: { childSessionID: run.handle.reference?.id, action: pending.action, status: terminalState } };
+						if (terminalState !== "completed") return { content: `Fusion executor ${terminalState}: ${result.text}\nReview the full working tree before deciding whether to revise.`, metadata: { childSessionID: run.handle.reference?.id, requestId: pending.requestId, action: pending.action, status: terminalState } };
+						return { content: formatCompactReport(parsed.report, stat, parsed.prose, ["reconciled background turn; review the full working tree"]), metadata: { childSessionID: run.handle.reference?.id, requestId: pending.requestId, action: pending.action, status: terminalState } };
 					} finally { run.reconciling = false; }
 				},
 			});
@@ -1340,6 +1490,7 @@ export default {
 					if (scoutInFlight || hasBackgroundScout()) throw new Error("A Fusion scout is still running; wait for it to stop before resetting.");
 					const run = runs.get(context.sessionID);
 					if (!run) return { content: "No Fusion run in this session." };
+					if (run.stopFlight || run.interruptFlight || readExecutorStop(run.adapterData?.fusionStop) && run.persistFlight) throw new Error("Executor stop or persistence is still in progress.");
 					if (hasUnconfirmedPrompt(run)) throw new Error("Fusion prompt delivery is unconfirmed. Retry /fusion-run with the same task before resetting.");
 					const error = run.controller.resetError(false, run.reconciling);
 					if (error) throw new Error(error);
@@ -1454,6 +1605,17 @@ export default {
 					return await reportCommand(args.sessionID, "Fusion clean", await cleanWorkspace(args.sessionID));
 				},
 			});
+			editor.add({
+				name: "fusion-stop",
+				description: "Stop the owned executor immediately and report observed activity (no model call)",
+				async execute(args) {
+					if (!ctx.session.synthetic) throw new Error("This host cannot deliver Fusion stop feedback.");
+					const stop = await stopExecutor(args.sessionID, args.prompt?.text?.trim() || undefined);
+					if (!stop) return reportCommand(args.sessionID, "Fusion executor stop", "No Fusion run in this session.");
+					await stopNotice(args.sessionID, stop);
+					return stopFeedback(stop);
+				},
+			});
 		});
 		// Embedding hosts may call this on unload. Process exit also releases SQLite locks.
 		/** Dispose a native registration handle defensively: unload paths must never throw. */
@@ -1466,6 +1628,7 @@ export default {
 				busController.abort();
 				busSinks.delete(onScoutBusEvent);
 				busSinks.delete(onTurnBusEvent);
+				busSinks.delete(onStopBusEvent);
 				scoutGuards.clear();
 				settlementChains.clear();
 				activeScout = undefined;

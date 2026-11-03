@@ -38,6 +38,9 @@ permissions:
   - action: fusion_reset
     resource: "*"
     effect: deny
+  - action: fusion_stop
+    resource: "*"
+    effect: deny
   - action: fusion_reconcile
     resource: "*"
     effect: deny

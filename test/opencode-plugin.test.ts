@@ -633,7 +633,7 @@ describe("OpenCode Fusion plugin", () => {
 				transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
 			},
 		}, storage);
-		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean"]);
+		expect(commands.map((command) => command.name)).toEqual(["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]);
 		await expect(commands[0].execute({ sessionID: "one", prompt: { text: "  " } })).rejects.toThrow("Provide a task");
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build the thing" } });
 		expect(prompts).toHaveLength(1);
@@ -2341,5 +2341,253 @@ describe("/fusion-config command", () => {
 		// After the scout finishes, the deferral reason reflects its history.
 		await configCommand.execute({ sessionID: "one", prompt: { text: "other/big" } });
 		expect(published.at(-1)!.text).toContain("the next run (a scout has already run in this run): other/big");
+	});
+});
+
+test("compact delegation forwards the full brief and scoped live activity while keeping native ownership", async () => {
+	const tools = new Map<string, Tool>();
+	const updates: Record<string, unknown>[] = [];
+	const queue: { type: string; data: Record<string, unknown> }[] = [];
+	let wake: (() => void) | undefined;
+	let received = "";
+	const resultText = '```json\n{"status":"done","summary":"ok","checks":[],"files_changed":[],"blockers":[]}\n```';
+	await setupTest({
+		location: { directory: "/workspace" },
+		session: { context: async () => [], hook: async () => {} },
+		event: { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = queue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); } } }; } }) },
+		tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, nativeContext) => {
+			expect(nativeContext.sessionID).toBe("one");
+			expect((nativeContext as Context & { id: string }).id).toBe("parent-call");
+			received = input.prompt;
+			await nativeContext.progress({ sessionID: "child" });
+			for (const sessionID of ["unrelated-child", "child"]) queue.push(
+				{ type: "session.tool.input.started", data: { sessionID, id: "edit-call", name: "edit" } },
+				{ type: "session.tool.called", data: { sessionID, id: "edit-call", input: { secret: "not-for-progress" } } },
+				{ type: "session.tool.success", data: { sessionID, id: "edit-call", content: "not-for-progress" } },
+			);
+			wake?.();
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			return { output: { sessionID: "child", status: "completed", output: resultText } };
+		} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+	});
+	const ctx = { ...context("one"), id: "parent-call", progress: async (update: Record<string, unknown>) => { updates.push(update); } };
+	const brief = "Implement this complete multi-line brief.\nDo not drop any of its details.";
+	const result = await tools.get("fusion_delegate")!.execute({ action: "execute", title: "Implement objects", details: { brief, originalTask: "Object operations" } }, ctx);
+	expect(received).toContain(brief);
+	expect(result.metadata?.fusion).toMatchObject({ action: "execute", title: "Implement objects", phase: "completed", tools: 1, childSessionID: "child" });
+	expect(updates.some((update) => (update.fusion as { activity?: string })?.activity === "Running edit")).toBe(true);
+	expect(JSON.stringify(updates)).not.toContain("not-for-progress");
+});
+
+describe("owned executor stop", () => {
+	const tick = () => new Promise((resolve) => setTimeout(resolve, 30));
+	const result = { output: { sessionID: "child-stop", status: "completed", output: "partial result" } };
+
+	test("interrupts only the owned child, keeps pending work, and confirms only a fresh terminal", async () => {
+		const tools = new Map<string, Tool>();
+		const notices: { resume?: boolean; metadata?: Record<string, unknown> }[] = [];
+		const interrupts: { sessionID: string; resume?: boolean }[] = [];
+		const queue: { type: string; created: number; data: { sessionID: string } }[] = [];
+		let wake: (() => void) | undefined, entered!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({ location: { directory: "/workspace" },
+			event: { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = queue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); } } }; } }) },
+			session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { notices.push(input); }, interrupt: async (input) => { interrupts.push(input); return { interrupted: true }; } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => {
+				await ctx.progress({ sessionID: "child-stop" }); entered();
+				return await new Promise<never>((_resolve, reject) => { ctx.signal.addEventListener("abort", () => reject(new Error("cancelled by stop")), { once: true }); });
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one")).catch((error) => String(error));
+		await ready;
+		await expect(tools.get("fusion_stop")!.execute({}, context("two"))).rejects.toThrow("another session");
+		await expect(tools.get("fusion_stop")!.execute({}, context("one", "build"))).rejects.toThrow("primary agent");
+		expect(interrupts).toHaveLength(0);
+		const response = await tools.get("fusion_stop")!.execute({ reason: "User asked to stop" }, context("one"));
+		expect(response.content).toContain("not confirmed");
+		expect(interrupts).toEqual([{ sessionID: "child-stop", resume: false }]);
+		await pending;
+		const status = async () => JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect((await status()).pending).toBeTruthy();
+		const requestedAt = (response.metadata!.stop as { requestedAt: number }).requestedAt;
+		queue.push({ type: "session.execution.interrupted", created: requestedAt - 1, data: { sessionID: "child-stop" } }, { type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "unrelated-child" } }); wake?.(); await tick();
+		expect((await status()).stop.state).toBe("acknowledged");
+		queue.push({ type: "session.execution.interrupted", created: Date.now(), data: { sessionID: "child-stop" } }); wake?.(); await tick();
+		expect((await status()).stop).toMatchObject({ state: "confirmed", terminal: "cancelled" });
+		expect((await status()).pending).toBeTruthy();
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "retry" }, context("one"))).rejects.toThrow("was stopped");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).rejects.toThrow("uncertain");
+		expect(notices.length).toBeGreaterThan(0);
+		expect(notices.every((notice) => notice.resume === false)).toBe(true);
+	});
+
+	test.each(["unsupported", "foreign"])("reports %s interruption honestly without releasing uncertainty", async (scenario) => {
+		const tools = new Map<string, Tool>();
+		let interruptions = 0;
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {},
+			...(scenario === "foreign" ? { get: async ({ sessionID }: { sessionID: string }) => ({ id: sessionID, parentID: "another-supervisor", location: { directory: "/workspace" } }), interrupt: async () => { interruptions++; } } : {}),
+		}, tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { ...result.output, status: "running" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } } });
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"));
+		const response = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(response.metadata?.stop).toMatchObject({ state: "failed" });
+		expect(response.content).toContain("not confirmed");
+		expect(interruptions).toBe(0);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.uncertain).toBe(true);
+		expect(status.pending).toBeTruthy();
+	});
+
+	test("queues a stop before the native child is published", async () => {
+		const tools = new Map<string, Tool>();
+		let entered!: () => void, publish!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const gate = new Promise<void>((resolve) => { publish = resolve; });
+		const interrupted: string[] = [];
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {}, interrupt: async ({ sessionID }) => { interrupted.push(sessionID); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { entered(); await gate; await ctx.progress({ sessionID: "child-stop" }); return { output: { ...result.output, status: "running" } }; } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"));
+		await ready;
+		const response = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(response.metadata?.stop).toMatchObject({ state: "requested" });
+		expect(interrupted).toHaveLength(0);
+		publish(); await pending; await tick();
+		expect(interrupted).toEqual(["child-stop"]);
+	});
+
+	test("cancelling the supervisor requests child interruption and suppresses continuation nudges", async () => {
+		const tools = new Map<string, Tool>();
+		const queue: { type: string; data: { sessionID: string } }[] = [];
+		const nudges: unknown[] = [], interrupted: string[] = [];
+		let wake: (() => void) | undefined, entered!: () => void;
+		let hook!: (event: { agent: string; tools: Record<string, unknown>; sessionID?: string }) => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		await setupTest({ location: { directory: "/workspace" },
+			event: { subscribe: () => ({ [Symbol.asyncIterator]() { return { next: async () => { for (;;) { const next = queue.shift(); if (next) return { value: next, done: false as const }; await new Promise<void>((resolve) => { wake = resolve; }); } } }; } }) },
+			session: { context: async () => [], hook: async (_name, callback) => { hook = callback; }, prompt: async (input) => { if (input.id?.startsWith("msg_fusion_nudge")) nudges.push(input); }, interrupt: async ({ sessionID }) => { interrupted.push(sessionID); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { await ctx.progress({ sessionID: "child-stop" }); entered(); return await new Promise<never>((_resolve, reject) => { ctx.signal.addEventListener("abort", () => reject(new Error("parent cancelled")), { once: true }); }); } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		});
+		const cancellation = new AbortController();
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, { ...context("one"), signal: cancellation.signal }).catch(() => undefined);
+		await ready;
+		cancellation.abort();
+		await pending;
+		await tick();
+		hook({ agent: "fusion", tools: {}, sessionID: "one" });
+		queue.push({ type: "session.execution.succeeded", data: { sessionID: "one" } }); wake?.();
+		await tick();
+		expect(interrupted).toEqual(["child-stop"]);
+		expect(nudges).toHaveLength(0);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.pending).toBeTruthy();
+		expect(status.stop.state).toBe("acknowledged");
+	});
+
+	test("a slow persistence write cannot prevent a pre-submission stop", async () => {
+		const tools = new Map<string, Tool>();
+		const memory = memoryStorage();
+		let release!: () => void, entered!: () => void, block = true, calls = 0;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const storage = { ...memory, set: async (key: string, value: unknown) => { if (key.startsWith("run/") && block) { block = false; entered(); await gate; } await memory.set(key, value); } };
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {} }, tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { calls++; return result; } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } } }, storage);
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one")).catch((error) => String(error));
+		await ready;
+		const stopped = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(stopped.metadata?.stop).toMatchObject({ persistenceWarning: true });
+		expect(calls).toBe(0);
+		release(); await pending;
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(calls).toBe(0);
+		expect(status.stop.state).toBe("not-submitted");
+		expect(status.pending).toBeUndefined();
+		expect(status.uncertain).toBe(false);
+	});
+
+	test("restored background work can be stopped without resubmitting it", async () => {
+		const tools = new Map<string, Tool>();
+		const storage = memoryStorage();
+		let submissions = 0, interruptions = 0;
+		const base = () => ({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {}, interrupt: async () => { interruptions++; } }, tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => { submissions++; return { output: { ...result.output, status: "running" } }; } }], transform: async (callback: (editor: { add(tool: Tool): void }) => void) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } } });
+		await setupTest(base(), storage);
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"));
+		await setupTest(base(), storage);
+		const stopped = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(stopped.metadata?.stop).toMatchObject({ state: "acknowledged" });
+		expect(submissions).toBe(1);
+		expect(interruptions).toBe(1);
+	});
+
+	test("a stalled reference persistence cannot delay interrupting the published child", async () => {
+		const tools = new Map<string, Tool>();
+		const memory = memoryStorage();
+		let entered!: () => void, publish!: () => void, release!: () => void;
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const publication = new Promise<void>((resolve) => { publish = resolve; });
+		const stalled = new Promise<void>((resolve) => { release = resolve; });
+		const interrupted: string[] = [];
+		let runWrites = 0;
+		// The second run-state write is the reference persistence inside
+		// recordReference (the first is the delegation intent), and it hangs.
+		const storage = { ...memory, set: async (key: string, value: unknown) => { if (key.startsWith("run/") && ++runWrites === 2) await stalled; await memory.set(key, value); } };
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {}, interrupt: async ({ sessionID }) => { interrupted.push(sessionID); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async (_input, ctx) => { entered(); await publication; await ctx.progress({ sessionID: "child-stop" }); return await new Promise<never>((_resolve, reject) => { const cancel = () => reject(new Error("cancelled by stop")); if (ctx.signal.aborted) cancel(); else ctx.signal.addEventListener("abort", cancel, { once: true }); }); } }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const pending = tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one")).catch((error) => String(error));
+		await ready;
+		// The stop is queued while the child reference is still unpublished.
+		await tools.get("fusion_stop")!.execute({}, context("one"));
+		publish();
+		// Publication interrupts the owned child before the stalled write
+		// returns: only a later qualifying bus event would retry otherwise.
+		for (let i = 0; i < 500 && interrupted.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(interrupted).toEqual(["child-stop"]);
+		// Releasing the write lets the delegation unwind; no duplicate interrupt.
+		release();
+		await pending;
+		await tick();
+		expect(interrupted).toEqual(["child-stop"]);
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.stop.state).toBe("acknowledged");
+	});
+
+	test("reconciliation of cancelled work confirms the matching stop record", async () => {
+		const tools = new Map<string, Tool>();
+		const notices: { description?: string; text: string; resume?: boolean }[] = [];
+		const messages: unknown[] = [];
+		let interruptedChild = false;
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => messages, hook: async () => {}, synthetic: async (input) => { notices.push(input); }, interrupt: async () => { interruptedChild = true; } }, tool: {
+			hook: async () => {}, list: async () => [{ id: "subagent", execute: async (input, ctx) => {
+				await ctx.progress({ sessionID: "child-stop" });
+				// The host collects the completion proof while the turn is still running.
+				messages.push({ type: "synthetic", description: input.description, metadata: { source: "subagent", childID: "child-stop", agent: "fusion-executor", state: "cancelled" }, text: `<subagent sessionID="child-stop" state="cancelled" description="${input.description}">\nExecutor turn ended without producing output.\n</subagent>` });
+				return { output: { sessionID: "child-stop", status: "running", output: "" } };
+			} }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); },
+		} }, memoryStorage());
+		// The executor turn goes background (managed natively), so it is
+		// uncertain with a retained pending request.
+		await tools.get("fusion_delegate")!.execute({ action: "execute", brief: "work" }, context("one"));
+		const stopped = await tools.get("fusion_stop")!.execute({}, context("one"));
+		expect(interruptedChild).toBe(true);
+		expect(stopped.metadata?.stop).toMatchObject({ state: "acknowledged" });
+		// Before reconciliation the stop feedback still says unconfirmed.
+		expect(stopped.content).toContain("Termination is not confirmed");
+		const before = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(before.stop.state).toBe("acknowledged");
+		// The completion notification proves the turn ended cancelled.
+		const reconciled = await tools.get("fusion_reconcile")!.execute({}, context("one"));
+		expect(reconciled.content).toContain("cancelled");
+		const after = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(after.stop).toMatchObject({ state: "confirmed", terminal: "cancelled" });
+		expect(after.stop.childSessionID).toBe("child-stop");
+		expect(after.uncertain).toBe(false);
+		expect(after.pending).toBeUndefined();
+		// The fresh feedback reports the proven termination, not the stale one.
+		const confirmation = notices.at(-1)!;
+		expect(confirmation.description).toContain("Fusion executor stop");
+		expect(confirmation.text).toContain("Executor turn stopped (cancelled).");
+		// The settled stop keeps refusing further delegation until reset.
+		await expect(tools.get("fusion_delegate")!.execute({ action: "revise", brief: "fix" }, context("one"))).rejects.toThrow("was stopped");
+		await expect(tools.get("fusion_reset")!.execute({}, context("one"))).resolves.toHaveProperty("content", "Fusion run reset.");
 	});
 });

@@ -176,7 +176,7 @@ export default { id: "fusion-load-probe", async setup(ctx) {
 	}
 	const commands = first.listOf(await first.get("/api/command"));
 	const commandNames = commands.map((command) => command?.name);
-	for (const name of ["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean"]) check(`command ${name} is registered`, commandNames.includes(name), commandNames);
+	for (const name of ["fusion-run", "fusion-mode", "fusion-config", "fusion-status", "fusion-stats", "fusion-resume", "fusion-clean", "fusion-stop"]) check(`command ${name} is registered`, commandNames.includes(name), commandNames);
 	const plugins = first.listOf(await first.get("/api/plugin"));
 	const fusionPlugin = plugins.find((plugin) => plugin?.id === "fusion");
 	check("the fusion plugin is active from a non-builtin source", fusionPlugin?.state?.status === "active" && !!fusionPlugin?.source && fusionPlugin.source.type !== "builtin", fusionPlugin);
