@@ -2,6 +2,7 @@ import { FusionController } from "./core/controller.ts";
 import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
+import { stopFusionRun, STOPPED_RUN_REFUSAL } from "./pi/run-stop.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
@@ -123,6 +124,12 @@ interface FusionScoutDetails {
 	error?: string;
 	usage?: Usage;
 	transcript?: string;
+}
+
+interface FusionStopDetails {
+	recap: string;
+	stopped: boolean;
+	abort: "delivered" | "unavailable" | "failed" | "skipped";
 }
 
 interface FusionState {
@@ -878,6 +885,9 @@ export default function (pi: ExtensionAPI) {
 			if ((await unresolvedRuns(ctx.cwd, state.runId)).length > 0) return respond("An interrupted Fusion run requires recovery before new delegation. Use /fusion-resume or /fusion-resolve.");
 			if (changingMode) return respond("Fusion mode change is in progress.");
 			if (resolvingRun) return respond("Fusion recovery resolution is in progress.");
+			// A stopped run refuses new executor work; resume stays available as
+			// the recovery path for an interrupted durable turn.
+			if (state.activeRun?.stopped && params.action !== "resume") return respond(STOPPED_RUN_REFUSAL);
 			const error = controller.validateDelegation(params.action, params.brief);
 			if (error) return respond(error);
 
@@ -1337,6 +1347,8 @@ export default function (pi: ExtensionAPI) {
 			const limitError = scoutLimitError(state.scoutCalls);
 			if (limitError) return respond(limitError);
 
+			if (state.activeRun?.stopped) return respond(STOPPED_RUN_REFUSAL);
+
 			if (!state.executorModel) {
 				return respond("No fusion executor model configured. Run /fusion-config first.");
 			}
@@ -1417,6 +1429,48 @@ export default function (pi: ExtensionAPI) {
 				(isPartial ? details?.transcript : undefined) ||
 				(fallback?.type === "text" ? fallback.text : "");
 			const color = details?.error ? "error" : isPartial ? "muted" : "text";
+			return new Text(theme.fg(color, text), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "fusion_stop",
+		label: "Fusion Stop",
+		description:
+			"Stop the Fusion executor for the current run and return a bounded recap of what ran and what to do next. Call this immediately when the user asks to stop, cancel, or halt the executor; do not start more executor or scout work afterwards. The recap is deterministic state, not a model summary: last observed activity, pending request, abort delivery, and the recovery path. Partial edits stay in the working tree.",
+		parameters: Type.Object({
+			reason: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+		}),
+		async execute(_toolCallId, params, _signal, onUpdate, ctx): Promise<AgentToolResult<FusionStopDetails>> {
+			const respond = (recap: string, stopped: boolean, abort: FusionStopDetails["abort"]): AgentToolResult<FusionStopDetails> => ({
+				content: [{ type: "text", text: recap }],
+				details: { recap, stopped, abort },
+			});
+			if (changingMode) return respond("Fusion mode change is in progress; retry the stop afterwards.", false, "skipped");
+			if (resolvingRun) return respond("Fusion recovery resolution is in progress; retry the stop afterwards.", false, "skipped");
+			const outcome = await stopFusionRun({
+				activeRun: state.activeRun,
+				uncertain: controller.uncertain,
+				abortExecutor: async () => { const handle = state.executorHandle ?? await state.executorReady; if (!handle) throw new Error("No executor handle is available in this session."); await handle.abort(); },
+				executorLabel: executorLabel(),
+				backend: state.executorSessionBackend ?? state.executorBackend,
+				activity: state.executorActivity,
+				transcriptTail: state.executorTranscript.slice(-5),
+				persist: persistRunCritical,
+			}, params.reason);
+			appendExecutorProgress(`[stop] ${outcome.text.split("\n")[0]}`);
+			updateWidget(ctx);
+			onUpdate?.({ content: [{ type: "text", text: outcome.text }], details: { recap: outcome.text, stopped: outcome.stopped, abort: outcome.abort } });
+			return respond(outcome.text, outcome.stopped, outcome.abort);
+		},
+		renderCall(_args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold("fusion_stop ")), 0, 0);
+		},
+		renderResult(result, _meta, theme) {
+			const details = result.details as FusionStopDetails | undefined;
+			const fallback = result.content.find((part) => part.type === "text");
+			const text = (details?.recap ?? (fallback?.type === "text" ? fallback.text : "")) || "Fusion stop";
+			const color = details && !details.stopped ? "error" : "text";
 			return new Text(theme.fg(color, text), 0, 0);
 		},
 	});
@@ -1564,8 +1618,9 @@ export default function (pi: ExtensionAPI) {
 				: "";
 			const owned = workspaceLease?.manifest ?? (await (await registry()).inspect(await canonical(ctx.cwd)))?.manifest;
 			const ownership = owned ? ` | owner ${owned.owner.harness}:${owned.owner.supervisorId} | run ${owned.runId} | recovery ${owned.recovery}${owned.pending ? ` | pending ${owned.pending.action}:${owned.pending.requestId}` : ""}` : "";
+			const stopped = state.activeRun?.stopped ? ` | stopped ${state.activeRun.stopped.at}${state.activeRun.stopped.reason ? ` (${state.activeRun.stopped.reason})` : ""}` : "";
 			ctx.ui.notify(
-				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${ownership}${lastTimings}`,
+				`Fusion mode ${mode} | cohort ${RECENT_MODEL_COHORT} | supervisor ${supervisor} | executor ${executor} | phase ${state.phase} | revisions ${state.revisions}/${MAX_REVISIONS} | final fix ${state.finalFixUsed ? 1 : 0}/${MAX_FINAL_FIXES} | scout calls ${state.scoutCalls}/${MAX_SCOUT_CALLS} | scout thinking ${state.scoutThinking} | scout usage ${formatUsageSummary(state.scoutUsage)} | supervisor usage ${formatUsageSummary(state.supervisorUsage)} | executor usage ${formatUsageSummary(state.executorUsage)} | executor activity ${state.executorActivity ?? "-"} | backend ${state.executorBackend}${controller.uncertain ? " | executor outcome uncertain" : ""}${stopped}${ownership}${lastTimings}`,
 				"info",
 			);
 		},

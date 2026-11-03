@@ -117,7 +117,7 @@ try {
 		exec: async () => ({ code: 1, stdout: "" }),
 	});
 	assert("boot", "registered the documented Pi surface",
-		tools.has("fusion_delegate") && tools.has("fusion_scout") && commands.has("fusion") && commands.has("fusion-resume") && commands.has("fusion-resolve"));
+		tools.has("fusion_delegate") && tools.has("fusion_scout") && tools.has("fusion_stop") && commands.has("fusion") && commands.has("fusion-resume") && commands.has("fusion-resolve"));
 
 	const optionLabel = (option) => String(option?.label ?? option?.value ?? option);
 	const notificationsWith = (text) => notifications.filter((n) => n.message.toLowerCase().includes(text.toLowerCase()));

@@ -30,7 +30,7 @@ const buildHost = () => {
 };
 
 const expected = {
-	tools: ["fusion_delegate", "fusion_scout"],
+	tools: ["fusion_delegate", "fusion_scout", "fusion_stop"],
 	commands: ["fusion", "fusion-clean", "fusion-config", "fusion-mode", "fusion-resolve", "fusion-resume", "fusion-stats", "fusion-status"],
 	hooks: ["agent_before_settle", "agent_end", "agent_settled", "input", "session_shutdown", "session_start"],
 };
