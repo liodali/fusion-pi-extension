@@ -156,6 +156,9 @@ has no dependencies — no Pi SDKs and no `@opencode/plugin` SDK — and loading
 it through the native `plugins` entry, an empty-agent project, and a full
 model-free run lifecycle are covered by `bun run test:opencode-package-load`.
 
+The development version additionally provides `/fusion-stop` and an executor
+activity card for OpenCode 2.2.5. They are not part of the v0.1.3 tag.
+
 ### Downloading a GitHub Actions package
 
 Run **Package OpenCode plugin** from the repository's Actions tab (Run
@@ -242,6 +245,15 @@ OpenCode (user-facing commands): `fusion-run` — starts a run,
 `fusion-mode` — persistent mode gate, `fusion-status`, `fusion-stats`,
 `fusion-resume`, `fusion-clean`. The supervisor calls `fusion_reset` itself
 at summary time unless the task says otherwise.
+
+In the development version, use `/fusion-stop`, click **Stop executor** in the
+activity card, or ask the Fusion supervisor to stop its executor. The stop
+request targets the current supervisor's child and reports the last observed
+tool activity without an extra model call. An acknowledged request is not
+proof of termination. Partial changes remain in the working tree; check
+`/fusion-status` and `/fusion-resume`, inspect the changes, and follow the
+reconciliation or operator-resolution instructions before cleanup. Background
+activity may be unavailable until a completion notification is reconciled.
 
 Pi: the `fusion` command starts a run; `fusion-status` / `fusion-stats` /
 `fusion-resume` / `fusion-clean` mirror the OpenCode controls;

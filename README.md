@@ -110,6 +110,13 @@ OpenCode's native selector. OpenCode uses
 `/fusion-mode on` and `/fusion-mode off` for persistent mode. After an
 interruption, use `/fusion-resume` and follow its recovery instructions.
 
+The current development version also shows a compact executor activity card
+in OpenCode 2.2.5. Click **Stop executor**, run `/fusion-stop`, or ask the
+supervisor to stop it. The feedback shows the last observed activity; a stop
+request is not proof that the executor has finished. Check `/fusion-status`
+and `/fusion-resume`, inspect partial edits, and reconcile retained work
+before cleanup. These controls are not included in the v0.1.3 tag.
+
 The dedicated package has no dependencies (no Pi SDKs, no plugin SDK). The
 workflow uploads a package artifact; it does not publish to npm or create a
 GitHub release, so `opencode plugin add fusion-opencode` becomes available
@@ -143,9 +150,10 @@ pi --extension ./src/index.ts
 
 | Goal | Pi | OpenCode |
 | --- | --- | --- |
-| Configure models | `/fusion-config` | Ask the supervisor to call `fusion_configure` |
+| Configure models | `/fusion-config` | `/fusion-config` |
 | Start a task | `/fusion <task>` | `/fusion-run <task>` |
 | Inspect current work | `/fusion-status` | `/fusion-status` |
+| Stop an executor | Host interruption | `/fusion-stop` (development version) |
 | Inspect usage | `/fusion-stats [N]` | `/fusion-stats` |
 | Inspect recovery options | `/fusion-resume` | `/fusion-resume` |
 | Release resources after work settles | `/fusion-clean` | `/fusion-clean` |
