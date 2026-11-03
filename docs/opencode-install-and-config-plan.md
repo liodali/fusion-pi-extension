@@ -416,6 +416,93 @@ prevents Build from discovering supervisor-only tools; it does not claim to
 prove the cause of the historical model response. The user's project files
 remain untouched.
 
+## OpenCode delegation UI and executor stop (2026-11-03)
+
+Current release remains **v0.1.3**, commit `86797ff`. All work below is local,
+uncommitted, and unreleased. The user's other project has not been modified.
+
+Implemented locally:
+
+- Compact delegation input: `action`, short `title`, and nested
+  `details.brief` / `details.originalTask`. The full brief remains intact and
+  expandable. Legacy top-level brief calls remain accepted by the schema and
+  runtime; historical rows are not rewritten.
+- OpenCode TUI activity card above the composer: action/title, observed tool
+  activity/count, elapsed time, and navigation to the owned executor child.
+  Activity ignores reasoning, text deltas, shell arguments, and tool results.
+- UI updates use existing scoped WorkerEvents and native progress metadata;
+  no extra model calls or network polling. The elapsed timer runs only while
+  active. Pi entrypoints remain separate; Pi UI expansion is deferred.
+- Found and fixed bare-package JSX loading failure (`@opentui/solid` could
+  not resolve after runtime JSX transformation). `src/opencode/tui.ts` now
+  uses explicit host render primitives. Both package manifests export `./tui`.
+- Added `fusion_stop`, `/fusion-stop`, and a clickable Stop executor control.
+  Stop targets only the owning session's executor, disables continuation
+  nudges/new delegation/scouting, preserves partial edits and unresolved
+  ownership, and provides bounded deterministic feedback without asking a
+  model to summarize. Parent cancellation also requests child interruption.
+- Stop-before-reference requests are retained, interruptions pass
+  `resume: false`, and termination is confirmed only by fresh owned-child
+  terminal evidence or a matching worker result. RPC acknowledgement alone
+  is not confirmation. Restored background work remains stoppable.
+- Added serialized per-run persistence and bounded stop waits so a slow
+  write does not prevent interruption. Advisory scout writes skip an already
+  busy persistence queue; strict settlement writes remain ordered.
+- Progress delivery has a bounded coalescing queue and cannot block executor
+  submission, stopping, or settlement. Reconciliation display matches both
+  the child and request ID; completion during a stop is reported as completion.
+
+Review fixes (2026-11-03, local):
+
+- Stop records requested before publication now interrupt a newly
+  discovered owned child independently of the reference persistence write,
+  while persistence still gates the forwarded progress overlay. Previously
+  a stalled write delayed the interrupt until another qualifying bus
+  event arrived. The pre-submission branch is unchanged: an idle child
+  still only produces the stop-before-submission throw (an idle child
+  needs no interruption), and it still follows the persisted intent.
+- Reconciliation of a backgrounded turn now updates and persists a
+  matching stop record from the proven terminal result before the
+  settlement clears the pending intent, so cancelled-work reconciliation
+  no longer leaves stop feedback claiming an unconfirmed termination.
+  A stale confirmed record produces no second feedback.
+
+Validation so far:
+
+- The full suite passed with 418 tests, including parent cancellation and
+  completion-during-stop feedback. With the review fixes the suite grew to
+  420 tests, adding the stalled-persistence interruption regression and the
+  cancelled-work reconciliation feedback regression; both fail when the
+  respective fix is reverted. Native visual, native stop, smoke, and Pi
+  loading fixtures passed with the fixes in place.
+- The native visual fixture passed using a bare installed tarball. It checks
+  the compact card, live and completed states, Stop button dispatch, and
+  acknowledged feedback. Its activity feed is deterministic fixture data.
+- A model-free native stop fixture passed using a bare installed tarball:
+  real OpenCode created and interrupted the owned child, Fusion confirmed
+  its cancelled outcome, and the pending request remained for recovery.
+  A context hook blocks the child before any provider request; a driver
+  invokes delegation without a supervisor model call.
+- Native package loading, tool visibility, Pi entrypoint loading, and
+  TypeScript checks passed. No paid model or provider credentials were used.
+
+Next steps:
+
+1. Review and commit the changes, then prepare a new version and package when
+   a release is requested; the v0.1.3 tag does not contain these controls.
+2. Perform a real-model user acceptance run in OpenCode to check ordinary
+   supervisor behavior, display, cancellation, feedback, and recovery together.
+   The model-free probes do not demonstrate model compliance with the prompts.
+3. Consider a Pi presentation and stop control separately; its existing
+   entrypoint and behavior have not been migrated to these OpenCode controls.
+
+Main files: `src/opencode/delegate-presentation.ts`, `activity-view.ts`,
+`executor-stop.ts`, `tui.ts`, and `index.ts`;
+`test/opencode-delegate-presentation.test.ts`, `test/opencode-plugin.test.ts`,
+and `test/integration/opencode-{delegate-display,stop-native}.mjs`. Development-only UI
+types/libraries and the headless terminal emulator were added to package.json;
+the generated OpenCode runtime package still has no dependencies.
+
 ## References
 
 - Native installation and package sources: https://dev.opencode.ai/v2/docs/plugins/
