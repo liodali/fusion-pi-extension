@@ -28,6 +28,9 @@ export interface FusionRun {
 	conversationId?: number;
 	/** Write-ahead identity of the last unsettled executor submission. */
 	pending?: { action: "execute" | "revise" | "final_fix"; requestId: string };
+	/** Set when the supervisor stopped the run; refuses further executor and
+	 * scout work until recovery or cleanup. */
+	stopped?: { at: string; reason?: string };
 	manualResolution?: { at: string };
 	metrics?: FusionRunMetrics;
 	status: FusionRunStatus;
