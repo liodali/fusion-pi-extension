@@ -734,10 +734,11 @@ describe("OpenCode Fusion plugin", () => {
 		expect(record).toHaveProperty("fusion_status");
 		expect(record).toHaveProperty("fusion_stats");
 		expect(record).toHaveProperty("read");
-		// Non-fusion agents are never touched.
+		// Other agents must not discover tools that requireSupervisor rejects.
 		const buildRecord: Record<string, unknown> = { fusion_delegate: {}, read: {} };
 		contextHook({ agent: "build", tools: buildRecord, sessionID: "one" });
-		expect(buildRecord).toHaveProperty("fusion_delegate");
+		expect(buildRecord).not.toHaveProperty("fusion_delegate");
+		expect(buildRecord).toHaveProperty("read");
 		// /fusion starts the run: tools become visible for that session.
 		await commands[0].execute({ sessionID: "one", prompt: { text: "Build it" } });
 		record = fusionTools();
@@ -747,6 +748,11 @@ describe("OpenCode Fusion plugin", () => {
 		await tools.get("fusion_reset")!.execute({}, context("one"));
 		record = fusionTools();
 		expect(record).toHaveProperty("fusion_start");
+		const configCommand = commands.find((command) => command.name === "fusion-config")!;
+		const diagnostic = await configCommand.execute({ sessionID: "one" });
+		expect(diagnostic).toContain("Fusion mode: on.");
+		expect(diagnostic).toContain("Last Fusion context hook: agent=fusion;");
+		expect(diagnostic).toContain("fusion_start");
 		// Reload: the persisted mode survives, and the new instance's toggle owns it now.
 		await setupTest(base() as TestContext, storage);
 		const commandsAfterReload: CommandDefinition[] = [];

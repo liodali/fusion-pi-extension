@@ -84,7 +84,7 @@ the host; the ownership registry is shared across harnesses (below).
 ### Native Git install (Fusion 0.1.1+, OpenCode v2.2.5)
 
 ```sh
-opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.2'
+opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.3'
 ```
 
 This installs into OpenCode's global plugin configuration. Restart OpenCode
@@ -92,7 +92,7 @@ in your workspace, then use `/fusion-config` and `/fusion-run <task>`.
 All three agents are registered automatically; no wrapper or Markdown copy
 is needed. Remove any previous Fusion wrapper before enabling the package.
 The referenced release tag must exist on GitHub. To use the development
-branch after these changes are pushed, replace `#v0.1.2` with `#main`.
+branch after these changes are pushed, replace `#v0.1.3` with `#main`.
 
 The Git package preserves its Pi default export and supplies OpenCode through
 `exports["./server"]`, which OpenCode v2.2.5 prefers over `exports["."]`.
@@ -327,6 +327,7 @@ Model-free (always safe to run):
 | OpenCode registration/catalog/configure/run-start smoke (v2.2.x host) | `bun run test:opencode-smoke` |
 | Pi extension install-shim load | `bun run test:pi-load` |
 | Native agent/command surfaces, reload, and isolated package-manager removal/reinstall (OpenCode v2.2.5) | `bun run test:opencode-native` |
+| Actual per-turn Fusion tool visibility with mode off/on and Build → Fusion switching, aborted before model requests | `bun run test:opencode-tool-visibility` |
 | Dedicated package load, configuration persistence across restart, recovery CLI, and legacy-agent coexistence | `bun run test:opencode-package-load` |
 | Real cross-process workspace-claim hold | `bun run test:ownership-cross-process` |
 | Dependency contract (entrypoints, closure isolation, consumer pins) | `bun test test/package-isolation.test.ts` |
@@ -358,6 +359,16 @@ Network/opt-in (consumes something — registry or model usage):
 | Full Pi acceptance workflow live (real Pi SDK executor/scout sessions; supervisor fixture-driven — real-worker integration, not native supervisor acceptance; `--model zai/glm-5.3-flash`, `--supervisor opencode-go/gemini-4-argon` defaults) | `bun run test:pi-parity` |
 
 ### Integration artifacts
+
+If the supervisor says Fusion tools are unavailable, stop the turn and run
+`/fusion-config` in that same session. Versions 0.1.3 and later show
+the instance's loaded mode and the Fusion tools left by its last context
+hook. This is diagnostic evidence, not a live model turn or a claim about
+later filters from other plugins. With mode on, a Fusion turn should include
+`fusion_start`, `fusion_scout`, and `fusion_delegate`; Build should receive
+no Fusion tools. Earlier rejected Build calls do not establish current Fusion
+tool availability. The native visibility fixture checks these states without
+credentials, model requests, or project edits.
 
 Every integration fixture writes a **sanitized artifact** to `artifacts/`
 under the repository root (local-only, gitignored; override with

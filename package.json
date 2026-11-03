@@ -1,6 +1,6 @@
 {
   "name": "pi-fusion-extension",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Supervisor-executor orchestration extension for Pi and OpenCode",
   "type": "module",
   "keywords": [
@@ -48,6 +48,7 @@
     "test:opencode-lifecycle": "bun test/integration/opencode-real-child-lifecycle.mjs",
     "test:opencode-scout": "bun test/integration/opencode-scout.mjs",
     "test:opencode-native": "bun test/integration/opencode-native-surface.mjs",
+    "test:opencode-tool-visibility": "bun test/integration/opencode-tool-visibility.mjs",
     "test:opencode-package-load": "bun test/integration/opencode-package-load.mjs",
     "test:opencode-parity": "bun run test:opencode-parity-syntax && bun test/integration/opencode-parity.mjs",
     "test:clean-install": "bun test/integration/clean-install.mjs",

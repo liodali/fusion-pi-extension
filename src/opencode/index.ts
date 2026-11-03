@@ -123,6 +123,7 @@ const SCOUT_AGENT = "fusion-scout";
 const SCOUT_TOOLS = new Set(["read", "grep", "glob"]);
 /** Fusion tools hidden from the fusion agent when persistent mode is off and its session has no active run. Read-only reporting tools stay visible. */
 const FUSION_GATED_TOOLS = ["fusion_start", "fusion_delegate", "fusion_scout", "fusion_reconcile", "fusion_reset", "fusion_configure"];
+const FUSION_TOOLS = [...FUSION_GATED_TOOLS, "fusion_resume", "fusion_stats", "fusion_status"];
 
 interface Run {
 	controller: FusionController;
@@ -274,12 +275,14 @@ export default {
 		// agents and redeliveries never nudge or settle the run.
 		const supervisorText = new Map<string, string>();
 		const turnAgent = new Map<string, string>();
+		const turnVisibility = new Map<string, { agent: string; tools: string[] }>();
 		const processedTurnIds = new Map<string, Set<string>>();
 		/** Settlement is serialized per run: one terminal settles at a time, in bus order. */
 		const settlementChains = new Map<string, Promise<void>>();
 		const forgetTurnState = (sessionID: string): void => {
 			supervisorText.delete(sessionID);
 			turnAgent.delete(sessionID);
+			turnVisibility.delete(sessionID);
 			processedTurnIds.delete(sessionID);
 		};
 		const seenTerminalId = (sessionID: string, id: string | undefined): boolean => {
@@ -502,6 +505,10 @@ export default {
 				if (turnAgent.size > 32) { const oldest = turnAgent.keys().next().value; if (oldest !== undefined) turnAgent.delete(oldest); }
 			}
 			if (event.agent === "fusion") delete event.tools.subagent;
+			// Match requireSupervisor at discovery time too. Showing Build tools
+			// it cannot execute seeds misleading failures into the conversation
+			// before the user switches to Fusion.
+			else for (const name of FUSION_TOOLS) delete event.tools[name];
 			// Defense in depth: hide every non-allowlisted tool from the scout agent
 			// when the host exposes child sessions here. The execute.before guard
 			// above stays the enforced boundary either way.
@@ -514,6 +521,10 @@ export default {
 			if (event.agent === "fusion" && !fusionMode) {
 				const sessionID = typeof event.sessionID === "string" ? event.sessionID : undefined;
 				if (!runs.get(sessionID ?? "")?.controller.state.runActive) for (const name of FUSION_GATED_TOOLS) delete event.tools[name];
+			}
+			if (event.sessionID) {
+				turnVisibility.set(event.sessionID, { agent: event.agent, tools: FUSION_TOOLS.filter((name) => Object.hasOwn(event.tools, name)).sort() });
+				if (turnVisibility.size > 32) turnVisibility.delete(turnVisibility.keys().next().value!);
 			}
 		});
 		// Native agent contribution (pinned live on OpenCode v2.2.5; see
@@ -856,8 +867,11 @@ export default {
 		function configStatusText(sessionID: string): string {
 			const format = (model: WorkerModelConfig | undefined) => model ? `${model.provider}/${model.modelId}${model.variant ? `#${model.variant}` : ""}` : undefined;
 			const run = runs.get(sessionID);
+			const visible = turnVisibility.get(sessionID);
 			return [
 				"Fusion executor model configuration.",
+				`Fusion mode: ${fusionMode ? "on" : "off"}.`,
+				visible ? `Last Fusion context hook: agent=${visible.agent}; tools=${visible.tools.join(", ") || "none"}.` : "Last Fusion context hook: no model turn observed in this session since plugin load.",
 				`Saved preference: ${format(preferredModel) ?? "none"}.`,
 				`Current run: ${run ? format(run.model) ?? "the host-configured model" : "no run in this session"}.`,
 				"Usage:",

@@ -46,7 +46,7 @@ jobs:
           bun test
           bun run typecheck
           bun run test:pi-load
-          bun run test:syntax test/integration/artifact.mjs test/integration/clean-install.mjs test/integration/opencode-native-surface.mjs test/integration/opencode-package-load.mjs
+          bun run test:syntax test/integration/artifact.mjs test/integration/clean-install.mjs test/integration/opencode-native-surface.mjs test/integration/opencode-package-load.mjs test/integration/opencode-tool-visibility.mjs
       - name: Test a clean OpenCode consumer install
         run: bun run test:clean-install
       - name: Pack installable plugins
@@ -58,7 +58,9 @@ jobs:
           cd dist
           sha256sum *.tgz > SHA256SUMS
       - name: Verify the native host surfaces (model-free)
-        run: bun run test:opencode-native
+        run: |
+          bun run test:opencode-native
+          bun run test:opencode-tool-visibility
       - name: Load the exact dedicated tarball through the package loader
         run: |
           FUSION_OPENCODE_TARBALL="$GITHUB_WORKSPACE/dist/fusion-opencode-$(node -p "require('./package.json').version").tgz" bun run test:opencode-package-load
@@ -83,4 +85,5 @@ jobs:
           path: |
             artifacts/opencode-native-surface-*.json
             artifacts/opencode-package-load-*.json
+            artifacts/opencode-tool-visibility-*.json
           if-no-files-found: ignore

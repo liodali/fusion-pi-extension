@@ -43,7 +43,7 @@ flowchart LR
 For Fusion **0.1.1+**, use OpenCode **2.2.5** and Bun for native Git installation:
 
 ```sh
-opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.2'
+opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.3'
 ```
 
 Restart OpenCode, then use `/fusion-config` and `/fusion-run <task>`. The
@@ -64,7 +64,7 @@ replacing the tarball path with your download:
 
 ```sh
 cd /path/to/your/project
-bun add /path/to/fusion-opencode-0.1.2.tgz
+bun add /path/to/fusion-opencode-0.1.3.tgz
 ```
 
 Then add the plugin to your project's `opencode.json(c)`. **Append to the

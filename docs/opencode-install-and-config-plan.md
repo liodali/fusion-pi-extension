@@ -386,6 +386,36 @@ is recorded under `artifacts/opencode-command-display-*.json`.
 This correction is prepared as version 0.1.2, with installation examples
 updated to the new tag. v0.1.1 remains unchanged.
 
+## Persistent-mode tool investigation (2026-11-02)
+
+Affected live session metadata confirmed mode saved as true, v0.1.2 active,
+earlier fusion_start rejections on the Build agent, and a subsequent Fusion
+assistant claiming tools were missing. Historical messages alone do not
+prove the tools actually supplied to that later model call.
+
+An isolated native context-hook probe observes nine Fusion tools with mode
+on/Fusion selected and only reporting tools with mode off. It also exposed a
+discovery defect: Build was offered tools that requireSupervisor rejected.
+The local fix hides Fusion tools from other agents and adds supervisor
+instructions to stop rather than implement directly when orchestration tools
+are unavailable. Prompt instructions guide behavior; they are not an enforced
+ban on direct edits.
+
+`test:opencode-tool-visibility` now covers mode off, mode on/Build, and mode
+on/Fusion in the same conversation, aborting before each model request. The
+corrected fixture passes: reporting tools, zero tools, all nine tools,
+respectively. `/fusion-config` gains loaded-mode and last-hook visibility
+diagnostics so the affected session can be inspected after installing the
+fix. The exact cause of that historical missing-tools claim remains
+unconfirmed; stale conversation assumptions are a hypothesis, not a proven
+host tool omission. No release or user-project modification was made.
+
+Version 0.1.3 packages these fixes and diagnostics, with the native visibility
+regression included in the packaging workflow. This improves diagnosis and
+prevents Build from discovering supervisor-only tools; it does not claim to
+prove the cause of the historical model response. The user's project files
+remain untouched.
+
 ## References
 
 - Native installation and package sources: https://dev.opencode.ai/v2/docs/plugins/
