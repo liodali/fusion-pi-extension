@@ -503,6 +503,43 @@ and `test/integration/opencode-{delegate-display,stop-native}.mjs`. Development-
 types/libraries and the headless terminal emulator were added to package.json;
 the generated OpenCode runtime package still has no dependencies.
 
+## Pi executor stop and Fusion mode visibility (2026-11-04, local)
+
+Review finding: the stop control existed only on OpenCode (native subagent);
+the Pi extension had the abort primitive (`WorkerHandle.abort`, durable
+conversation and session abort) but no supervisor-reachable stop, and
+`/fusion-mode` could not report its current state.
+
+Implemented locally:
+
+- `fusion_stop` Pi tool (`src/pi/run-stop.ts` + registration in
+  `src/index.ts`): the supervisor calls it when the user asks to stop. It
+  aborts a live executor conversation only when an uncertain pending turn
+  exists (an idle executor is not interrupted), marks the run
+  `stopped` in the persisted run record, and returns a deterministic recap:
+  run/task, executor label and backend, last observed activity, pending
+  request, revisions used, abort delivery (delivered / failed / nothing
+  running — never overstated), executor progress tail, and the
+  `/fusion-resume` / `/fusion-resolve` / `/fusion-clean` recovery path. No
+  model summarizes; a failed marker write keeps the in-memory stop and warns.
+- Stopped-run gating: `fusion_delegate` refuses execute/revise/final_fix and
+  `fusion_scout` refuses new calls with one shared recovery message; resume
+  stays available as the recovery path for an interrupted durable turn.
+  `/fusion-status` shows the stop marker. Mid-delegation stops remain host
+  interruptions (the Pi supervisor is blocked inside the tool call), which
+  already abort the executor through the delegation signal.
+- OpenCode `/fusion-mode` with no arguments reports the current mode, its
+  effect, and usage without touching storage; invalid arguments name all
+  three forms; `/fusion-status` now carries `fusionMode`.
+
+Validation: unit coverage in `test/pi-run-stop.test.ts` (recap contents,
+abort branches, idempotence, persistence failure, truncation) and
+`test/opencode-plugin.test.ts` (mode show/status); the Pi surface fixtures
+(`pi-load`, `pi-parity` registration) expect `fusion_stop`. The full suite
+passed with 429 tests. A live Pi stop against a real durable executor is
+still pending (the model-free fixtures register the surface; a real-model Pi
+acceptance run should exercise the stop and recap end to end).
+
 ## References
 
 - Native installation and package sources: https://dev.opencode.ai/v2/docs/plugins/
