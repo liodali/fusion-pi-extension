@@ -38,6 +38,7 @@ const manifest = {
 	bin: root.bin,
 	exports: {
 		".": "./src/opencode/index.ts",
+		"./tui": "./src/opencode/tui.ts",
 		"./package.json": "./package.json",
 	},
 };

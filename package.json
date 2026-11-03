@@ -25,6 +25,7 @@
     "./pi": "./src/index.ts",
     "./opencode": "./src/opencode/index.ts",
     "./server": "./src/opencode/index.ts",
+    "./tui": "./src/opencode/tui.ts",
     "./package.json": "./package.json"
   },
   "pi": {
@@ -49,6 +50,8 @@
     "test:opencode-scout": "bun test/integration/opencode-scout.mjs",
     "test:opencode-native": "bun test/integration/opencode-native-surface.mjs",
     "test:opencode-tool-visibility": "bun test/integration/opencode-tool-visibility.mjs",
+    "test:opencode-delegate-display": "bun test/integration/opencode-delegate-display.mjs",
+    "test:opencode-stop-native": "bun test/integration/opencode-stop-native.mjs",
     "test:opencode-package-load": "bun test/integration/opencode-package-load.mjs",
     "test:opencode-parity": "bun run test:opencode-parity-syntax && bun test/integration/opencode-parity.mjs",
     "test:clean-install": "bun test/integration/clean-install.mjs",
@@ -95,11 +98,15 @@
   "devDependencies": {
     "@earendil-works/pi-agent-core": "1.0.3",
     "@earendil-works/pi-ai": "1.0.3",
-    "@earendil-works/pi-coding-agent": "1.0.3",
     "@earendil-works/pi-codemode": "1.0.3",
+    "@earendil-works/pi-coding-agent": "1.0.3",
     "@earendil-works/pi-durable": "1.0.3",
     "@earendil-works/pi-tui": "1.0.3",
+    "@opencode/plugin": "2.2.5",
+    "@opentui/solid": "0.8.0",
     "@types/bun": "^1.4.2",
+    "@xterm/headless": "6.0.0",
+    "solid-js": "1.9.17",
     "typebox": "1.3.27",
     "typescript": "^5.9.2"
   }
