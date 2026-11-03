@@ -106,16 +106,21 @@ reviews its work. `/fusion-config` shows or sets the executor and scout model
 (`list [filter]` for catalog choices, `<provider>/<model> [variant]` to select —
 validated against the host catalog, split on the first slash so model IDs with
 slashes work, saved across restarts). The supervisor's own model stays
-OpenCode's native selector. OpenCode uses
-`/fusion-mode on` and `/fusion-mode off` for persistent mode. After an
-interruption, use `/fusion-resume` and follow its recovery instructions.
+OpenCode's native selector. OpenCode uses `/fusion-mode` (no arguments shows
+the current mode) and `/fusion-mode on` / `/fusion-mode off` for persistent
+mode, which `/fusion-status` also reports. After an interruption, use
+`/fusion-resume` and follow its recovery instructions.
 
 The current development version also shows a compact executor activity card
 in OpenCode 2.2.5. Click **Stop executor**, run `/fusion-stop`, or ask the
 supervisor to stop it. The feedback shows the last observed activity; a stop
 request is not proof that the executor has finished. Check `/fusion-status`
 and `/fusion-resume`, inspect partial edits, and reconcile retained work
-before cleanup. These controls are not included in the v0.1.3 tag.
+before cleanup. On Pi, asking the supervisor to stop calls `fusion_stop`,
+which aborts the live executor conversation (durable or session backend),
+refuses further executor and scout work for the run, and returns the same
+style of deterministic recap. These controls are not included in the v0.1.3
+tag.
 
 The dedicated package has no dependencies (no Pi SDKs, no plugin SDK). The
 workflow uploads a package artifact; it does not publish to npm or create a
@@ -153,7 +158,7 @@ pi --extension ./src/index.ts
 | Configure models | `/fusion-config` | `/fusion-config` |
 | Start a task | `/fusion <task>` | `/fusion-run <task>` |
 | Inspect current work | `/fusion-status` | `/fusion-status` |
-| Stop an executor | Host interruption | `/fusion-stop` (development version) |
+| Stop an executor | Ask the supervisor (`fusion_stop`) | `/fusion-stop` (development version) |
 | Inspect usage | `/fusion-stats [N]` | `/fusion-stats` |
 | Inspect recovery options | `/fusion-resume` | `/fusion-resume` |
 | Release resources after work settles | `/fusion-clean` | `/fusion-clean` |

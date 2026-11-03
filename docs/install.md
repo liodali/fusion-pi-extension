@@ -71,7 +71,7 @@ consumer directories (real tarball installs):
    ownership directory (below).
 
 Registration surface a Pi host sees — tools: `fusion_delegate`,
-`fusion_scout`; commands: `fusion`, `fusion-config`, `fusion-mode`,
+`fusion_scout`, `fusion_stop`; commands: `fusion`, `fusion-config`, `fusion-mode`,
 `fusion-status`, `fusion-stats`, `fusion-resume`, `fusion-resolve`,
 `fusion-clean`; events: `input`, `agent_end`, `agent_before_settle`,
 `agent_settled`, `session_start`, `session_shutdown`.
@@ -254,6 +254,13 @@ proof of termination. Partial changes remain in the working tree; check
 `/fusion-status` and `/fusion-resume`, inspect the changes, and follow the
 reconciliation or operator-resolution instructions before cleanup. Background
 activity may be unavailable until a completion notification is reconciled.
+
+On Pi, asking the supervisor to stop calls the `fusion_stop` tool: it aborts
+a live executor conversation (durable or session backend), marks the run
+stopped so further executor and scout work is refused, and returns a
+deterministic recap — last observed activity, pending request, abort
+delivery, and the `/fusion-resume` / `/fusion-resolve` / `/fusion-clean`
+recovery path. No model summarizes the stop.
 
 Pi: the `fusion` command starts a run; `fusion-status` / `fusion-stats` /
 `fusion-resume` / `fusion-clean` mirror the OpenCode controls;
