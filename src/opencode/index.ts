@@ -1066,7 +1066,7 @@ export default {
 					: !run.controller.state.executed
 					? "Investigate the original task, then call fusion_delegate with action execute."
 					: "Review the working tree and audit the original task; reset when the run is finished.";
-			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, agents: await agentReport(), nextAction });
+			return JSON.stringify({ ...run.controller.state, runId: run.runId, owner: run.handle.owner, workspaceClaimed: !!run.lease, model: run.model, fusionMode: fusionMode ? "on" : "off", pending: run.controller.pending, promptDelivery: promptDelivery?.state, nudgeDelivery, settlementWrite, incomplete: !!run.incomplete, childSessionID: run.handle.reference?.id, capabilities: run.runtime.capabilities, uncertain: run.controller.uncertain, backgroundPending: status.backgroundPending, reconciling: !!run.reconciling, stop: stopped, agents: await agentReport(), nextAction });
 		}
 		/** Resume presentation: recovery surface for the owned or adopted run.
 		 * Routed to fusion_reconcile only when exact completion proof can exist;
@@ -1554,11 +1554,18 @@ export default {
 			});
 			editor.add({
 				name: "fusion-mode",
-				description: "Toggle Fusion persistent mode [on|off]",
+				description: "Show or toggle Fusion persistent mode [on|off]",
 				execute: async (args) => {
 					if (!ctx.session.synthetic) throw new Error("This OpenCode host cannot deliver Fusion command output.");
 					const arg = args.prompt?.text?.trim().toLowerCase();
-					if (arg !== "on" && arg !== "off") throw new Error("Use /fusion-mode on or /fusion-mode off.");
+					// No argument is read-only: it reports the current mode without
+					// touching storage, like the /fusion-config no-argument view.
+					if (!arg) return await reportCommand(args.sessionID, "Fusion mode", [
+						`Fusion persistent mode is ${fusionMode ? "on" : "off"}.`,
+						fusionMode ? "Fusion tools stay available to the fusion agent between runs; tasks can start without /fusion-run." : "Fusion tools require an active run; /fusion-run starts one.",
+						"Usage: /fusion-mode <on|off>.",
+					].join("\n"));
+					if (arg !== "on" && arg !== "off") throw new Error("Use /fusion-mode, /fusion-mode on, or /fusion-mode off.");
 					const enabled = arg === "on";
 					await setFusionMode(enabled);
 					return await reportCommand(args.sessionID, "Fusion mode", enabled

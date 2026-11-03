@@ -708,6 +708,36 @@ describe("OpenCode Fusion plugin", () => {
 		expect(published).toEqual([{ sessionID: "one", description: "Fusion status\nNo Fusion run in this session.", text: "No Fusion run in this session.", resume: false }, { sessionID: "one", description: "Fusion stats\nNo Fusion run in this session.", text: "No Fusion run in this session.", resume: false }]);
 	});
 
+	test("/fusion-mode shows the current mode without arguments and status carries it", async () => {
+		const commands: CommandDefinition[] = [];
+		const tools = new Map<string, Tool>();
+		const published: { sessionID: string; text: string; description?: string; resume?: boolean }[] = [];
+		const storage = memoryStorage();
+		await setupTest({ location: { directory: "/workspace" }, session: { context: async () => [], hook: async () => {}, synthetic: async (input) => { published.push(input); } },
+			command: { list: async () => ({ data: [] }), transform: async (callback) => { callback({ add: (command) => { commands.push(command); } }); } },
+			tool: { hook: async () => {}, list: async () => [{ id: "subagent", execute: async () => ({ output: { sessionID: "child", status: "completed", output: "done" } }) }], transform: async (callback) => { callback({ add: (tool) => tools.set(tool.name, tool) }); } },
+		}, storage);
+		const mode = commands.find((command) => command.name === "fusion-mode")!;
+		expect(mode).toBeTruthy();
+		// No argument is read-only: reports the default without touching storage.
+		await mode.execute({ sessionID: "one", prompt: { text: "" } });
+		expect(String(published.at(-1)!.description)).toContain("Fusion mode");
+		expect(published.at(-1)!.text).toContain("Fusion persistent mode is off.");
+		expect(published.at(-1)!.text).toContain("Fusion tools require an active run; /fusion-run starts one.");
+		expect(published.at(-1)!.text).toContain("Usage: /fusion-mode <on|off>.");
+		expect(await storage.get("fusion-mode")).toBeUndefined();
+		await expect(mode.execute({ sessionID: "one", prompt: { text: "maybe" } })).rejects.toThrow("Use /fusion-mode, /fusion-mode on, or /fusion-mode off.");
+		await mode.execute({ sessionID: "one", prompt: { text: "on" } });
+		expect(published.at(-1)!.text).toContain("Fusion persistent mode enabled");
+		await mode.execute({ sessionID: "one", prompt: { text: "" } });
+		expect(published.at(-1)!.text).toContain("Fusion persistent mode is on.");
+		expect(await storage.get("fusion-mode")).toBe(true);
+		// The run status report carries the mode alongside the run state.
+		await tools.get("fusion_start")!.execute({ task: "Task" }, context("one"));
+		const status = JSON.parse((await tools.get("fusion_status")!.execute({}, context("one"))).content);
+		expect(status.fusionMode).toBe("on");
+	});
+
 	test("persistent mode gates fusion tools per session until a run is active", async () => {
 		const tools = new Map<string, Tool>();
 		const storage = memoryStorage();
