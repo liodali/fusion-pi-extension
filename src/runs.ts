@@ -29,8 +29,10 @@ export interface FusionRun {
 	/** Write-ahead identity of the last unsettled executor submission. */
 	pending?: { action: "execute" | "revise" | "final_fix"; requestId: string };
 	/** Set when the supervisor stopped the run; refuses further executor and
-	 * scout work until recovery or cleanup. */
-	stopped?: { at: string; reason?: string };
+	 * scout work until recovery or cleanup. `abort` records delivery: a
+	 * pending abort is still in flight and the marker catches up when it
+	 * settles; a failed delivery is retried by a repeated stop. */
+	stopped?: { at: string; reason?: string; abort?: "delivered" | "failed" | "pending" };
 	manualResolution?: { at: string };
 	metrics?: FusionRunMetrics;
 	status: FusionRunStatus;

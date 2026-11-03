@@ -129,7 +129,7 @@ interface FusionScoutDetails {
 interface FusionStopDetails {
 	recap: string;
 	stopped: boolean;
-	abort: "delivered" | "unavailable" | "failed" | "skipped";
+	abort: "delivered" | "failed" | "pending" | "skipped";
 }
 
 interface FusionState {
