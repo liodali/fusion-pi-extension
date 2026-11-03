@@ -540,6 +540,21 @@ passed with 429 tests. A live Pi stop against a real durable executor is
 still pending (the model-free fixtures register the surface; a real-model Pi
 acceptance run should exercise the stop and recap end to end).
 
+Review fixes (2026-11-04, local):
+
+- A repeated stop no longer claims successful persistence after a failed
+  marker write: every call retries the (idempotent) write and reports the
+  real outcome, so the recap warning survives until a write actually lands.
+  A failed abort delivery is likewise retried by a repeated stop; a
+  delivered or in-flight one never is.
+- A stalled abort can no longer block the stop marker or the supervisor
+  feedback: the marker is set before any awaited I/O, the abort wait is
+  bounded (default 1500 ms) and reports delivery as pending past it, and a
+  follower updates the marker and record when the abort settles. Marker
+  writes are bounded too (default 2000 ms), so the recap always returns.
+  Both regressions fail against the previous implementation (false-success
+  assertion, 5 s hang) and pass with the fixes; the suite is at 434 tests.
+
 ## References
 
 - Native installation and package sources: https://dev.opencode.ai/v2/docs/plugins/
