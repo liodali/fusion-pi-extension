@@ -43,7 +43,7 @@ flowchart LR
 For Fusion **0.1.1+**, use OpenCode **2.2.5** and Bun for native Git installation:
 
 ```sh
-opencode plugin add 'github:liodali/fusion-harness-extension#v0.1.3'
+opencode plugin add 'github:liodali/fusion-harness-extension#v0.1.4'
 ```
 
 Restart OpenCode, then use `/fusion-config` and `/fusion-run <task>`. The
@@ -64,7 +64,7 @@ replacing the tarball path with your download:
 
 ```sh
 cd /path/to/your/project
-bun add /path/to/fusion-opencode-0.1.3.tgz
+bun add /path/to/fusion-opencode-0.1.4.tgz
 ```
 
 Then add the plugin to your project's `opencode.json(c)`. **Append to the
@@ -119,8 +119,7 @@ and `/fusion-resume`, inspect partial edits, and reconcile retained work
 before cleanup. On Pi, asking the supervisor to stop calls `fusion_stop`,
 which aborts the live executor conversation (durable or session backend),
 refuses further executor and scout work for the run, and returns the same
-style of deterministic recap. These controls are not included in the v0.1.3
-tag.
+style of deterministic recap. These controls ship in the v0.1.4 release.
 
 The dedicated package has no dependencies (no Pi SDKs, no plugin SDK). The
 workflow uploads a package artifact; it does not publish to npm or create a

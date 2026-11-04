@@ -1,6 +1,6 @@
 {
   "name": "fusion-harness-extension",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Supervisor-executor orchestration extension for multiple harnesses (Pi and OpenCode today)",
   "type": "module",
   "keywords": [

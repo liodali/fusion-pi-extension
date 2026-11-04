@@ -555,6 +555,31 @@ Review fixes (2026-11-04, local):
   Both regressions fail against the previous implementation (false-success
   assertion, 5 s hang) and pass with the fixes; the suite is at 434 tests.
 
+## Release v0.1.4 (2026-11-04)
+
+Ships everything since v0.1.3 (`86797ff`): the compact delegation input
+and TUI activity card with a clickable stop control; the executor stop
+machinery (persisted stop records, bounded deterministic feedback,
+acknowledged-is-not-confirmed semantics, stall-independent interruption,
+reconciliation confirming the stop record); `/fusion-stop`; the Pi
+`fusion_stop` supervisor tool with stopped-run gating and the
+deterministic recap (marker-first, bounded abort and writes, honest
+retry semantics); `/fusion-mode` state visibility and `fusionMode` in
+`/fusion-status`; and the rename to `fusion-harness-extension`
+(package and repository; npm name verified unclaimed; nothing was ever
+published under the old name).
+
+Gate evidence for this release: typecheck; 434 tests; the exact
+`fusion-opencode-0.1.4.tgz` loaded through the native package loader
+(package-load: agents, commands, `/fusion-config` across a full server
+restart, coexistence), delegate-display and stop-native fixtures on the
+installed tarball (`installedPackage: true`, stop confirmed/cancelled);
+smoke on v2.2.5; pi-load and clean-install for the renamed root package.
+The live installed-package parity run passed on the exact tarball
+(artifact `artifacts/opencode-parity-2026-11-04T121814-102Z.json`,
+`ok: true`, 11 steps, no stuck recovery). The tag is annotated and the
+GitHub release attaches the workflow-built tarballs and SHA256SUMS.
+
 ## Rename to fusion-harness-extension (2026-11-04, local)
 
 The project is no longer Pi-only (OpenCode shipped; more harnesses planned),

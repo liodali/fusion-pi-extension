@@ -84,7 +84,7 @@ the host; the ownership registry is shared across harnesses (below).
 ### Native Git install (Fusion 0.1.1+, OpenCode v2.2.5)
 
 ```sh
-opencode plugin add 'github:liodali/fusion-harness-extension#v0.1.3'
+opencode plugin add 'github:liodali/fusion-harness-extension#v0.1.4'
 ```
 
 This installs into OpenCode's global plugin configuration. Restart OpenCode
@@ -92,7 +92,7 @@ in your workspace, then use `/fusion-config` and `/fusion-run <task>`.
 All three agents are registered automatically; no wrapper or Markdown copy
 is needed. Remove any previous Fusion wrapper before enabling the package.
 The referenced release tag must exist on GitHub. To use the development
-branch after these changes are pushed, replace `#v0.1.3` with `#main`.
+branch after these changes are pushed, replace `#v0.1.4` with `#main`.
 
 The Git package preserves its Pi default export and supplies OpenCode through
 `exports["./server"]`, which OpenCode v2.2.5 prefers over `exports["."]`.
@@ -157,7 +157,7 @@ it through the native `plugins` entry, an empty-agent project, and a full
 model-free run lifecycle are covered by `bun run test:opencode-package-load`.
 
 The development version additionally provides `/fusion-stop` and an executor
-activity card for OpenCode 2.2.5. They are not part of the v0.1.3 tag.
+activity card for OpenCode 2.2.5. They ship in the v0.1.4 release.
 
 ### Downloading a GitHub Actions package
 
