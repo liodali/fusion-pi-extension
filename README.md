@@ -1,8 +1,8 @@
-# Fusion for Pi and OpenCode
+# Fusion Harness Extension
 
 Plan with a supervisor. Delegate implementation to an executor. Review the actual changes before finishing.
 
-Fusion runs as a **Pi extension** or an **OpenCode plugin**. Each agent has its own conversation and works in the same project directory.
+Fusion runs as a harness extension — a **Pi extension** or an **OpenCode plugin** today, with more harnesses to come. Each agent has its own conversation and works in the same project directory.
 
 ## How it works
 
@@ -43,7 +43,7 @@ flowchart LR
 For Fusion **0.1.1+**, use OpenCode **2.2.5** and Bun for native Git installation:
 
 ```sh
-opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.3'
+opencode plugin add 'github:liodali/fusion-harness-extension#v0.1.3'
 ```
 
 Restart OpenCode, then use `/fusion-config` and `/fusion-run <task>`. The
@@ -55,7 +55,7 @@ Alternatively, download a package artifact (OpenCode **2.2.3–2.2.5**):
 1. Open this repository's **Actions → Package OpenCode plugin** workflow.
 2. Select **Run workflow**, or open a successful run for a `v*` tag or relevant pull request.
 3. Download the `fusion-opencode-<commit>` artifact and extract it. It contains
-   `fusion-opencode-<version>.tgz`, `pi-fusion-extension-<version>.tgz`, and
+   `fusion-opencode-<version>.tgz`, `fusion-harness-extension-<version>.tgz`, and
    `SHA256SUMS`.
 
 Verify the download from its extracted directory (`shasum -a 256 -c SHA256SUMS`

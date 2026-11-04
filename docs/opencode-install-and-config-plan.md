@@ -13,7 +13,7 @@ v0.1.0 is not retagged.
 A developer installs the OpenCode package through OpenCode's native plugin
 manager, gets the Fusion supervisor/executor/scout without copying files, and
 can configure the worker model with `/fusion-config` before starting a run.
-Existing Pi installs and `pi-fusion-extension/opencode` imports keep working.
+Renamed to `fusion-harness-extension` (2026-11-04): the package was never published, so installs and `fusion-harness-extension/opencode` imports simply use the new name.
 
 ## 1. Verify the native extension surfaces
 
@@ -555,7 +555,22 @@ Review fixes (2026-11-04, local):
   Both regressions fail against the previous implementation (false-success
   assertion, 5 s hang) and pass with the fixes; the suite is at 434 tests.
 
+## Rename to fusion-harness-extension (2026-11-04, local)
+
+The project is no longer Pi-only (OpenCode shipped; more harnesses planned),
+so the package and repository are renamed `fusion-harness-extension`
+(npm name verified unclaimed). The rename is free of compatibility cost:
+the package was never published, the OpenCode package keeps its own
+deliberate name (`fusion-opencode`), and harness-specific surfaces keep
+their correct names (`pi.extensions`, `.pi/extensions` discovery shim,
+`src/pi/*`, `src/opencode/*`). Historical records (the verified v0.1.1
+install command, the m4 handoff working directory) keep the names they
+were written under; GitHub redirects the old repository URL. Verified with
+the full suite plus clean-install, consumer-install, and pi-load fixtures
+installing the renamed package.
+
 ## References
+
 
 - Native installation and package sources: https://dev.opencode.ai/v2/docs/plugins/
 - Package exports and loading: https://dev.opencode.ai/v2/docs/build/plugins

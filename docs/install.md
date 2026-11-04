@@ -12,10 +12,10 @@ rely on:
 
 | Import | Loads | Consumer |
 | --- | --- | --- |
-| `pi-fusion-extension` | Pi extension (`src/index.ts`) | Pi hosts |
-| `pi-fusion-extension/pi` | same file (alias) | Pi hosts |
-| `pi-fusion-extension/opencode` | OpenCode plugin (`src/opencode/index.ts`) | OpenCode hosts |
-| `pi-fusion-extension/package.json` | package metadata | tooling |
+| `fusion-harness-extension` | Pi extension (`src/index.ts`) | Pi hosts |
+| `fusion-harness-extension/pi` | same file (alias) | Pi hosts |
+| `fusion-harness-extension/opencode` | OpenCode plugin (`src/opencode/index.ts`) | OpenCode hosts |
+| `fusion-harness-extension/package.json` | package metadata | tooling |
 | `fusion-resolve` (bin) | operator ownership resolution CLI (`src/workspace/resolve.ts`, runs under bun) | operators, package installs |
 
 The import graphs behind the two entrypoints are isolated and statically
@@ -56,7 +56,7 @@ consumer directories (real tarball installs):
 
 ## Installing for Pi
 
-1. Install `pi-fusion-extension` into the Pi host (or workspace). A Pi host
+1. Install `fusion-harness-extension` into the Pi host (or workspace). A Pi host
    resolves the extension from the targets listed in the package manifest's
    `pi.extensions` field — `./src/index.ts`, the extension's default export.
    The package also ships a project-local discovery file,
@@ -84,7 +84,7 @@ the host; the ownership registry is shared across harnesses (below).
 ### Native Git install (Fusion 0.1.1+, OpenCode v2.2.5)
 
 ```sh
-opencode plugin add 'github:liodali/fusion-pi-extension#v0.1.3'
+opencode plugin add 'github:liodali/fusion-harness-extension#v0.1.3'
 ```
 
 This installs into OpenCode's global plugin configuration. Restart OpenCode
@@ -167,7 +167,7 @@ It checks package isolation and a clean consumer install, verifies the
 native host surfaces (`test:opencode-native`), loads the exact dedicated
 tarball through the real package loader (`test:opencode-package-load`), and
 uploads `fusion-opencode-<commit>` containing both package tarballs
-(`pi-fusion-extension` and `fusion-opencode`) plus `SHA256SUMS`.
+(`fusion-harness-extension` and `fusion-opencode`) plus `SHA256SUMS`.
 
 This workflow uploads build artifacts; it does not publish to npm or create a
 GitHub release. `opencode plugin add` accepts Git sources as shown above and
@@ -193,7 +193,7 @@ required. This boundary is deliberate honesty, not a bug.
    entry — a project-local discovered plugin that re-exports it:
    ```ts
    // .opencode/plugins/fusion.ts
-   export { default } from "pi-fusion-extension/opencode";
+   export { default } from "fusion-harness-extension/opencode";
    ```
    (The parity fixture uses the equivalent copied-checkout form: it copies
    `src` into the project `.opencode/fusion` and re-exports
@@ -208,7 +208,7 @@ required. This boundary is deliberate honesty, not a bug.
    contributes natively (`src/opencode/agents.ts`; regenerate with
    `bun run generate:agent-markdown`, kept in sync by
    `test/opencode-agents.test.ts`) and ship in both packages
-   (`node_modules/pi-fusion-extension/examples/opencode/agents/` or
+   (`node_modules/fusion-harness-extension/examples/opencode/agents/` or
    `node_modules/fusion-opencode/examples/opencode/agents/` in an install;
    `examples/opencode/agents/` in this checkout).
    These are the exact agent files the live parity fixture ran with

@@ -104,7 +104,7 @@ For a disposable project, copy `examples/opencode/agents/fusion.md` and
 path to this checkout's `src/opencode/index.ts`, for example:
 
 ```ts
-export { default } from "/absolute/path/to/Fusion-Pi-Extension/src/opencode/index.ts";
+export { default } from "/absolute/path/to/Fusion-Harness-Extension/src/opencode/index.ts";
 ```
 
 Select the `fusion` primary agent;

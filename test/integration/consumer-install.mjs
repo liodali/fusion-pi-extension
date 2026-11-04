@@ -56,7 +56,7 @@ const manifest = (tarball, override) => ({
 		"@earendil-works/chord": "1.0.3",
 		"@earendil-works/pi-coding-agent": "1.0.3",
 		"@earendil-works/pi-durable": "1.0.3",
-		"pi-fusion-extension": `file:${tarball}`,
+		"fusion-harness-extension": `file:${tarball}`,
 	},
 	...(override ? { overrides: { "@earendil-works/pi-codemode": override } } : {}),
 });
@@ -90,7 +90,7 @@ async function codemodeCopies(consumerDir) {
 // and the Pi project-local discovery shim ships. Missing files break the
 // documented install steps, so these are asserted like the codemode rows.
 async function shippedAssets(consumerDir) {
-	const pkgRoot = join(consumerDir, "node_modules/pi-fusion-extension");
+	const pkgRoot = join(consumerDir, "node_modules/fusion-harness-extension");
 	const wanted = {
 		"agent fusion.md": join(pkgRoot, "examples/opencode/agents/fusion.md"),
 		"agent fusion-executor.md": join(pkgRoot, "examples/opencode/agents/fusion-executor.md"),
@@ -130,9 +130,9 @@ async function importProbe(consumerDir) {
 	// itself, the exact evaluation that fails in an unguided tree.
 	const script = [
 		"const suffix = 'IMPORT-PASS';",
-		"const m = await import('pi-fusion-extension');",
+		"const m = await import('fusion-harness-extension');",
 		"if (typeof m.default !== 'function') throw new Error('unexpected default export shape');",
-		`await import('${pathToFileURL(join(consumerDir, "node_modules/pi-fusion-extension/src/pi/durable/backend.ts")).href}');`,
+		`await import('${pathToFileURL(join(consumerDir, "node_modules/fusion-harness-extension/src/pi/durable/backend.ts")).href}');`,
 		`await import('${pathToFileURL(join(consumerDir, "node_modules/@earendil-works/pi-coding-agent/dist/index.js")).href}');`,
 		"console.log('IMPORT-OK');",
 	].join("\n");

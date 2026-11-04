@@ -1,6 +1,6 @@
 // Clean-install smoke (M7.4), model-free and registry-free: from a packed
 // tarball of this package, a bare consumer directory installs ONLY
-// pi-fusion-extension (no Pi stack) and must be able to load the OpenCode
+// fusion-harness-extension (no Pi stack) and must be able to load the OpenCode
 // plugin entry — proving at runtime that the OpenCode path imports no Pi
 // SDKs (if it did, this bare install could not load it). The Pi entry is
 // expected NOT to load in this shape: it requires the host's Pi stack, and
@@ -37,12 +37,12 @@ try {
 	await mkdir(consumerDir, { recursive: true });
 	const tarball = await packTarball();
 	await cp(tarball, join(consumerDir, "fusion.tgz"));
-	await writeFile(join(consumerDir, "package.json"), `${JSON.stringify({ name: "fusion-clean-install", private: true, type: "module", dependencies: { "pi-fusion-extension": "file:./fusion.tgz" } }, null, 2)}\n`);
+	await writeFile(join(consumerDir, "package.json"), `${JSON.stringify({ name: "fusion-clean-install", private: true, type: "module", dependencies: { "fusion-harness-extension": "file:./fusion.tgz" } }, null, 2)}\n`);
 	const install = spawnSync("bun", ["install"], { cwd: consumerDir, encoding: "utf8" });
 	result.installExit = install.status;
 	check("bun install of the bare tarball succeeds", install.status === 0, `${install.stdout ?? ""}${install.stderr ?? ""}`.split("\n").slice(-3).join(" | "));
 
-	const pkgRoot = join(consumerDir, "node_modules/pi-fusion-extension");
+	const pkgRoot = join(consumerDir, "node_modules/fusion-harness-extension");
 	const assets = {
 		"agent fusion.md": join(pkgRoot, "examples/opencode/agents/fusion.md"),
 		"agent fusion-executor.md": join(pkgRoot, "examples/opencode/agents/fusion-executor.md"),
@@ -83,7 +83,7 @@ try {
 	// The OpenCode entry loads in the bare install — the runtime proof of
 	// "no Pi SDK imports" behind the ./opencode entrypoint.
 	const loadOpenCode = spawnSync("bun", ["-e", `
-		const plugin = (await import("pi-fusion-extension/opencode")).default;
+		const plugin = (await import("fusion-harness-extension/opencode")).default;
 		if (plugin?.id !== "fusion" || typeof plugin?.setup !== "function") throw new Error("unexpected plugin shape: " + JSON.stringify(Object.keys(plugin ?? {})));
 		console.log("OPENCODE-ENTRY-OK");
 	`], { cwd: consumerDir, encoding: "utf8" });
@@ -93,7 +93,7 @@ try {
 
 	// The Pi entry must NOT load in this shape: it needs the host's Pi
 	// stack. The recorded failure mode is the honest boundary.
-	const loadPi = spawnSync("bun", ["-e", "await import('pi-fusion-extension'); console.log('PI-ENTRY-LOADED')"], { cwd: consumerDir, encoding: "utf8" });
+	const loadPi = spawnSync("bun", ["-e", "await import('fusion-harness-extension'); console.log('PI-ENTRY-LOADED')"], { cwd: consumerDir, encoding: "utf8" });
 	const piOutput = `${loadPi.stdout ?? ""}${loadPi.stderr ?? ""}`.trim();
 	result.piEntryRefusedInBareInstall = loadPi.status !== 0;
 	result.piEntryFailureHead = piOutput.split("\n").find((line) => /Cannot find module|error/i.test(line))?.slice(0, 160) ?? piOutput.slice(0, 160);
