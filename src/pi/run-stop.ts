@@ -4,10 +4,20 @@ import type { FusionRun } from "../runs.ts";
  * the delegation and scout gates so the wording stays identical. */
 export const STOPPED_RUN_REFUSAL = "This Fusion run was stopped. Recover a durable turn with /fusion-resume or release the run with /fusion-clean before starting more executor work.";
 
-/** Abort delivery recorded on the stop marker. "pending" means the bounded
- * stop wait elapsed without the abort settling; a follower updates the
- * marker when it does. */
+/** Delivery states recorded on the stop marker. "pending" means delivery
+ * was never confirmed — it is NOT proof that an abort operation is still
+ * running: after a restart the promise and its follower are gone. */
 export type StopAbortState = "delivered" | "failed" | "pending";
+
+/** One live abort operation started by stopFusionRun, carrying its own
+ * terminal state so a later stop can wait on it without closure state. */
+export type AbortFlight = Promise<{ state: "delivered" } | { state: "failed"; error?: string }>;
+
+/** Live abort operations keyed by run id, held in memory only. In-flight
+ * state lives here — separate from the persisted delivery state — so a
+ * restored "pending" marker (whose operation no longer exists) is retried
+ * instead of being mistaken for a running abort. */
+export type StopFlights = Map<string, AbortFlight>;
 
 export interface StopDeps {
 	/** The session's active run; mutated only by marking it stopped. */
@@ -16,6 +26,8 @@ export interface StopDeps {
 	uncertain: boolean;
 	/** Abort the live executor conversation/session, when one exists. */
 	abortExecutor: () => Promise<void>;
+	/** Live abort operations for this session's runs. */
+	flights: StopFlights;
 	/** Human label of the executor model, for the recap. */
 	executorLabel: string;
 	/** The backend the run actually delegated on. */
@@ -62,9 +74,12 @@ function waitOrTimeout(operation: Promise<void>, milliseconds: number, label: st
  * termination is never overstated. Ordering is deliberate: the stop marker
  * is set before any awaited I/O, so a stalled abort or write can never
  * leave the run unmarked or block the supervisor's feedback; the abort wait
- * is bounded and reports delivery as pending until it settles; and every
- * call retries a previously failed marker write, so a repeated stop never
- * claims a persistence that did not happen. */
+ * is bounded and reports delivery as pending until it settles; live aborts
+ * are tracked in memory (not on the persisted marker), so a restored
+ * "pending" after a restart is retried instead of being mistaken for a
+ * running operation; and every call retries a previously failed marker
+ * write, so a repeated stop never claims a persistence that did not
+ * happen. */
 export async function stopFusionRun(deps: StopDeps, reason?: string): Promise<StopOutcome> {
 	const run = deps.activeRun;
 	if (!run) return { text: "No Fusion run is active; nothing to stop.", stopped: false, abort: "skipped", persisted: false };
@@ -75,10 +90,10 @@ export async function stopFusionRun(deps: StopDeps, reason?: string): Promise<St
 	const marker = run.stopped ?? { at, ...(reason?.trim() ? { reason: shortTask(reason.trim()) } : {}) };
 	run.stopped = marker;
 	run.updatedAt = marker.at;
-	// Retry an abort only when a live turn may still exist and no delivery
-	// holds or is in flight: repeat stops retry failures, never successes
-	// and never a pending attempt.
-	const wantsAbort = deps.uncertain && (fresh || marker.abort === undefined || marker.abort === "failed");
+	// Delivery only suppresses a retry when it was actually proven. A live
+	// abort in this session is awaited rather than re-sent; a persisted
+	// "pending" or "failed" is retried, because after a restart its
+	// operation no longer exists and only the record survived.
 	let persisted = true;
 	const writeMarker = async (): Promise<void> => {
 		try {
@@ -89,25 +104,38 @@ export async function stopFusionRun(deps: StopDeps, reason?: string): Promise<St
 	};
 	await writeMarker();
 	let abortError: string | undefined;
-	if (wantsAbort) {
-		marker.abort = "pending";
-		const operation = deps.abortExecutor();
-		const outcome = await new Promise<"delivered" | "failed" | "timeout">((resolve) => {
+	if (deps.uncertain && marker.abort !== "delivered") {
+		let flight = deps.flights.get(run.runId);
+		if (!flight) {
+			marker.abort = "pending";
+			const operation = deps.abortExecutor();
+			flight = operation.then(
+				() => ({ state: "delivered" as const }),
+				(error: unknown) => ({ state: "failed" as const, error: error instanceof Error ? error.message : String(error) }),
+			);
+			deps.flights.set(run.runId, flight);
+			// The follower cleans the registry and catches the marker (and the
+			// run record, best effort) up when the abort settles, even if this
+			// call already returned reporting pending.
+			void flight.then((result) => {
+				deps.flights.delete(run.runId);
+				if (marker.abort === "pending") {
+					marker.abort = result.state === "delivered" ? "delivered" : "failed";
+					void deps.persist().catch(() => {});
+				}
+			});
+		}
+		const outcome = await new Promise<"settled" | "timeout">((resolve) => {
 			const timer = setTimeout(() => resolve("timeout"), deps.abortTimeoutMs ?? 1500);
-			void operation.then(
-				() => { clearTimeout(timer); resolve("delivered"); },
-				(error) => { clearTimeout(timer); abortError = error instanceof Error ? error.message : String(error); resolve("failed"); },
-			);
+			void flight!.then(() => { clearTimeout(timer); resolve("settled"); });
 		});
-		if (outcome === "timeout") {
-			// The abort keeps running: the marker (and the run record, best
-			// effort) catch up when it settles so /fusion-status stays honest.
-			void operation.then(
-				() => { if (marker.abort === "pending") { marker.abort = "delivered"; void deps.persist().catch(() => {}); } },
-				(error) => { if (marker.abort === "pending") { marker.abort = "failed"; abortError = error instanceof Error ? error.message : String(error); void deps.persist().catch(() => {}); } },
-			);
-		} else if (outcome === "failed") marker.abort = "failed";
-		else marker.abort = "delivered";
+		if (outcome === "settled") {
+			const result = await flight;
+			if (result.state === "failed") { marker.abort = "failed"; abortError = result.error; }
+			else marker.abort = "delivered";
+		} else {
+			marker.abort = "pending";
+		}
 		// The delivery state belongs on the record; a failed write never
 		// un-stops the run and stays retryable by the next stop.
 		await writeMarker();

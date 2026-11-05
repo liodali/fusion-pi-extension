@@ -2,7 +2,7 @@ import { FusionController } from "./core/controller.ts";
 import { createPiWorkerRuntime } from "./pi/worker-runtime.ts";
 import { piModelConfig, piWorkerUsage } from "./pi/worker-translation.ts";
 import { translatePiRun } from "./pi/manifest-translation.ts";
-import { stopFusionRun, STOPPED_RUN_REFUSAL } from "./pi/run-stop.ts";
+import { stopFusionRun, STOPPED_RUN_REFUSAL, type StopFlights } from "./pi/run-stop.ts";
 import { readRunManifest, type RunManifest } from "./core/manifest.ts";
 import type { WorkspaceLease } from "./workspace/ownership.ts";
 import type { FusionPhase } from "./core/workflow.ts";
@@ -212,6 +212,10 @@ function collectModels(ctx: ExtensionContext): Model<Api>[] {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Live abort operations started by fusion_stop, keyed by run id. Held in
+	// memory only: after a restart this map is empty, so a persisted "pending"
+	// stop marker is retried rather than treated as a running abort.
+	const stopFlights: StopFlights = new Map();
 	const state: FusionState = {
 		modeEnabled: false,
 		runActive: false,
@@ -1452,6 +1456,9 @@ export default function (pi: ExtensionAPI) {
 				activeRun: state.activeRun,
 				uncertain: controller.uncertain,
 				abortExecutor: async () => { const handle = state.executorHandle ?? await state.executorReady; if (!handle) throw new Error("No executor handle is available in this session."); await handle.abort(); },
+				// Session-scoped live aborts: only these prove an operation is
+				// still running, never the persisted "pending" marker.
+				flights: stopFlights,
 				executorLabel: executorLabel(),
 				backend: state.executorSessionBackend ?? state.executorBackend,
 				activity: state.executorActivity,

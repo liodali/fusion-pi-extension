@@ -25,6 +25,7 @@ function makeDeps(overrides: Partial<StopDeps> & { activeRun?: FusionRun } = {})
 		activeRun: makeRun(),
 		uncertain: false,
 		abortExecutor: async () => {},
+		flights: new Map(),
 		executorLabel: "prov/model",
 		backend: "durable",
 		activity: "running edit",
@@ -165,6 +166,47 @@ describe("stopFusionRun", () => {
 		await stopFusionRun(deps);
 		expect(aborts).toBe(1);
 		expect(run.stopped?.abort).toBe("pending");
+	});
+
+	test("a restored pending marker is retried after restart, not mistaken for a live abort", async () => {
+		// The reviewer's repro: the marker says pending, but the operation and
+		// its follower died with the previous session — a fresh flights map is
+		// the restart state. Repeated stops must send a new abort.
+		const run = makeRun({ stopped: { at: "2026-11-04T11:00:00.000Z", abort: "pending" } });
+		let aborts = 0;
+		const deps = makeDeps({ activeRun: run, uncertain: true, abortExecutor: async () => { aborts++; } });
+		const outcome = await stopFusionRun(deps);
+		expect(aborts).toBe(1);
+		expect(outcome.abort).toBe("delivered");
+		expect(run.stopped?.abort).toBe("delivered");
+		expect(outcome.text).toContain("Abort: delivered")
+		// The retry outcome is persisted, and the live flight is cleaned up.
+		expect(deps.flights.has(run.runId)).toBe(false);
+		const again = await stopFusionRun(deps);
+		expect(again.abort).toBe("delivered");
+		expect(aborts).toBe(1);
+	});
+
+	test("a live flight is awaited, not re-sent, and settles the marker", async () => {
+		const run = makeRun();
+		let resolveAbort!: () => void;
+		let aborts = 0;
+		const deps = makeDeps({
+			activeRun: run, uncertain: true, abortTimeoutMs: 500,
+			abortExecutor: () => { aborts++; return new Promise<void>((resolve) => { resolveAbort = resolve; }); },
+		});
+		const first = stopFusionRun(deps);
+		// Wait for the flight to actually start before settling it.
+		for (let i = 0; i < 500 && aborts === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+		resolveAbort();
+		await first;
+		expect(run.stopped?.abort).toBe("delivered");
+		// The settled flight is gone; a later stop sees the proven delivery.
+		expect(deps.flights.has(run.runId)).toBe(false);
+		const second = await stopFusionRun(deps);
+		expect(aborts).toBe(1);
+		expect(second.abort).toBe("delivered");
+		expect(second.text).toContain("already stopped at")
 	});
 
 	test("a stalled marker write cannot block the recap either", async () => {
