@@ -554,6 +554,15 @@ Review fixes (2026-11-04, local):
   writes are bounded too (default 2000 ms), so the recap always returns.
   Both regressions fail against the previous implementation (false-success
   assertion, 5 s hang) and pass with the fixes; the suite is at 434 tests.
+- A persisted `pending` marker is no longer mistaken for a running abort
+  (2026-11-05): live abort operations are tracked in a session-scoped
+  in-memory registry (`StopFlights`), separate from the persisted delivery
+  state. A stop awaits a live flight instead of re-sending, and after a
+  restart — where the flight registry is empty and the old promise and
+  follower are gone — a restored `pending` marker is retried. Only a
+  proven `delivered` suppresses further attempts. The repro fails against
+  the previous implementation (zero abort calls) and passes with the fix;
+  the suite is at 436 tests.
 
 ## Release v0.1.4 (2026-11-04)
 
